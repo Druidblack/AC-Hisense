@@ -71,9 +71,86 @@ void ACHi::setup() {
 }
 
 void ACHi::update() {
-  //this->loop();
-  ESP_LOGD("ACHi", "Update");
+  ESP_LOGD("ACHi", "Update (apply user intents)");
+  // Power
+  if (this->power_switch != nullptr) {
+    bool desired = this->power_switch->state;
+    if (desired != this->current_power_) {
+      this->set_power(desired);
+    }
+  }
+  // Temperature
+  if (this->my_temperature != nullptr) {
+    uint8_t desired = static_cast<uint8_t>(this->my_temperature->state);
+    if (desired != this->current_set_temp_) {
+      this->set_temperature(desired);
+    }
+  }
+  // Mode
+  if (this->ac_mode_select != nullptr) {
+    std::string desired = this->ac_mode_select->state;
+    if (!desired.empty() && desired != this->current_ac_mode_) {
+      this->set_mode(desired);
+    }
+  }
+  // Wind
+  if (this->ac_wind_select != nullptr) {
+    std::string desired = this->ac_wind_select->state;
+    if (!desired.empty() && desired != this->current_wind_) {
+      this->set_fan_speed(desired);
+    }
+  }
+  // Sleep
+  if (this->ac_sleep_select != nullptr) {
+    std::string desired = this->ac_sleep_select->state;
+    if (!desired.empty() && desired != this->current_sleep_) {
+      this->set_sleep_mode(desired);
+    }
+  }
+  // Quiet
+  if (this->quiet_switch != nullptr) {
+    bool desired = this->quiet_switch->state;
+    if (desired != this->sensor_quiet->state) {
+      this->set_quiet_mode(desired);
+    }
+  }
+  // Turbo
+  if (this->turbo_switch != nullptr) {
+    bool desired = this->turbo_switch->state;
+    if (desired != this->sensor_turbo->state) {
+      this->set_turbo_mode(desired);
+    }
+  }
+  // Eco
+  if (this->eco_switch != nullptr) {
+    bool desired = this->eco_switch->state;
+    if (desired != this->sensor_eco->state) {
+      this->set_eco_mode(desired);
+    }
+  }
+  // LED
+  if (this->led_switch != nullptr) {
+    bool desired = this->led_switch->state;
+    if (desired != this->sensor_led->state) {
+      this->set_led(desired);
+    }
+  }
+  // Swing UD
+  if (this->swing_up_down_switch != nullptr) {
+    bool desired = this->swing_up_down_switch->state;
+    if (this->sensor_up_down != nullptr && desired != this->sensor_up_down->state) {
+      this->set_swing_up_down(desired);
+    }
+  }
+  // Swing LR
+  if (this->swing_left_right_switch != nullptr) {
+    bool desired = this->swing_left_right_switch->state;
+    if (this->sensor_left_right != nullptr && desired != this->sensor_left_right->state) {
+      this->set_swing_left_right(desired);
+    }
+  }
 }
+
 
 void ACHi::loop() {
   uint32_t now = millis();

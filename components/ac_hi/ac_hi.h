@@ -42,6 +42,16 @@ class ACHi : public PollingComponent, public uart::UARTDevice {
     // Sensor and other methods
 
   void set_mode_select(select::Select *s) { ac_mode_select = s; }
+  void set_wind_select(select::Select *s) { ac_wind_select = s; }
+  void set_sleep_select(select::Select *s) { ac_sleep_select = s; }
+  void set_temperature_number(number::Number *n) { my_temperature = n; }
+  void set_power_switch(switch_::Switch *s) { power_switch = s; }
+  void set_quiet_switch(switch_::Switch *s) { quiet_switch = s; }
+  void set_turbo_switch(switch_::Switch *s) { turbo_switch = s; }
+  void set_eco_switch(switch_::Switch *s) { eco_switch = s; }
+  void set_led_switch(switch_::Switch *s) { led_switch = s; }
+  void set_swing_up_down_switch(switch_::Switch *s) { swing_up_down_switch = s; }
+  void set_swing_left_right_switch(switch_::Switch *s) { swing_left_right_switch = s; }
 
   void set_compr_freq_sensor(sensor::Sensor *s) { compr_freq = s; }
   void set_compr_freq_set_sensor(sensor::Sensor *s) { compr_freq_set = s; }
