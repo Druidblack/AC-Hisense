@@ -13,7 +13,8 @@ namespace ac_hi {
 
 /**
  * ACHiClimate — нативный ESPHome climate для кондиционеров Ballu/Hisense по RS-485.
- * Основан на реверсе legacy/ballu_legacy.yaml: индексы байт статуса и формирование команд.
+ * Реализация основана на рабочем legacy-конфиге (ballu_legacy.yaml): читаем статус (cmd 0x66),
+ * формируем запись изменяя поля последнего статус-кадра и отправляя cmd 0x65 с корректной CRC.
  * YAML-лямбды не нужны: всё управление через ClimateCall.
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
@@ -31,7 +32,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   // ===== I/O helpers =====
   void send_status_request_();
   void send_write_frame_();
-  void rebuild_write_frame_();
+  void rebuild_write_frame_from_last_status_();
   void compute_crc_(std::vector<uint8_t> &buf);
   bool parse_next_frame_();
   void handle_status_(const std::vector<uint8_t> &bytes);
@@ -45,15 +46,11 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   bool swing_ud_{false};
   bool swing_lr_{false};
-  bool quiet_{false};
-  bool turbo_{false};
-  bool eco_{false};
-  bool led_{false};
 
   // write-intent fields (match legacy encoding)
   uint8_t power_bin_{0x04};      // base (bit2); ON adds bit3
   uint8_t mode_bin_{0x10};       // ((idx<<1)|1)<<4
-  uint8_t wind_code_{0x01};      // 1=auto; low/med/high -> 12/14/16 (status uses raw; write uses +1)
+  uint8_t wind_code_{0x01};      // 1=auto; low/med/high -> 12/14/16
   uint8_t temp_byte_{0x00};      // ((°C)<<1)|1, or 0 when turbo override
   uint8_t updown_bin_{0x10};     // 0x30 on, 0x10 off -> [32]
   uint8_t leftright_bin_{0x04};  // 0x0C on, 0x04 off -> [32]
@@ -61,8 +58,12 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   uint8_t eco_bin_{0x40};        // 0xC0 on, 0x40 off -> [33]
   uint8_t quiet_bin_{0x10};      // 0x30 on, 0x10 off -> [35]
 
-  // outbound long frame template (50 bytes)
-  std::vector<uint8_t> out_{50, 0};
+  // last received full status frame (used as template for writes)
+  std::vector<uint8_t> last_status_;
+  bool have_status_template_{false};
+
+  // outbound frame buffer (same length as last_status_)
+  std::vector<uint8_t> out_;
 
   // RX ring buffer
   static constexpr size_t RB_SIZE = 512;

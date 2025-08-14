@@ -29,7 +29,4 @@ async def to_code(config):
     await climate.register_climate(var, config)
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
-
-    # Use the standard pattern from ESPHome components:
-    # pass the validated TimePeriod directly; C++ expects uint32_t(ms).
     cg.add(var.set_update_interval(config[CONF_UPDATE_INTERVAL]))

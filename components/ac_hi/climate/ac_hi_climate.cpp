@@ -13,26 +13,7 @@ void ACHiClimate::setup() {
   ESP_LOGI(TAG, "Init climate over RS-485");
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 
-  // Build outbound template once (matches legacy long write frame)
-  this->out_.assign(50, 0x00);
-  // Header & footer
-  this->out_[0] = 0xF4; this->out_[1] = 0xF5;
-  this->out_[2] = 0x00;           // addr/flag as in captured traffic
-  this->out_[3] = 0x40;
-  this->out_[4] = 0x29;           // long write packet type used in legacy
-  this->out_[8] = 0x01;           // service constants observed in dumps
-  this->out_[9] = 0xFE;
-  this->out_[10] = 0x00;
-  this->out_[11] = 0x00;
-  this->out_[12] = 0x00;
-  this->out_[13] = 0x65;          // 101 — write/apply (unlock follows)
-  // bytes [46],[47] — CRC, [48]=0xF4, [49]=0xFB
-  this->out_[48] = 0xF4; this->out_[49] = 0xFB;
-
-  // Visual default
-  this->target_temperature = 24;
-
-  // Request first status soon
+  // Request first status soon (we build write-frames from it)
   this->set_timeout("init_status", 1000, [this]() { this->send_status_request_(); });
 }
 
@@ -90,6 +71,11 @@ void ACHiClimate::loop() {
 // ======================= Control =======================
 
 void ACHiClimate::control(const climate::ClimateCall &call) {
+  if (!have_status_template_) {
+    ESP_LOGW(TAG, "Write ignored until first status template is received");
+    return;
+  }
+
   bool need_write = false;
 
   if (call.get_mode().has_value()) {
@@ -150,7 +136,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 // ======================= Protocol I/O =======================
 
 void ACHiClimate::send_status_request_() {
-  // Short status request (cmd 0x66 / 102) from legacy
+  // Short status request (cmd 0x66 / 102) — проверено в legacy
   const uint8_t req[] = {
     0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
   };
@@ -159,49 +145,62 @@ void ACHiClimate::send_status_request_() {
   ESP_LOGVV(TAG, "Sent status request (102)");
 }
 
-void ACHiClimate::rebuild_write_frame_() {
-  // Apply write-intent to the outbound frame
-  // [16] wind (protocol requires +1)
+void ACHiClimate::rebuild_write_frame_from_last_status_() {
+  // Start from last status frame as template
+  out_ = last_status_;               // copy full frame
+  if (out_.size() < 50) out_.resize(50, 0x00);
+
+  // Header/trailer stay as-is from status.
+  // Switch command to WRITE (0x65) at [13]
+  out_[13] = 0x65;
+
+  // Apply fields
+  // [16] wind (protocol uses +1 in writes; status already raw)
   out_[16] = uint8_t(wind_code_ + 1);
+
   // [18] power + mode
   out_[18] = uint8_t(power_bin_ + mode_bin_);
-  // [32] swing (up-down + left-right)
-  updown_bin_    = swing_ud_ ? 0b00110000 : 0b00010000;
-  leftright_bin_ = swing_lr_ ? 0b00001100 : 0b00000100;
-  out_[32] = uint8_t(updown_bin_ + leftright_bin_);
-  // [33] turbo + eco
-  out_[33] = uint8_t(turbo_bin_ + eco_bin_);
-  // [35] quiet
-  out_[35] = quiet_bin_;
-  // [19] target temp (0 — when turbo override)
-  out_[19] = (turbo_bin_ == 0b00001100) ? 0x00 : temp_byte_;
-
-  // Explicitly clear power bit3 on OFF, as done in legacy
   if ((power_bin_ & 0b00001000) == 0) {
     out_[18] = uint8_t(out_[18] & (~(1U<<3)));
   }
 
+  // [32] swing (up-down + left-right)
+  updown_bin_    = swing_ud_ ? 0b00110000 : 0b00010000;
+  leftright_bin_ = swing_lr_ ? 0b00001100 : 0b00000100;
+  out_[32] = uint8_t(updown_bin_ + leftright_bin_);
+
+  // [33] turbo + eco (kept off by default)
+  out_[33] = uint8_t(turbo_bin_ + eco_bin_);
+
+  // [35] quiet
+  out_[35] = quiet_bin_;
+
+  // [19] target temp (0 — when turbo override)
+  out_[19] = (turbo_bin_ == 0b00001100) ? 0x00 : temp_byte_;
+
+  // Recompute CRC and ensure proper trailer
   compute_crc_(out_);
 }
 
 void ACHiClimate::send_write_frame_() {
-  this->rebuild_write_frame_();
+  this->rebuild_write_frame_from_last_status_();
   this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGD(TAG, "Sent write frame (expect unlock 101)");
+  ESP_LOGD(TAG, "Sent write frame (cmd 0x65)");
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
-  // CRC as in legacy: sum bytes [2..size-5] -> [46],[47]; tail [48]=F4, [49]=FB
-  if (buf.size() < 50) return;
+  // CRC как в legacy: сумма по [2..len-5] -> [len-4],[len-3]; хвост [len-2]=F4,[len-1]=FB
+  if (buf.size() < 8) return;
+  const size_t n = buf.size();
   int csum = 0;
-  for (size_t i = 2; i < buf.size() - 4; i++) csum += buf[i];
+  for (size_t i = 2; i < n - 4; i++) csum += buf[i];
   uint8_t cr1 = (csum & 0xFF00) >> 8;
   uint8_t cr2 = (csum & 0x00FF);
-  buf[46] = cr1;
-  buf[47] = cr2;
-  buf[48] = 0xF4;
-  buf[49] = 0xFB;
+  buf[n - 4] = cr1;
+  buf[n - 3] = cr2;
+  buf[n - 2] = 0xF4;
+  buf[n - 1] = 0xFB;
 }
 
 // Frames start with F4 F5 and end with F4 FB
@@ -223,7 +222,7 @@ bool ACHiClimate::parse_next_frame_() {
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
-          if (++guard > 256) break;
+          if (++guard > 512) break;
         }
         return false;
       } else {
@@ -237,11 +236,17 @@ bool ACHiClimate::parse_next_frame_() {
 }
 
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
-  if (bytes.size() < 46) return;
+  if (bytes.size() < 20) return;
+
+  // Save template if this looks like a full frame (keep original header & trailer)
+  if (bytes.size() >= 50 && bytes[13] == 102 /*0x66*/) {
+    last_status_ = bytes;
+    have_status_template_ = true;
+  }
 
   // We only care about cmd=102 (status)
   if (bytes[13] != 102) {
-    // 101 — unlock after write; ignore here
+    // 101 — unlock after write; ignore for state, but accept as acks
     return;
   }
 
@@ -270,16 +275,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   uint8_t tset = bytes[19];
   uint8_t tcur = bytes[20];
 
-  // Flags
-  // quiet: [36] & 0b00000100
-  // turbo: [35] & 0b00000010
-  // eco:   [35] & 0b00000100
-  // led:   [37] & 0b10000000
-  // swing: [35] up/down 0b10000000, left/right 0b01000000
-  bool quiet = (bytes[36] & 0b00000100) != 0;
-  bool turbo = (bytes[35] & 0b00000010) != 0;
-  bool eco   = (bytes[35] & 0b00000100) != 0;
-  bool led   = (bytes[37] & 0b10000000) != 0;
+  // Swing flags — legacy mapping: up/down bit7, left/right bit6 at [35]
   bool ud    = (bytes[35] & 0b10000000) != 0;
   bool lr    = (bytes[35] & 0b01000000) != 0;
 
@@ -296,10 +292,6 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   this->fan_   = new_fan;
   this->swing_ud_ = ud;
   this->swing_lr_ = lr;
-  this->quiet_ = quiet;
-  this->turbo_ = turbo;
-  this->eco_   = eco;
-  this->led_   = led;
   this->room_temp_   = float(tcur);
   this->target_temp_ = float(tset);
 
