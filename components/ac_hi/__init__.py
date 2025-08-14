@@ -1,182 +1,149 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import select, sensor, binary_sensor, text_sensor, uart, switch, number
-from esphome.const import *
 
-DEPENDENCIES = ['uart']
-AUTO_LOAD = ['sensor', 'text_sensor', 'number', 'select', 'switch', 'climate']
+from esphome.components import uart, sensor, switch, text_sensor, number, select
+from esphome.const import (
+    CONF_ID,
+)
 
-CONF_AC_MODE_SELECT = "ac_mode_select"
-CONF_AC_WIND_SELECT = "ac_wind_select"
-CONF_AC_SLEEP_SELECT = "ac_sleep_select"
-CONF_TEMPERATURE_NUMBER = "temperature_number"
-CONF_POWER_SWITCH = "power_switch"
-CONF_QUIET_SWITCH = "quiet_switch"
-CONF_TURBO_SWITCH = "turbo_switch"
-CONF_ECO_SWITCH = "eco_switch"
-CONF_LED_SWITCH = "led_switch"
-CONF_SWING_UP_DOWN_SWITCH = "swing_up_down_switch"
-CONF_SWING_LEFT_RIGHT_SWITCH = "swing_left_right_switch"
+DEPENDENCIES = ["uart"]
+AUTO_LOAD = ["sensor", "switch", "text_sensor", "number", "select"]
 
-CONF_COMPR_FREQ = "compr_freq"
-CONF_COMPR_FREQ_SET = "compr_freq_set"
-CONF_TEMP_CURRENT = "temp_current"
-CONF_TEMP_OUTDOOR = "temp_outdoor"
-CONF_TEMP_OUTDOOR_CONDENSER = "temp_outdoor_condenser"
-CONF_TEMP_PIPE_CURRENT = "temp_pipe_current"
-CONF_TEMP_SET = "temp_set"
-CONF_SENSOR_ECO = "sensor_eco"
-CONF_SENSOR_LED = "sensor_led"
-CONF_SENSOR_MODE = "sensor_mode"
-CONF_POWER_STATUS = "power_status"
+ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 
-ac_hi_ns = cg.esphome_ns.namespace('ac_hi')
-ACHi = ac_hi_ns.class_('ACHi', cg.PollingComponent, uart.UARTDevice)
+ACHIComponent = ac_hi_ns.class_("ACHIComponent", cg.PollingComponent, uart.UARTDevice)
 
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(ACHi),
+# child controls
+ACHISwitch = ac_hi_ns.class_("ACHISwitch", switch.Switch)
+ACHINumber = ac_hi_ns.class_("ACHINumber", number.Number)
+ACHISelect = ac_hi_ns.class_("ACHISelect", select.Select)
 
-    cv.Optional(CONF_AC_MODE_SELECT): cv.use_id(select.Select),
+# enums from C++
+ControlType = ac_hi_ns.enum("ControlType")
 
-    cv.Optional(CONF_COMPR_FREQ):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_FREQUENCY,unit_of_measurement=UNIT_HERTZ,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
+CONF_NAME_PREFIX = "name_prefix"
+CONF_UPDATE_INTERVAL = "update_interval"
 
-    cv.Optional(CONF_COMPR_FREQ_SET):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_FREQUENCY,unit_of_measurement=UNIT_HERTZ,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
+CONFIG_SCHEMA = (
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(ACHIComponent),
+            cv.Optional(CONF_NAME_PREFIX, default="Hisense AC"): cv.string,
+            cv.Optional(CONF_UPDATE_INTERVAL, default="1s"): cv.update_interval,
+        }
+    )
+    .extend(uart.UART_DEVICE_SCHEMA)
+)
 
-    cv.Optional(CONF_SENSOR_ECO):
-        sensor.sensor_schema(accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
+def _mk_sensor(name, **kw):
+    cfg = {"name": name}
+    cfg.update(kw)
+    return sensor.new_sensor(cfg)
 
-    cv.Optional(CONF_SENSOR_LED):
-        sensor.sensor_schema(accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-    
-    cv.Optional(CONF_SENSOR_MODE):
-        sensor.sensor_schema(accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-
-    cv.Optional(CONF_POWER_STATUS):
-        text_sensor.text_sensor_schema().extend(),
-
-    cv.Optional(CONF_TEMP_CURRENT):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-
-    cv.Optional(CONF_TEMP_OUTDOOR):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-
-    cv.Optional(CONF_TEMP_OUTDOOR_CONDENSER):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-    
-    cv.Optional(CONF_TEMP_PIPE_CURRENT):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-
-    cv.Optional(CONF_TEMP_SET):
-        sensor.sensor_schema(device_class=DEVICE_CLASS_TEMPERATURE,unit_of_measurement=UNIT_CELSIUS,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
-    
-    # External (template) entities passed by id
-    cv.Optional(CONF_AC_WIND_SELECT): cv.use_id(select.Select),
-    cv.Optional(CONF_AC_SLEEP_SELECT): cv.use_id(select.Select),
-    cv.Optional(CONF_TEMPERATURE_NUMBER): cv.use_id(number.Number),
-    cv.Optional(CONF_POWER_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_QUIET_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_TURBO_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_ECO_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_LED_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_SWING_UP_DOWN_SWITCH): cv.use_id(switch.Switch),
-    cv.Optional(CONF_SWING_LEFT_RIGHT_SWITCH): cv.use_id(switch.Switch),
-}).extend(uart.UART_DEVICE_SCHEMA)
+def _mk_text_sensor(name, **kw):
+    cfg = {"name": name}
+    cfg.update(kw)
+    return text_sensor.new_text_sensor(cfg)
 
 async def to_code(config):
-    uart_component = await cg.get_variable(config[uart.CONF_UART_ID])
-    var = cg.new_Pvariable(config[CONF_ID], uart_component)
+    var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
 
-    if CONF_AC_MODE_SELECT in config:
-        sel = await cg.get_variable(config[CONF_AC_MODE_SELECT])
-        cg.add(var.set_mode_select(sel))
+    name_prefix = config[CONF_NAME_PREFIX]
 
-    # Bind external controls (template entities) by id if provided
-    if CONF_AC_WIND_SELECT in config:
-        s = await cg.get_variable(config[CONF_AC_WIND_SELECT])
-        cg.add(var.set_wind_select(s))
-    if CONF_AC_SLEEP_SELECT in config:
-        s = await cg.get_variable(config[CONF_AC_SLEEP_SELECT])
-        cg.add(var.set_sleep_select(s))
-    if CONF_TEMPERATURE_NUMBER in config:
-        n = await cg.get_variable(config[CONF_TEMPERATURE_NUMBER])
-        cg.add(var.set_temperature_number(n))
-    if CONF_POWER_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_POWER_SWITCH])
-        cg.add(var.set_power_switch(sw))
-    if CONF_QUIET_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_QUIET_SWITCH])
-        cg.add(var.set_quiet_switch(sw))
-    if CONF_TURBO_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_TURBO_SWITCH])
-        cg.add(var.set_turbo_switch(sw))
-    if CONF_ECO_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_ECO_SWITCH])
-        cg.add(var.set_eco_switch(sw))
-    if CONF_LED_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_LED_SWITCH])
-        cg.add(var.set_led_switch(sw))
-    if CONF_SWING_UP_DOWN_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_SWING_UP_DOWN_SWITCH])
-        cg.add(var.set_swing_up_down_switch(sw))
-    if CONF_SWING_LEFT_RIGHT_SWITCH in config:
-        sw = await cg.get_variable(config[CONF_SWING_LEFT_RIGHT_SWITCH])
-        cg.add(var.set_swing_left_right_switch(sw))
+    # --------- Text sensors ----------
+    power_text = await _mk_text_sensor(f"{name_prefix} Power Status")
 
-    if CONF_COMPR_FREQ in config:
-        conf = config[CONF_COMPR_FREQ]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_compr_freq_sensor(sens))
+    # --------- Numeric sensors ----------
+    wind_s    = await _mk_sensor(f"{name_prefix} Wind", accuracy_decimals=0)
+    sleep_s   = await _mk_sensor(f"{name_prefix} Sleep", accuracy_decimals=0)
+    mode_s    = await _mk_sensor(f"{name_prefix} Mode", accuracy_decimals=0)
 
-    if CONF_COMPR_FREQ_SET in config:
-        conf = config[CONF_COMPR_FREQ_SET]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_compr_freq_set_sensor(sens))
+    t_set     = await _mk_sensor(f"{name_prefix} Temperature Set", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
+    t_cur     = await _mk_sensor(f"{name_prefix} Temperature Current", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
+    t_pipe    = await _mk_sensor(f"{name_prefix} Pipe Temperature Current", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
 
-    if CONF_SENSOR_ECO in config:
-        conf = config[CONF_SENSOR_ECO]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_sensor_eco_sensor(sens))
+    quiet_s   = await _mk_sensor(f"{name_prefix} Quiet", accuracy_decimals=0)
+    turbo_s   = await _mk_sensor(f"{name_prefix} Turbo", accuracy_decimals=0)
+    led_s     = await _mk_sensor(f"{name_prefix} LED", accuracy_decimals=0)
+    eco_s     = await _mk_sensor(f"{name_prefix} Economy", accuracy_decimals=0)
+    lr_s      = await _mk_sensor(f"{name_prefix} Left-Right", accuracy_decimals=0)
+    ud_s      = await _mk_sensor(f"{name_prefix} Up-Down", accuracy_decimals=0)
 
-    if CONF_SENSOR_LED in config:
-        conf = config[CONF_SENSOR_LED]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_sensor_led_sensor(sens))
+    # --------- Switches ----------
+    power_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(power_sw.set_parent(var))
+    cg.add(power_sw.set_type(ControlType.CTRL_POWER))
+    await switch.register_switch(power_sw, {"name": f"{name_prefix} Power"})
 
-    if CONF_SENSOR_MODE in config:
-        conf = config[CONF_SENSOR_MODE]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_sensor_mode_sensor(sens))
+    quiet_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(quiet_sw.set_parent(var))
+    cg.add(quiet_sw.set_type(ControlType.CTRL_QUIET))
+    await switch.register_switch(quiet_sw, {"name": f"{name_prefix} Quiet Mode"})
 
-    if CONF_POWER_STATUS in config:
-        conf = config[CONF_POWER_STATUS]
-        sens = await text_sensor.new_text_sensor(conf)
-        cg.add(var.set_power_status_sensor(sens))
+    turbo_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(turbo_sw.set_parent(var))
+    cg.add(turbo_sw.set_type(ControlType.CTRL_TURBO))
+    await switch.register_switch(turbo_sw, {"name": f"{name_prefix} Turbo Mode"})
 
-    if CONF_TEMP_CURRENT in config:
-        conf = config[CONF_TEMP_CURRENT]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_temp_current_sensor(sens))
-    
-    if CONF_TEMP_OUTDOOR in config:
-        conf = config[CONF_TEMP_OUTDOOR]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_temp_outdoor_sensor(sens))
+    led_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(led_sw.set_parent(var))
+    cg.add(led_sw.set_type(ControlType.CTRL_LED))
+    await switch.register_switch(led_sw, {"name": f"{name_prefix} LED"})
 
-    if CONF_TEMP_OUTDOOR_CONDENSER in config:
-        conf = config[CONF_TEMP_OUTDOOR_CONDENSER]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_temp_outdoor_condenser_sensor(sens))
+    eco_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(eco_sw.set_parent(var))
+    cg.add(eco_sw.set_type(ControlType.CTRL_ECO))
+    await switch.register_switch(eco_sw, {"name": f"{name_prefix} ECO Mode"})
 
-    if CONF_TEMP_PIPE_CURRENT in config:
-        conf = config[CONF_TEMP_PIPE_CURRENT]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_temp_pipe_current_sensor(sens))
+    ud_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(ud_sw.set_parent(var))
+    cg.add(ud_sw.set_type(ControlType.CTRL_UPDOWN))
+    await switch.register_switch(ud_sw, {"name": f"{name_prefix} Up-Down Swing"})
 
-    if CONF_TEMP_SET in config:
-        conf = config[CONF_TEMP_SET]
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_temp_set_sensor(sens))
+    lr_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    cg.add(lr_sw.set_parent(var))
+    cg.add(lr_sw.set_type(ControlType.CTRL_LEFTRIGHT))
+    await switch.register_switch(lr_sw, {"name": f"{name_prefix} Left-Right Swing"})
+
+    # --------- Number (setpoint) ----------
+    temp_num = cg.new_Pvariable(ac_hi_ns.class_("ACHINumber"))
+    cg.add(temp_num.set_parent(var))
+    cg.add(temp_num.set_type(ControlType.CTRL_TEMP))
+    await number.register_number(
+        temp_num,
+        {
+            "name": f"{name_prefix} Temperature",
+            "min_value": 18,
+            "max_value": 28,
+            "step": 1,
+        },
+    )
+
+    # --------- Selects ----------
+    mode_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    cg.add(mode_sel.set_parent(var))
+    cg.add(mode_sel.set_type(ControlType.CTRL_MODE))
+    await select.register_select(mode_sel, {"name": f"{name_prefix} Mode"})
+
+    wind_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    cg.add(wind_sel.set_parent(var))
+    cg.add(wind_sel.set_type(ControlType.CTRL_WIND))
+    await select.register_select(wind_sel, {"name": f"{name_prefix} Wind"})
+
+    sleep_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    cg.add(sleep_sel.set_parent(var))
+    cg.add(sleep_sel.set_type(ControlType.CTRL_SLEEP))
+    await select.register_select(sleep_sel, {"name": f"{name_prefix} Sleep"})
+
+    # --------- Wire children into component ----------
+    cg.add(var.set_entities(
+        power_text,
+        wind_s, sleep_s, mode_s,
+        t_set, t_cur, t_pipe,
+        quiet_s, turbo_s, led_s, eco_s, lr_s, ud_s,
+        power_sw, quiet_sw, turbo_sw, led_sw, eco_sw, ud_sw, lr_sw,
+        temp_num,
+        mode_sel, wind_sel, sleep_sel
+    ))

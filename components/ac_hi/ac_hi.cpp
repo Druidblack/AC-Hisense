@@ -1,523 +1,371 @@
 #include "ac_hi.h"
-#include "esphome/components/climate/climate.h"
 
 namespace esphome {
 namespace ac_hi {
 
-ACHi::ACHi(uart::UARTComponent *parent) : PollingComponent(1000), uart::UARTDevice(parent) {
-  // Initialize pointers to nullptr
-  sensor_wind = nullptr;
-  sensor_sleep = nullptr;
-  sensor_mode = nullptr;
-  temp_set = nullptr;
-  temp_current = nullptr;
-  compr_freq_set = nullptr;
-  compr_freq = nullptr;
-  temp_outdoor = nullptr;
-  temp_outdoor_condenser = nullptr;
-  sensor_quiet = nullptr;
-  sensor_turbo = nullptr;
-  sensor_led = nullptr;
-  sensor_eco = nullptr;
-  temp_pipe_current = nullptr;
-  sensor_left_right = nullptr;
-  sensor_up_down = nullptr;
+using esphome::uart::UARTDevice;
+using esphome::uart::UARTComponent;
 
-  power_status = nullptr;
+static const uint8_t START0 = 0xF4;
+static const uint8_t START1 = 0xF5;
+static const uint8_t END0   = 0xF4;
+static const uint8_t END1   = 0xFB;
 
-  my_temperature = nullptr;
+static const uint8_t CMD_IDX = 13;  // per YAML parsing
 
-  ac_mode_select = nullptr;
-  ac_wind_select = nullptr;
-  ac_sleep_select = nullptr;
-
-  power_switch = nullptr;
-  quiet_switch = nullptr;
-  turbo_switch = nullptr;
-  eco_switch = nullptr;
-  led_switch = nullptr;
-  swing_up_down_switch = nullptr;
-  swing_left_right_switch = nullptr;
+// ------------ ACHISwitch ------------
+void ACHISwitch::write_state(bool state) {
+  if (this->parent_ == nullptr) return;
+  this->parent_->on_switch(this->type_, state);
+  // actual publish happens from parent after device confirms / status arrives
 }
 
-void ACHi::setup() {
-  // Initialize variables
-  this->current_power_ = false;
-  this->current_set_temp_ = 25;  // Default to 25°C
-  this->current_ac_mode_ = "auto";
-  this->current_wind_ = "auto";
-  this->current_sleep_ = "off";
+// ------------ ACHINumber ------------
+void ACHINumber::control(float value) {
+  if (this->parent_ == nullptr) return;
+  this->parent_->on_number(this->type_, value);
+}
 
+// ------------ ACHISelect ------------
+void ACHISelect::control(const std::string &value) {
+  if (this->parent_ == nullptr) return;
+  this->parent_->on_select(this->type_, value);
+}
+
+// ------------ ACHIComponent ------------
+
+void ACHIComponent::setup() {
+  ESP_LOGI(TAG, "AC-Hi component init");
+  // publish initial OFF as в вашем YAML
+  if (this->power_text_ != nullptr) this->power_text_->publish_state("OFF");
+}
+
+void ACHIComponent::update() {
+  // FSM tick every update_interval (default 1s)
+  if (!this->lock_update_ && this->state_ == State::IDLE) {
+    this->send_query_();
+    this->state_ = State::QUERY_SENT;
+  }
+
+  // handle sliding write window
+  if (this->write_changes_ && (millis() >= this->write_deadline_ms_)) {
+    this->maybe_send_write_();
+  }
+}
+
+void ACHIComponent::loop() {
+  // collect bytes only when something is happening
+  while (this->available()) {
+    uint8_t b;
+    if (!this->read_byte(&b)) break;
+    rx_.push_back(b);
+
+    // find end delimiter [F4 FB]
+    size_t n = rx_.size();
+    if (n >= 2 && rx_[n-2] == END0 && rx_[n-1] == END1) {
+      // find start marker in buffer
+      size_t start = 0;
+      for (size_t i = 0; i + 1 < n; i++) {
+        if (rx_[i] == START0 && rx_[i+1] == START1) { start = i; break; }
+      }
+      std::vector<uint8_t> frame(rx_.begin() + start, rx_.end());
+      this->handle_frame_(frame);
+      rx_.clear();
+    }
+  }
+}
+
+void ACHIComponent::send_query_() {
+  // Short request from your YAML (0x66)
+  std::vector<uint8_t> req{0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB};
+  this->write_array(req.data(), req.size());
+  this->state_ = State::WAIT_STATUS;
+  ESP_LOGV(TAG, "Query status sent");
+}
+
+void ACHIComponent::handle_frame_(const std::vector<uint8_t> &bytes) {
+  if (bytes.size() <= 20) return;
+  if (!(bytes[0]==START0 && bytes[1]==START1)) return;
+
+  // 0x102 status payload (bytes[13] == 102) and not during locked write
+  if (bytes[CMD_IDX] == 102 && !this->lock_update_) {
+    // CRC check (sum[2..len-5])
+    int crc = 0;
+    for (size_t i = 2; i < bytes.size()-4; i++) crc += bytes[i];
+
+    if (crc != this->last_status_crc_) {
+      this->last_status_crc_ = crc;
+      this->publish_states_from_102_(bytes);
+    } else {
+      ESP_LOGV(TAG, "Status unchanged (CRC)");
+    }
+    this->state_ = State::IDLE;
+  }
+
+  // 0x101 ack/unlock
+  if (bytes[CMD_IDX] == 101) {
+    this->unlock_on_101_(bytes);
+    this->state_ = State::IDLE;
+  }
+}
+
+void ACHIComponent::publish_states_from_102_(const std::vector<uint8_t> &bytes) {
+  // -------- Power --------
+  bool new_power = (bytes[18] & 0x08) != 0;
+  if (new_power != this->current_power_) {
+    this->current_power_ = new_power;
+  }
+  if (this->power_text_ != nullptr) this->power_text_->publish_state(new_power ? "ON" : "OFF");
+  if (this->power_sw_ != nullptr) this->power_sw_->publish_state(new_power);
+
+  // -------- Wind ----------
+  const char* wind = (bytes[16] < 19) ? this->decode_wind_[bytes[16]] : "off";
+  if (this->current_wind_ != wind) {
+    this->current_wind_ = wind;
+    if (this->wind_s_) this->wind_s_->publish_state(bytes[16]);
+    if (this->wind_sel_) this->wind_sel_->publish_state(this->current_wind_);
+  }
+
+  // -------- Sleep ----------
+  const char* sleep = (bytes[17] < 5) ? this->decode_sleep_[bytes[17]] : "off";
+  if (this->current_sleep_ != sleep) {
+    this->current_sleep_ = sleep;
+    if (this->sleep_s_) this->sleep_s_->publish_state(bytes[17]);
+    if (this->sleep_sel_) this->sleep_sel_->publish_state(this->current_sleep_);
+  }
+
+  // -------- Mode ----------
+  const char* mode = this->decode_mode_[(bytes[18] >> 4) & 0x07];
+  if (this->current_ac_mode_ != mode) {
+    this->current_ac_mode_ = mode;
+    if (this->mode_s_) this->mode_s_->publish_state(bytes[18] >> 4);
+    if (this->mode_sel_) this->mode_sel_->publish_state(this->current_ac_mode_);
+  }
+
+  // -------- Temps ----------
+  if (this->current_set_temp_ != bytes[19]) {
+    this->current_set_temp_ = bytes[19];
+    if (this->t_set_) this->t_set_->publish_state(bytes[19]);
+    // Update number entity to reflect actual setpoint (decoded is already integer 18..28 in your YAML logic)
+    if (this->temp_num_) this->temp_num_->publish_state(this->current_set_temp_);
+  }
+  if (this->t_cur_) this->t_cur_->publish_state(bytes[20]);
+  if (this->t_pipe_) this->t_pipe_->publish_state(bytes[21]);
+
+  // -------- Flags (only for cmd 102) ----------
+  // quiet (byte 36 bit 2)
+  if (this->quiet_s_) {
+    bool q = (bytes[36] & 0x04) != 0;
+    this->quiet_s_->publish_state(q);
+    if (this->quiet_sw_) this->quiet_sw_->publish_state(q);
+  }
+  // eco (byte 35 bit 2)
+  if (this->eco_s_) {
+    bool e = (bytes[35] & 0x04) != 0;
+    this->eco_s_->publish_state(e);
+    if (this->eco_sw_) this->eco_sw_->publish_state(e);
+  }
+  // turbo (byte 35 bit 1)
+  if (this->turbo_s_) {
+    bool t = (bytes[35] & 0x02) != 0;
+    this->turbo_s_->publish_state(t);
+    if (this->turbo_sw_) this->turbo_sw_->publish_state(t);
+  }
+  // LED (byte 37 bit 7)
+  if (this->led_s_) {
+    bool l = (bytes[37] & 0x80) != 0;
+    this->led_s_->publish_state(l);
+    if (this->led_sw_) this->led_sw_->publish_state(l);
+  }
+  // Up-Down (byte 35 bit 7)
+  if (this->ud_s_) {
+    bool ud = (bytes[35] & 0x80) != 0;
+    this->ud_s_->publish_state(ud);
+    if (this->ud_sw_) this->ud_sw_->publish_state(ud);
+  }
+  // Left-Right (byte 35 bit 6)
+  if (this->lr_s_) {
+    bool lr = (bytes[35] & 0x40) != 0;
+    this->lr_s_->publish_state(lr);
+    if (this->lr_sw_) this->lr_sw_->publish_state(lr);
+  }
+}
+
+void ACHIComponent::unlock_on_101_(const std::vector<uint8_t> &/*bytes*/) {
   this->lock_update_ = false;
+  ESP_LOGV(TAG, "Update lock released (0x101)");
+}
+
+void ACHIComponent::on_switch(ControlType t, bool state) {
+  // mirror original YAML behavior & masks
+  switch (t) {
+    case CTRL_POWER:
+      this->power_bin_ = state ? 0b00001100 : 0b00000100;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    case CTRL_QUIET:
+      this->quiet_bin_ = state ? 48 /*0b00110000*/ : 16 /*0b00010000*/;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    case CTRL_TURBO:
+      this->turbo_bin_ = state ? 0b00001100 : 0b00000100;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    case CTRL_LED:
+      // direct byte write (byte 36)
+      this->frame_[36] = state ? 0b11000000 : 0b01000000;
+      this->lock_update_ = true;
+      this->write_changes_ = true;
+      this->write_deadline_ms_ = millis() + 1500;
+      break;
+    case CTRL_ECO:
+      this->eco_bin_ = state ? 0b00110000 : 0b00010000;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    case CTRL_UPDOWN:
+      this->updown_bin_ = state ? 0b11000000 : 0b01000000;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    case CTRL_LEFTRIGHT:
+      this->leftright_bin_ = state ? 0b00110000 : 0b00010000;
+      this->lock_update_ = true;
+      this->schedule_write_();
+      break;
+    default:
+      break;
+  }
+}
+
+void ACHIComponent::on_number(ControlType t, float value) {
+  if (t != CTRL_TEMP) return;
+  // encode: (c << 1) | 1
+  uint8_t c = static_cast<uint8_t>(value);
+  if (c < 17 || c > 30) return; // sanity, YAML used 18..28
+  uint8_t tempX = (c << 1) | 0x01;
+  if (this->current_set_temp_ != c) {
+    this->frame_[19] = tempX;
+    this->lock_update_ = true;
+    this->schedule_write_();
+    ESP_LOGD(TAG, "Target temp set to %d", c);
+  }
+}
+
+void ACHIComponent::on_select(ControlType t, const std::string &value) {
+  if (t == CTRL_MODE) {
+    // table {fan_only, heat, cool, dry, auto} -> {0,1,2,3,4} then <<1 |1 then <<4
+    uint8_t idx = 0;
+    if (value == "heat") idx = 1;
+    else if (value == "cool") idx = 2;
+    else if (value == "dry") idx = 3;
+    else if (value == "auto") idx = 4;
+    uint8_t mode = ((idx << 1) | 0x01) << 4;
+    this->mode_bin_ = mode;
+    this->lock_update_ = true;
+    this->schedule_write_();
+    ESP_LOGD(TAG, "AC mode -> %s", value.c_str());
+  } else if (t == CTRL_WIND) {
+    // {off,auto,lowest,low,medium,high,highest} -> {0,1,10,12,14,16,18} then +1 when writing
+    uint8_t listix = 0;
+    if (value == "auto") listix = 1;
+    else if (value == "lowest") listix = 2;
+    else if (value == "low") listix = 3;
+    else if (value == "medium") listix = 4;
+    else if (value == "high") listix = 5;
+    else if (value == "highest") listix = 6;
+    static const uint8_t codes[7] = {0,1,10,12,14,16,18};
+    uint8_t mode = codes[listix] + 1;
+    this->frame_[16] = mode;
+    this->lock_update_ = true;
+    this->schedule_write_();
+    ESP_LOGD(TAG, "Wind -> %s", value.c_str());
+  } else if (t == CTRL_SLEEP) {
+    // {off, s1, s2, s3, s4} -> {0,1,2,4,8} then <<1 |1
+    uint8_t listix = 0;
+    if (value == "sleep_1") listix = 1;
+    else if (value == "sleep_2") listix = 2;
+    else if (value == "sleep_3") listix = 3;
+    else if (value == "sleep_4") listix = 4;
+    static const uint8_t codes[5] = {0,1,2,4,8};
+    uint8_t mode = (codes[listix] << 1) | 0x01;
+    this->frame_[17] = mode;
+    this->lock_update_ = true;
+    this->schedule_write_();
+    ESP_LOGD(TAG, "Sleep -> %s", value.c_str());
+  }
+}
+
+void ACHIComponent::schedule_write_() {
+  this->write_changes_ = true;
+  this->write_deadline_ms_ = millis() + 1500; // sliding window
+  ESP_LOGV(TAG, "Collecting changes for 1500ms");
+}
+
+void ACHIComponent::maybe_send_write_() {
+  if (!this->write_changes_) return;
   this->write_changes_ = false;
 
-  this->power_bin_ = 0;
-  this->mode_bin_ = 0;
-  this->updown_bin_ = 0;
-  this->leftright_bin_ = 0;
-  this->turbo_bin_ = 0;
-  this->eco_bin_ = 0;
-  this->quiet_bin_ = 0;
-  this->led_bin_ = 0;
+  // Merge fields
+  this->build_write_frame_();
 
-  // Initialize the bytearray with the appropriate length and default values
-  this->bytearray_ = {0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF4, 0xFB};
-
-  this->last_read_time_ = 0;
-  this->last_write_time_ = 0;
-  this->status_crc_ = 0;
-
-  this->pending_write_ = false;
+  // Send
+  this->write_array(this->frame_.data(), this->frame_.size());
+  this->state_ = State::WRITE_SENT;
+  ESP_LOGD(TAG, "Changes written to AC");
 }
 
-void ACHi::update() {
-  ESP_LOGD("ACHi", "Update (apply user intents)");
-  // Power
-  if (this->power_switch != nullptr) {
-    bool desired = this->power_switch->state;
-    if (desired != this->current_power_) {
-      this->set_power(desired);
-    }
-  }
-  // Temperature
-  if (this->my_temperature != nullptr) {
-    uint8_t desired = static_cast<uint8_t>(this->my_temperature->state);
-    if (desired != this->current_set_temp_) {
-      this->set_temperature(desired);
-    }
-  }
-  // Mode
-  if (this->ac_mode_select != nullptr) {
-    std::string desired = this->ac_mode_select->state;
-    if (!desired.empty() && desired != this->current_ac_mode_) {
-      this->set_mode(desired);
-    }
-  }
-  // Wind
-  if (this->ac_wind_select != nullptr) {
-    std::string desired = this->ac_wind_select->state;
-    if (!desired.empty() && desired != this->current_wind_) {
-      this->set_fan_speed(desired);
-    }
-  }
-  // Sleep
-  if (this->ac_sleep_select != nullptr) {
-    std::string desired = this->ac_sleep_select->state;
-    if (!desired.empty() && desired != this->current_sleep_) {
-      this->set_sleep_mode(desired);
-    }
-  }
-  // Quiet
-  if (this->quiet_switch != nullptr) {
-    bool desired = this->quiet_switch->state;
-    if (desired != this->sensor_quiet->state) {
-      this->set_quiet_mode(desired);
-    }
-  }
-  // Turbo
-  if (this->turbo_switch != nullptr) {
-    bool desired = this->turbo_switch->state;
-    if (desired != this->sensor_turbo->state) {
-      this->set_turbo_mode(desired);
-    }
-  }
-  // Eco
-  if (this->eco_switch != nullptr) {
-    bool desired = this->eco_switch->state;
-    if (desired != this->sensor_eco->state) {
-      this->set_eco_mode(desired);
-    }
-  }
-  // LED
-  if (this->led_switch != nullptr) {
-    bool desired = this->led_switch->state;
-    if (desired != this->sensor_led->state) {
-      this->set_led(desired);
-    }
-  }
-  // Swing UD
-  if (this->swing_up_down_switch != nullptr) {
-    bool desired = this->swing_up_down_switch->state;
-    if (this->sensor_up_down != nullptr && desired != this->sensor_up_down->state) {
-      this->set_swing_up_down(desired);
-    }
-  }
-  // Swing LR
-  if (this->swing_left_right_switch != nullptr) {
-    bool desired = this->swing_left_right_switch->state;
-    if (this->sensor_left_right != nullptr && desired != this->sensor_left_right->state) {
-      this->set_swing_left_right(desired);
-    }
-  }
-}
-
-
-void ACHi::loop() {
-  uint32_t now = millis();
-
-  // Periodically send read command every 1000ms
-  if (now - this->last_read_time_ >= 1000) {
-    this->last_read_time_ = now;
-    if (!this->lock_update_) {
-      this->send_read_command();
-    } else {
-      ESP_LOGD("ACHi", "Reading lock enabled. Skipping AC state reading.");
-    }
-  }
-  
-  ESP_LOGD("ACHi", "Time since last write time: %s", to_string(now - this->last_write_time_).c_str());
-  // Handle pending write after delay
-  if (this->pending_write_ && now - this->last_write_time_ >= 1500) {
-    ESP_LOGD("ACHi", "Write start");
-    this->write_changes();
-    this->pending_write_ = false;
-    ESP_LOGD("ACHi", "Write end");
-  }
-
-  // Process incoming data
-  while (available()) {
-    std::vector<uint8_t> data;
-    while (available()) {
-      data.push_back(read());
-    }
-    this->process_incoming_data(data);
-  }
-}
-
-// Send read command to the AC unit
-void ACHi::send_read_command() {
-  std::vector<uint8_t> command = {0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01,
-                                  0x01, 0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00,
-                                  0x00, 0x01, 0xB3, 0xF4, 0xFB};
-  this->write_array(command);
-}
-
-// Process incoming UART data from the AC unit
-void ACHi::process_incoming_data(const std::vector<uint8_t> &bytes) {
-  // Manual debug
-  ESP_LOGD("ACHi", "Status CRC: %s", to_string(this->status_crc_).c_str());
-  for (int val = 0; val < bytes.size(); val++) {
-    if (bytes[val] != 0) {
-      ESP_LOGD("ACHi", "BYTE %s: val %s", to_string(val).c_str(), to_string(bytes[val]).c_str());
-    }
-  }
-  if (bytes.size() > 20 && bytes[0] == 0xF4 && bytes[1] == 0xF5) {
-    // Parse status message from AC commands 102 and 101
-    if ((bytes[13] == 102 && bytes[2] == 1 && !this->lock_update_)) {
-      // Calculate CRC
-      int crc = 0;
-      int arrlen = bytes.size();
-      for (int i = 2; i < arrlen - 4; i++) {
-        crc += bytes[i];
-      }
-      ESP_LOGD("ACHi", "Status CRC New: %s", to_string(crc).c_str());
-      if (crc != this->status_crc_) { //&& bytes[45] < 127
-        this->status_crc_ = crc;
-        ESP_LOGD("ACHi", "Ok");
-        // Parse power status
-        bool power_status = (bytes[18] & 0x08) != 0;
-        //if (this->current_power_ != power_status) {
-          this->current_power_ = power_status;
-          if (this->power_status != nullptr)
-            this->power_status->publish_state(power_status ? "ON" : "OFF");
-          if (this->power_switch != nullptr)
-            this->power_switch->publish_state(power_status);
-        //}
-
-        // Parse current wind
-        std::string wind = this->decode_wind_codes_[bytes[16]];
-        if (this->current_wind_ != wind) {
-          this->current_wind_ = wind;
-          if (this->sensor_wind != nullptr)
-            this->sensor_wind->publish_state(bytes[16]);
-          if (this->ac_wind_select != nullptr)
-            this->ac_wind_select->publish_state(wind);
-        }
-
-        // Parse current sleep mode
-        std::string sleep_mode = this->decode_sleep_codes_[bytes[17]];
-        if (this->current_sleep_ != sleep_mode) {
-          this->current_sleep_ = sleep_mode;
-          if (this->sensor_sleep != nullptr)
-            this->sensor_sleep->publish_state(bytes[17]);
-          if (this->ac_sleep_select != nullptr)
-            this->ac_sleep_select->publish_state(sleep_mode);
-        }
-
-        // Parse current AC mode
-        std::string ac_mode = this->decode_acmode_codes_[bytes[18] >> 4];
-        if (this->current_ac_mode_ != ac_mode) {
-          this->current_ac_mode_ = ac_mode;
-          //if (this->sensor_mode != nullptr)
-          //this->sensor_mode->publish_state(bytes[18] >> 4);
-          //if (this->ac_mode_select != nullptr)
-          //this->ac_mode_select->publish_state(ac_mode);
-        }
-
-        // Parse current set temperature
-        if (this->current_set_temp_ != bytes[19]) {
-          this->current_set_temp_ = bytes[19];
-          if (this->temp_set != nullptr)
-            this->temp_set->publish_state(bytes[19]);
-          if (this->my_temperature != nullptr)
-            this->my_temperature->publish_state(bytes[19]);
-        }
-
-        // Update other sensors
-        if (this->temp_current != nullptr)
-          this->temp_current->publish_state(bytes[20]);
-        if (this->temp_pipe_current != nullptr)
-          this->temp_pipe_current->publish_state(bytes[21]);
-        if (this->compr_freq_set != nullptr)
-          this->compr_freq_set->publish_state(bytes[42]);
-        if (this->compr_freq != nullptr)
-          this->compr_freq->publish_state(bytes[43]);
-        if (this->temp_outdoor != nullptr)
-          this->temp_outdoor->publish_state(bytes[44]);
-        if (this->temp_outdoor_condenser != nullptr)
-          this->temp_outdoor_condenser->publish_state(bytes[45]);
-
-        // Update switches and sensors for special modes if command from AC is 102
-        if (bytes[13] == 102) {
-          // Quiet mode
-          bool quiet = (bytes[35] & 0x30) == 0x30;
-          if (this->sensor_quiet != nullptr)
-            this->sensor_quiet->publish_state(quiet);
-          if (this->quiet_switch != nullptr)
-            this->quiet_switch->publish_state(quiet);
-
-          // Eco mode
-          bool eco = (bytes[33] & 0x30) == 0x30;
-          if (this->sensor_eco != nullptr)
-            this->sensor_eco->publish_state(eco);
-          if (this->eco_switch != nullptr)
-            this->eco_switch->publish_state(eco);
-
-          // Turbo mode
-          bool turbo = (bytes[33] & 0x0C) == 0x0C;
-          if (this->sensor_turbo != nullptr)
-            this->sensor_turbo->publish_state(turbo);
-          if (this->turbo_switch != nullptr)
-            this->turbo_switch->publish_state(turbo);
-
-          // LED
-          bool led = (bytes[36] & 0xC0) == 0xC0;
-          if (this->sensor_led != nullptr)
-            this->sensor_led->publish_state(led);
-          if (this->led_switch != nullptr)
-            this->led_switch->publish_state(led);
-
-          // Swing Up-Down
-          bool swing_ud = (bytes[32] & 0xC0) == 0xC0;
-          if (this->sensor_up_down != nullptr)
-            this->sensor_up_down->publish_state(swing_ud);
-          if (this->swing_up_down_switch != nullptr)
-            this->swing_up_down_switch->publish_state(swing_ud);
-
-          // Swing Left-Right
-          bool swing_lr = (bytes[32] & 0x30) == 0x30;
-          if (this->sensor_left_right != nullptr)
-            this->sensor_left_right->publish_state(swing_lr);
-          if (this->swing_left_right_switch != nullptr)
-            this->swing_left_right_switch->publish_state(swing_lr);
-        }
-
-        ESP_LOGD("ACHi", "pending_write_ = true");
-        this->pending_write_ = true;
-      }
-    }
-
-    // Unlocking updates if command from AC is 101
-    if (bytes[13] == 101 && bytes[2] == 1) {
-      this->lock_update_ = false;
-      ESP_LOGD("ACHi", "Update lock released");
-    }
-  }
-}
-
-// Schedule a write after a delay to collect multiple changes
-void ACHi::schedule_write_changes() {
-  this->write_changes_ = true;
-  this->lock_update_ = true;
-  //this->last_write_time_ = millis();
-  this->pending_write_ = true;
-}
-
-// Implement the logic to write changes to the AC unit
-void ACHi::write_changes() {
-  ESP_LOGD("ACHi", "Writing changes to AC unit.");
-
-  // Merge BIT 18 power & mode
-  this->bytearray_[18] = this->power_bin_ + this->mode_bin_;
-  ESP_LOGD("ACHi", "WRITE BYTE 18: Power - Mode, val %s", to_string(this->bytearray_[18]).c_str());
-
-  // Merge BIT 32 up-down & left-right
-  this->bytearray_[32] = this->updown_bin_ + this->leftright_bin_;
-  ESP_LOGD("ACHi", "WRITE BYTE 32: Up-Down Left-Right, val %s", to_string(this->bytearray_[32]).c_str());
-
-  // Merge BIT 33 turbo & eco
-  this->bytearray_[33] = this->turbo_bin_ + this->eco_bin_;
-  ESP_LOGD("ACHi", "WRITE BYTE 33: Eco - Turbo, val %s", to_string(this->bytearray_[33]).c_str());
-
-  // Quiet mode
-  this->bytearray_[35] = this->quiet_bin_;
-
-  // LED mode
-  this->bytearray_[36] = this->led_bin_;
+void ACHIComponent::build_write_frame_() {
+  // byte 18: power + mode
+  this->frame_[18] = this->power_bin_ + this->mode_bin_;
+  // byte 32: up-down + left-right
+  this->frame_[32] = this->updown_bin_ + this->leftright_bin_;
+  // byte 33: turbo + eco
+  this->frame_[33] = this->turbo_bin_ + this->eco_bin_;
+  // byte 35: quiet
+  this->frame_[35] = this->quiet_bin_;
 
   // Turbo overrides eco & quiet
-  if (this->turbo_bin_ == 0x0C) {
-    this->bytearray_[19] = 0;  // Override temperature
-    this->bytearray_[33] = this->turbo_bin_;  // Override eco
-    this->bytearray_[35] = 0;  // Override quiet
+  if (this->turbo_bin_ == 0b00001100) {
+    this->frame_[19] = 0;         // override temperature
+    this->frame_[33] = this->turbo_bin_; // override eco
+    this->frame_[35] = 0;         // override quiet
   }
 
   // Restore temp settings after turbo off
-  if (this->turbo_bin_ == 0x04) {
-    ESP_LOGD("ACHi", "WRITE BYTE 19: Turbo Off Tempdata, val %s", to_string(this->bytearray_[19]).c_str());
-    // Update temperature
-    if (this->my_temperature != nullptr)
-      this->my_temperature->publish_state(this->my_temperature->state);
+  if (this->turbo_bin_ == 0b00000100) {
+    // keep frame_[19] as previously set
   }
 
   // Quiet overrides turbo & eco when turbo not switching on
-  if (this->quiet_bin_ == 0x30) {
-    this->bytearray_[33] = 0x04;  // Switching off turbo & eco
-    this->bytearray_[35] = this->quiet_bin_;
+  if (this->quiet_bin_ == 48) {
+    this->frame_[33] = 0b00000100; // switching off turbo & eco
+    this->frame_[35] = this->quiet_bin_;
   }
 
-  // Reset bins after use
-  if (this->eco_bin_ == 0x10)
-    this->eco_bin_ = 0;
-  if (this->quiet_bin_ == 0x10)
-    this->quiet_bin_ = 0;
-
-  // Turbo mode always to 0
+  // normalize one-shot bits (per YAML)
+  if (this->eco_bin_ == 0b00010000) this->eco_bin_ = 0;
+  if (this->quiet_bin_ == 16) this->quiet_bin_ = 0;
   this->turbo_bin_ = 0;
 
-  ESP_LOGD("ACHi", "WRITE BYTE 19: Temp setting, val %s", to_string(this->bytearray_[19]).c_str());
+  // CRC
+  put_crc_(this->frame_);
+}
 
-  // Calculate checksum
+void ACHIComponent::put_crc_(std::vector<uint8_t> &buf) {
   short int csum = 0;
-  int arrlen = this->bytearray_.size();
-  for (int i = 2; i < arrlen - 4; i++) {
-    csum += this->bytearray_[i];
+  int arrlen = buf.size();
+  for (int i = 2; i < arrlen - 4; i++) csum += buf[i];
+  uint8_t cr1 = (csum & 0xFF00) >> 8;
+  uint8_t cr2 = (csum & 0x00FF);
+  // positions as in YAML (46,47)
+  if (arrlen > 47) {
+    buf[46] = cr1;
+    buf[47] = cr2;
   }
-
-  uint8_t cr1 = (csum & 0x0000ff00) >> 8;
-  uint8_t cr2 = (csum & 0x000000ff);
-
-  this->bytearray_[46] = cr1;
-  this->bytearray_[47] = cr2;
-
-  // Send the command
-  this->write_array(this->bytearray_);
-  this->last_write_time_ = millis();
-
-  // Reset write flags
-  this->write_changes_ = false;
-  this->lock_update_ = false;
-}
-
-// Control methods implementation
-
-void ACHi::set_power(bool power) {
-  if (this->current_power_ != power) {
-    this->power_bin_ = power ? 0x0C : 0x04;
-    this->schedule_write_changes();
-    ESP_LOGD("ACHi", "Power set to %s", power ? "ON" : "OFF");
-  }
-}
-
-void ACHi::set_temperature(float temperature) {
-  uint8_t temp = static_cast<uint8_t>(temperature);
-  if (temp >= 16 && temp <= 30 && this->current_set_temp_ != temp) {
-    uint8_t tempX = (temp << 1) | 0x01;
-    this->bytearray_[19] = tempX;
-    this->schedule_write_changes();
-    ESP_LOGD("ACHi", "Temperature set to %d", temp);
-  }
-}
-
-void ACHi::set_mode(const std::string &mode) {
-  auto it = std::find(std::begin(this->decode_acmode_codes_), std::end(this->decode_acmode_codes_), mode);
-  if (it != std::end(this->decode_acmode_codes_)) {
-    uint8_t index = std::distance(this->decode_acmode_codes_, it);
-    uint8_t mode_bin = ((this->mode_codes_[index] << 1) | 0x01) << 4;
-    this->mode_bin_ = mode_bin;
-    this->schedule_write_changes();
-    ESP_LOGD("ACHi", "AC mode set to %s", mode);
-  }
-}
-
-void ACHi::set_fan_speed(const std::string &speed) {
-  auto it = std::find(std::begin(this->decode_wind_codes_), std::end(this->decode_wind_codes_), speed);
-  if (it != std::end(this->decode_wind_codes_)) {
-    uint8_t index = std::distance(this->decode_wind_codes_, it);
-    uint8_t mode = this->wind_codes_[index] + 1;
-    this->bytearray_[16] = mode;
-    this->schedule_write_changes();
-    ESP_LOGD("ACHi", "Fan speed set to %s", speed.c_str());
-  }
-}
-
-void ACHi::set_sleep_mode(const std::string &sleep_mode) {
-  auto it = std::find(std::begin(this->decode_sleep_codes_), std::end(this->decode_sleep_codes_), sleep_mode);
-  if (it != std::end(this->decode_sleep_codes_)) {
-    uint8_t index = std::distance(this->decode_sleep_codes_, it);
-    uint8_t mode = (this->sleep_codes_[index] << 1) | 0x01;
-    this->bytearray_[17] = mode;
-    this->schedule_write_changes();
-    ESP_LOGD("ACHi", "Sleep mode set to %s", sleep_mode.c_str());
-  }
-}
-
-void ACHi::set_quiet_mode(bool quiet) {
-  if (quiet) {
-    this->quiet_bin_ = 0x30;
-  } else {
-    this->quiet_bin_ = 0x10;
-  }
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "Quiet mode set to %s", quiet ? "ON" : "OFF");
-}
-
-void ACHi::set_turbo_mode(bool turbo) {
-  if (turbo) {
-    this->turbo_bin_ = 0x0C;
-  } else {
-    this->turbo_bin_ = 0x04;
-  }
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "Turbo mode set to %s", turbo ? "ON" : "OFF");
-}
-
-void ACHi::set_eco_mode(bool eco) {
-  if (eco) {
-    this->eco_bin_ = 0x30;
-  } else {
-    this->eco_bin_ = 0x10;
-  }
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "Eco mode set to %s", eco ? "ON" : "OFF");
-}
-
-void ACHi::set_led(bool led) {
-  this->led_bin_ = led ? 0xC0 : 0x40;
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "LED set to %s", led ? "ON" : "OFF");
-}
-
-void ACHi::set_swing_up_down(bool swing) {
-  this->updown_bin_ = swing ? 0xC0 : 0x40;
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "Swing Up/Down set to %s", swing ? "ON" : "OFF");
-}
-
-void ACHi::set_swing_left_right(bool swing) {
-  this->leftright_bin_ = swing ? 0x30 : 0x10;
-  this->schedule_write_changes();
-  ESP_LOGD("ACHi", "Swing Left/Right set to %s", swing ? "ON" : "OFF");
 }
 
 }  // namespace ac_hi
