@@ -34,7 +34,6 @@ void ACHISelect::control(const std::string &value) {
 
 void ACHIComponent::setup() {
   ESP_LOGI(TAG, "AC-Hi init, creating entities");
-  rx_.reserve(256);  // уменьшает аллокации
 
   // ----- Text sensor -----
   this->power_text_ = new text_sensor::TextSensor();
@@ -137,57 +136,82 @@ void ACHIComponent::update() {
   if (this->has_pending_status_) {
     this->publish_states_from_102_(this->pending_status_);
     this->has_pending_status_ = false;
+    this->first_publish_ = false;
   }
 }
 
-// --- неблокирующий loop(): читаем только доступное, обрабатываем 1 кадр ---
+// --- неблокирующий loop(): читаем только доступное, 1 кадр за итерацию ---
 void ACHIComponent::loop() {
   size_t avail = this->available();
-  if (avail == 0) return;
-
-  size_t chunk = avail > 32 ? 32 : avail;  // жёстче ограничим время цикла
-  for (size_t i = 0; i < chunk; i++) {
+  if (avail > 32) avail = 32;       // жёсткое ограничение времени цикла
+  for (size_t i = 0; i < avail; i++) {
     uint8_t b;
-    if (!this->read_byte(&b)) break;  // non-blocking, т.к. avail > 0
-    rx_.push_back(b);
+    if (!this->read_byte(&b)) break; // non-blocking, т.к. проверили avail
+    rb_push_(b);
   }
 
-  // найти начало
-  size_t start = 0;
-  while (start + 1 < rx_.size() && !(rx_[start] == START0 && rx_[start + 1] == START1)) start++;
-  if (start + 1 >= rx_.size()) {
-    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
+  // парсер: ищем начало
+  size_t cnt = rb_count_();
+  size_t start_idx = 0;
+  for (; start_idx + 1 < cnt; start_idx++) {
+    uint8_t b0, b1;
+    rb_peek_(start_idx, b0);
+    rb_peek_(start_idx + 1, b1);
+    if (b0 == START0 && b1 == START1) break;
+  }
+  if (start_idx + 1 >= cnt) {
+    // нет начала — выбрасываем мусор
+    if (start_idx > 0) rb_pop_n_(start_idx);
+    return;
+  }
+  // есть начало, выбрасываем мусор слева
+  if (start_idx > 0) rb_pop_n_(start_idx);
+
+  // пересчитываем количество после сдвига
+  cnt = rb_count_();
+
+  // ищем конец
+  size_t end_idx = 2;
+  for (; end_idx + 1 < cnt; end_idx++) {
+    uint8_t b0, b1;
+    rb_peek_(end_idx, b0);
+    rb_peek_(end_idx + 1, b1);
+    if (b0 == END0 && b1 == END1) break;
+  }
+  if (end_idx + 1 >= cnt) {
+    // полного кадра ещё нет
     return;
   }
 
-  // найти конец
-  size_t end = start + 2;
-  while (end + 1 < rx_.size() && !(rx_[end] == END0 && rx_[end + 1] == END1)) end++;
-  if (end + 1 >= rx_.size()) {
-    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
-    return;
+  // есть один полный кадр [0..end_idx+1]
+  std::vector<uint8_t> frame;
+  frame.reserve(end_idx + 2);
+  for (size_t i = 0; i <= end_idx + 1; i++) {
+    uint8_t b;
+    rb_peek_(i, b);
+    frame.push_back(b);
   }
+  // удаляем кадр из буфера
+  rb_pop_n_(end_idx + 2);
 
-  // 1 полный кадр [start..end+1] — проверим и отдадим в update()
-  std::vector<uint8_t> frame(rx_.begin() + start, rx_.begin() + end + 2);
-  rx_.erase(rx_.begin(), rx_.begin() + end + 2);
-
-  if (frame.size() > 20 && frame[CMD_IDX] == 102 && !this->lock_update_) {
-    int crc = 0;
-    for (size_t i = 2; i < frame.size() - 4; i++) crc += frame[i];
-    if (crc != this->last_status_crc_) {
-      this->last_status_crc_ = crc;
-      this->pending_status_ = std::move(frame);
-      this->has_pending_status_ = true;   // публикация произойдёт в update()
+  // обработаем заголовок, но публикацию отложим до update()
+  if (frame.size() > 20) {
+    if (frame[CMD_IDX] == 102 && !this->lock_update_) {
+      int crc = 0;
+      for (size_t i = 2; i < frame.size() - 4; i++) crc += frame[i];
+      if (crc != this->last_status_crc_) {
+        this->last_status_crc_ = crc;
+        this->pending_status_ = std::move(frame);
+        this->has_pending_status_ = true;
+      }
+      this->state_ = State::IDLE;
+      return;
     }
-    this->state_ = State::IDLE;
-    return;
-  }
-
-  if (frame.size() > 20 && frame[CMD_IDX] == 101) {
-    this->unlock_on_101_(frame);
-    this->state_ = State::IDLE;
-    return;
+    if (frame[CMD_IDX] == 101) {
+      this->unlock_on_101_(frame);
+      this->state_ = State::IDLE;
+      return;
+    }
   }
 }
 
@@ -199,10 +223,8 @@ void ACHIComponent::send_query_() {
 }
 
 void ACHIComponent::handle_frame_(const std::vector<uint8_t> &bytes) {
-  // (не используется для публикации — оставлено для совместимости, если понадобится)
+  // (не используется для публикации — оставлено для совместимости)
   if (bytes.size() <= 20) return;
-  if (!(bytes[0]==START0 && bytes[1]==START1)) return;
-
   if (bytes[CMD_IDX] == 101) {
     this->unlock_on_101_(bytes);
     this->state_ = State::IDLE;
@@ -210,76 +232,77 @@ void ACHIComponent::handle_frame_(const std::vector<uint8_t> &bytes) {
 }
 
 void ACHIComponent::publish_states_from_102_(const std::vector<uint8_t> &bytes) {
-  // power
+  // --- power ---
   bool new_power = (bytes[18] & 0x08) != 0;
-  if (new_power != this->current_power_) this->current_power_ = new_power;
-  if (this->power_text_) this->power_text_->publish_state(new_power ? "ON" : "OFF");
-  if (this->power_sw_)   this->power_sw_->publish_state(new_power);
+  if (first_publish_ || new_power != last_power_) {
+    last_power_ = new_power;
+    if (this->power_text_) this->power_text_->publish_state(new_power ? "ON" : "OFF");
+    if (this->power_sw_)   this->power_sw_->publish_state(new_power);
+  }
+  this->current_power_ = new_power;
 
-  // wind
-  const char* wind = (bytes[16] < 19) ? this->decode_wind_[bytes[16]] : "off";
-  if (this->current_wind_ != wind) {
+  // --- wind ---
+  uint8_t wind_raw = bytes[16];
+  if (first_publish_ || wind_raw != last_wind_raw_) {
+    last_wind_raw_ = wind_raw;
+    const char* wind = (wind_raw < 19) ? this->decode_wind_[wind_raw] : "off";
     this->current_wind_ = wind;
-    if (this->wind_s_)   this->wind_s_->publish_state(bytes[16]);
+    if (this->wind_s_)   this->wind_s_->publish_state(wind_raw);
     if (this->wind_sel_) this->wind_sel_->publish_state(this->current_wind_);
   }
 
-  // sleep
-  const char* sleep = (bytes[17] < 5) ? this->decode_sleep_[bytes[17]] : "off";
-  if (this->current_sleep_ != sleep) {
+  // --- sleep ---
+  uint8_t sleep_raw = bytes[17];
+  if (first_publish_ || sleep_raw != last_sleep_raw_) {
+    last_sleep_raw_ = sleep_raw;
+    const char* sleep = (sleep_raw < 5) ? this->decode_sleep_[sleep_raw] : "off";
     this->current_sleep_ = sleep;
-    if (this->sleep_s_)   this->sleep_s_->publish_state(bytes[17]);
+    if (this->sleep_s_)   this->sleep_s_->publish_state(sleep_raw);
     if (this->sleep_sel_) this->sleep_sel_->publish_state(this->current_sleep_);
   }
 
-  // mode
-  const char* mode = this->decode_mode_[(bytes[18] >> 4) & 0x07];
-  if (this->current_ac_mode_ != mode) {
+  // --- mode ---
+  uint8_t mode_raw = (bytes[18] >> 4) & 0x07;
+  if (first_publish_ || mode_raw != last_mode_raw_) {
+    last_mode_raw_ = mode_raw;
+    const char* mode = this->decode_mode_[mode_raw];
     this->current_ac_mode_ = mode;
-    if (this->mode_s_)   this->mode_s_->publish_state(bytes[18] >> 4);
+    if (this->mode_s_)   this->mode_s_->publish_state(mode_raw);
     if (this->mode_sel_) this->mode_sel_->publish_state(this->current_ac_mode_);
   }
 
-  // temperatures
-  if (this->current_set_temp_ != bytes[19]) {
-    this->current_set_temp_ = bytes[19];
-    if (this->t_set_)    this->t_set_->publish_state(bytes[19]);
-    if (this->temp_num_) this->temp_num_->publish_state(this->current_set_temp_);
+  // --- temperatures ---
+  uint8_t tset = bytes[19];
+  if (first_publish_ || tset != last_t_set_) {
+    last_t_set_ = tset;
+    if (this->t_set_)    this->t_set_->publish_state(tset);
+    if (this->temp_num_) this->temp_num_->publish_state(tset);
   }
-  if (this->t_cur_)  this->t_cur_->publish_state(bytes[20]);
-  if (this->t_pipe_) this->t_pipe_->publish_state(bytes[21]);
+  uint8_t tcur = bytes[20];
+  if (first_publish_ || tcur != last_t_cur_) {
+    last_t_cur_ = tcur;
+    if (this->t_cur_)    this->t_cur_->publish_state(tcur);
+  }
+  uint8_t tpipe = bytes[21];
+  if (first_publish_ || tpipe != last_t_pipe_) {
+    last_t_pipe_ = tpipe;
+    if (this->t_pipe_)   this->t_pipe_->publish_state(tpipe);
+  }
 
-  // flags
-  if (this->quiet_s_) {
-    bool q = (bytes[36] & 0x04) != 0;
-    this->quiet_s_->publish_state(q);
-    if (this->quiet_sw_) this->quiet_sw_->publish_state(q);
-  }
-  if (this->eco_s_) {
-    bool e = (bytes[35] & 0x04) != 0;
-    this->eco_s_->publish_state(e);
-    if (this->eco_sw_) this->eco_sw_->publish_state(e);
-  }
-  if (this->turbo_s_) {
-    bool t = (bytes[35] & 0x02) != 0;
-    this->turbo_s_->publish_state(t);
-    if (this->turbo_sw_) this->turbo_sw_->publish_state(t);
-  }
-  if (this->led_s_) {
-    bool l = (bytes[37] & 0x80) != 0;
-    this->led_s_->publish_state(l);
-    if (this->led_sw_) this->led_sw_->publish_state(l);
-  }
-  if (this->ud_s_) {
-    bool ud = (bytes[35] & 0x80) != 0;
-    this->ud_s_->publish_state(ud);
-    if (this->ud_sw_) this->ud_sw_->publish_state(ud);
-  }
-  if (this->lr_s_) {
-    bool lr = (bytes[35] & 0x40) != 0;
-    this->lr_s_->publish_state(lr);
-    if (this->lr_sw_) this->lr_sw_->publish_state(lr);
-  }
+  // --- flags ---
+  bool q  = (bytes[36] & 0x04) != 0;
+  bool e  = (bytes[35] & 0x04) != 0;
+  bool t  = (bytes[35] & 0x02) != 0;
+  bool l  = (bytes[37] & 0x80) != 0;
+  bool ud = (bytes[35] & 0x80) != 0;
+  bool lr = (bytes[35] & 0x40) != 0;
+
+  if (first_publish_ || q  != last_quiet_) { last_quiet_  = q;  if (quiet_s_) quiet_s_->publish_state(q);  if (quiet_sw_) quiet_sw_->publish_state(q); }
+  if (first_publish_ || e  != last_eco_)   { last_eco_    = e;  if (eco_s_)   eco_s_->publish_state(e);    if (eco_sw_)   eco_sw_->publish_state(e); }
+  if (first_publish_ || t  != last_turbo_) { last_turbo_  = t;  if (turbo_s_) turbo_s_->publish_state(t);  if (turbo_sw_) turbo_sw_->publish_state(t); }
+  if (first_publish_ || l  != last_led_)   { last_led_    = l;  if (led_s_)   led_s_->publish_state(l);    if (led_sw_)   led_sw_->publish_state(l); }
+  if (first_publish_ || ud != last_ud_)    { last_ud_     = ud; if (ud_s_)    ud_s_->publish_state(ud);    if (ud_sw_)    ud_sw_->publish_state(ud); }
+  if (first_publish_ || lr != last_lr_)    { last_lr_     = lr; if (lr_s_)    lr_s_->publish_state(lr);    if (lr_sw_)    lr_sw_->publish_state(lr); }
 }
 
 void ACHIComponent::unlock_on_101_(const std::vector<uint8_t> &/*bytes*/) {

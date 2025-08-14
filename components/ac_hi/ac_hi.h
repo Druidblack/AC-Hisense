@@ -102,9 +102,36 @@ class ACHIComponent : public PollingComponent, public uart::UARTDevice {
   void unlock_on_101_(const std::vector<uint8_t> &bytes);
   static void put_crc_(std::vector<uint8_t> &buf);
 
+  // --- ring buffer (без erase/memmove) ---
+  static constexpr size_t RB_SIZE = 256;
+  uint8_t rb_[RB_SIZE]{};
+  size_t rb_head_{0};
+  size_t rb_tail_{0};
+  inline size_t rb_count_() const {
+    return (rb_head_ >= rb_tail_) ? (rb_head_ - rb_tail_) : (RB_SIZE - rb_tail_ + rb_head_);
+  }
+  inline void rb_push_(uint8_t b) {
+    rb_[rb_head_] = b;
+    rb_head_ = (rb_head_ + 1) % RB_SIZE;
+    if (rb_head_ == rb_tail_) {            // переполнение — выталкиваем самый старый
+      rb_tail_ = (rb_tail_ + 1) % RB_SIZE;
+    }
+  }
+  inline bool rb_peek_(size_t idx, uint8_t &out) const {
+    size_t cnt = rb_count_();
+    if (idx >= cnt) return false;
+    size_t pos = (rb_tail_ + idx) % RB_SIZE;
+    out = rb_[pos];
+    return true;
+  }
+  inline void rb_pop_n_(size_t n) {
+    size_t cnt = rb_count_();
+    if (n > cnt) n = cnt;
+    rb_tail_ = (rb_tail_ + n) % RB_SIZE;
+  }
+
   // fsm & timers
   State state_{State::IDLE};
-  std::vector<uint8_t> rx_;
   bool write_changes_{false};
   bool lock_update_{false};
   uint32_t write_deadline_ms_{0};
@@ -115,9 +142,9 @@ class ACHIComponent : public PollingComponent, public uart::UARTDevice {
   bool has_pending_status_{false};
 
   // encoding tables
-  const char* decode_mode_[8] = { "fan_only","heat","cool","dry","auto","auto","auto","auto" };
-  const char* decode_wind_[19] = { "off","auto","auto","","","","","","","", "lowest","","low","","medium","","high","","highest" };
-  const char* decode_sleep_[5] = { "off","sleep_1","sleep_2","sleep_3","sleep_4" };
+  const char* decode_mode_[8]  = {"fan_only","heat","cool","dry","auto","auto","auto","auto"};
+  const char* decode_wind_[19] = {"off","auto","auto","","","","","","","", "lowest","","low","","medium","","high","","highest"};
+  const char* decode_sleep_[5] = {"off","sleep_1","sleep_2","sleep_3","sleep_4"};
 
   // outgoing frame template
   std::vector<uint8_t> frame_ = {0xF4,0xF5,0x00,0x40,0x29,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x65,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xF4,0xFB};
@@ -131,12 +158,28 @@ class ACHIComponent : public PollingComponent, public uart::UARTDevice {
   uint8_t eco_bin_{0};
   uint8_t quiet_bin_{0};
 
-  // current state mirrors
+  // current state mirrors (для сравнения и анти-флуда)
   bool current_power_{false};
   uint8_t current_set_temp_{0};
   std::string current_ac_mode_{};
   std::string current_wind_{};
   std::string current_sleep_{};
+
+  // кеш последних значений (для публикации только при изменении)
+  bool last_power_{false};
+  uint8_t last_wind_raw_{0xFF};
+  uint8_t last_sleep_raw_{0xFF};
+  uint8_t last_mode_raw_{0xFF};
+  uint8_t last_t_set_{0xFF};
+  uint8_t last_t_cur_{0xFF};
+  uint8_t last_t_pipe_{0xFF};
+  bool last_quiet_{false};
+  bool last_eco_{false};
+  bool last_turbo_{false};
+  bool last_led_{false};
+  bool last_ud_{false};
+  bool last_lr_{false};
+  bool first_publish_{true};
 
   // name prefix
   std::string name_prefix_{"Hisense AC"};
