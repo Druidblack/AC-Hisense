@@ -13,9 +13,10 @@ namespace ac_hi {
 
 /**
  * ACHiClimate — нативный ESPHome climate для кондиционеров Ballu/Hisense по RS-485.
- * Реализация основана на рабочем legacy-конфиге (ballu_legacy.yaml): читаем статус (cmd 0x66),
- * формируем запись изменяя поля последнего статус-кадра и отправляя cmd 0x65 с корректной CRC.
- * YAML-лямбды не нужны: всё управление через ClimateCall.
+ * Статусы читаем командой 0x66, запись параметров — командой 0x65.
+ * Кадры длинного формата (тип 0x29) формируются из корректного базового шаблона,
+ * CRC — 16-битная сумма по [2..len-5], последние два байта — контрольная сумма,
+ * затем хвост 0xF4 0xFB.
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
@@ -30,40 +31,37 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void control(const climate::ClimateCall &call) override;
 
   // ===== I/O helpers =====
-  void send_status_request_();
-  void send_write_frame_();
-  void rebuild_write_frame_from_last_status_();
+  void send_status_request_();          // длинный статус (0x29 + 0x66)
+  void send_write_frame_();             // запись (0x29 + 0x65)
+  void build_base_long_frame_();        // заполнить out_ базовым шаблоном 50 байт
+  void apply_intent_to_frame_();        // проставить в out_ текущие power/mode/temp/fan/swing
   void compute_crc_(std::vector<uint8_t> &buf);
   bool parse_next_frame_();
   void handle_status_(const std::vector<uint8_t> &bytes);
 
   // ===== State =====
-  // last known state (from status 102)
   bool power_{false};
   float room_temp_{NAN};
-  float target_temp_{NAN};
+  float target_temp_{24.0f};
+
   climate::ClimateMode mode_{climate::CLIMATE_MODE_AUTO};
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   bool swing_ud_{false};
   bool swing_lr_{false};
 
-  // write-intent fields (match legacy encoding)
-  uint8_t power_bin_{0x04};      // base (bit2); ON adds bit3
+  // write-intent поля (соответствуют реверсу)
+  uint8_t power_bin_{0x04};      // базовый 0x04; ON добавляет bit3 в составном байте
   uint8_t mode_bin_{0x10};       // ((idx<<1)|1)<<4
   uint8_t wind_code_{0x01};      // 1=auto; low/med/high -> 12/14/16
-  uint8_t temp_byte_{0x00};      // ((°C)<<1)|1, or 0 when turbo override
+  uint8_t temp_byte_{(24 << 1) | 1}; // ((°C)<<1)|1
   uint8_t updown_bin_{0x10};     // 0x30 on, 0x10 off -> [32]
   uint8_t leftright_bin_{0x04};  // 0x0C on, 0x04 off -> [32]
-  uint8_t turbo_bin_{0x04};      // 0x0C on, 0x04 off -> [33]
-  uint8_t eco_bin_{0x40};        // 0xC0 on, 0x40 off -> [33]
-  uint8_t quiet_bin_{0x10};      // 0x30 on, 0x10 off -> [35]
 
-  // last received full status frame (used as template for writes)
+  // Последний принятый статус (не обязателен для записи, но полезен для анализа)
   std::vector<uint8_t> last_status_;
-  bool have_status_template_{false};
 
-  // outbound frame buffer (same length as last_status_)
-  std::vector<uint8_t> out_;
+  // Рабочий буфер исходящего кадра (50 байт)
+  std::vector<uint8_t> out_{50, 0x00};
 
   // RX ring buffer
   static constexpr size_t RB_SIZE = 512;

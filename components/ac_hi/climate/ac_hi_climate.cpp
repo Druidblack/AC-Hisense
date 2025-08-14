@@ -11,9 +11,13 @@ static const char *const TAG = "ac_hi.climate";
 
 void ACHiClimate::setup() {
   ESP_LOGI(TAG, "Init climate over RS-485");
+  // Большинство Hisense/Ballu работают 9600 8N1 (RS-485 полудуплекс через автодирекшн платы TXD/RXD)
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 
-  // Request first status soon (we build write-frames from it)
+  // Сформируем базовый длинный кадр (тип 0x29)
+  this->build_base_long_frame_();
+
+  // Стартовый опрос
   this->set_timeout("init_status", 1000, [this]() { this->send_status_request_(); });
 }
 
@@ -71,11 +75,6 @@ void ACHiClimate::loop() {
 // ======================= Control =======================
 
 void ACHiClimate::control(const climate::ClimateCall &call) {
-  if (!have_status_template_) {
-    ESP_LOGW(TAG, "Write ignored until first status template is received");
-    return;
-  }
-
   bool need_write = false;
 
   if (call.get_mode().has_value()) {
@@ -92,7 +91,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
       uint8_t idx = 4; // auto
       if (m == climate::CLIMATE_MODE_HEAT) idx = 1;
       else if (m == climate::CLIMATE_MODE_COOL) idx = 2;
-      else if (m == climate::CLIMATE_MODE_DRY) idx = 3;
+      else if (m == climate::CLIMATE_MODE_DRY)  idx = 3;
       else if (m == climate::CLIMATE_MODE_FAN_ONLY) idx = 0;
       mode_bin_ = uint8_t((((idx << 1) | 0x01) << 4));
     }
@@ -111,7 +110,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
   if (call.get_fan_mode().has_value()) {
     auto f = *call.get_fan_mode();
     this->fan_mode = f;
-    // map to wind code used by protocol
+    // map to wind code used by протокол статуса
     if (f == climate::CLIMATE_FAN_AUTO)        wind_code_ = 1;
     else if (f == climate::CLIMATE_FAN_LOW)    wind_code_ = 12;
     else if (f == climate::CLIMATE_FAN_MEDIUM) wind_code_ = 14;
@@ -135,62 +134,91 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 
 // ======================= Protocol I/O =======================
 
-void ACHiClimate::send_status_request_() {
-  // Short status request (cmd 0x66 / 102) — проверено в legacy
-  const uint8_t req[] = {
-    0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
-  };
-  this->write_array(req, sizeof(req));
-  this->flush();
-  ESP_LOGVV(TAG, "Sent status request (102)");
+void ACHiClimate::build_base_long_frame_() {
+  // Базовый “длинный” пакет 50 байт (тип 0x29) как в проверенных примерах Hisense/AirCon
+  out_.assign(50, 0x00);
+  out_[0]  = 0xF4;
+  out_[1]  = 0xF5;
+  out_[2]  = 0x00;   // адрес/флаг (оставим 0x00; при необходимости подменится устройством)
+  out_[3]  = 0x40;
+  out_[4]  = 0x29;   // длинный пакет
+  out_[5]  = 0x00;
+  out_[6]  = 0x00;
+  out_[7]  = 0x01;
+  out_[8]  = 0x01;
+  out_[9]  = 0xFE;
+  out_[10] = 0x01;   // важно: в реальных кадрах = 0x01
+  out_[11] = 0x00;
+  out_[12] = 0x00;
+  // out_[13] — команда: 0x65 (write) / 0x66 (status)
+  // остальное заполним нулями; поля ниже мы изменяем в apply_intent_to_frame_()
+  out_[48] = 0xF4;
+  out_[49] = 0xFB;
 }
 
-void ACHiClimate::rebuild_write_frame_from_last_status_() {
-  // Start from last status frame as template
-  out_ = last_status_;               // copy full frame
-  if (out_.size() < 50) out_.resize(50, 0x00);
-
-  // Header/trailer stay as-is from status.
-  // Switch command to WRITE (0x65) at [13]
-  out_[13] = 0x65;
-
-  // Apply fields
-  // [16] wind (protocol uses +1 in writes; status already raw)
+void ACHiClimate::apply_intent_to_frame_() {
+  // Команда уже выставляется вызывающей стороной (write/status).
+  // Ниже — поля по реверсу (см. комментарии в исходниках).
+  // [16] скорость вентилятора (для записи требуется +1 к коду статуса)
   out_[16] = uint8_t(wind_code_ + 1);
 
-  // [18] power + mode
+  // [18] составной байт: питание + режим
   out_[18] = uint8_t(power_bin_ + mode_bin_);
   if ((power_bin_ & 0b00001000) == 0) {
     out_[18] = uint8_t(out_[18] & (~(1U<<3)));
   }
 
-  // [32] swing (up-down + left-right)
-  updown_bin_    = swing_ud_ ? 0b00110000 : 0b00010000;
-  leftright_bin_ = swing_lr_ ? 0b00001100 : 0b00000100;
-  out_[32] = uint8_t(updown_bin_ + leftright_bin_);
+  // [19] уставка температуры (°C *2 | 1)
+  out_[19] = temp_byte_;
 
-  // [33] turbo + eco (kept off by default)
-  out_[33] = uint8_t(turbo_bin_ + eco_bin_);
+  // [32] качание жалюзи (UD + LR)
+  uint8_t updown    = swing_ud_ ? 0b00110000 : 0b00010000;
+  uint8_t leftright = swing_lr_ ? 0b00001100 : 0b00000100;
+  out_[32] = uint8_t(updown + leftright);
 
-  // [35] quiet
-  out_[35] = quiet_bin_;
+  // Прочие флаги (turbo/eco/quiet/LED) не трогаем — оставляем 0x00 по умолчанию.
+  // Пересчёт CRC ниже.
+}
 
-  // [19] target temp (0 — when turbo override)
-  out_[19] = (turbo_bin_ == 0b00001100) ? 0x00 : temp_byte_;
+void ACHiClimate::send_status_request_() {
+  // Длинный запрос статуса: тот же базовый 0x29, но команда 0x66
+  this->build_base_long_frame_();
+  out_[13] = 0x66;
+  // Для статуса не важно, что в полях — но выставим текущие значения, некоторые контроллеры это учитывают
+  this->apply_intent_to_frame_();
+  this->compute_crc_(out_);
 
-  // Recompute CRC and ensure proper trailer
-  compute_crc_(out_);
+  this->write_array(out_.data(), out_.size());
+  this->flush();
+  ESP_LOGVV(TAG, "TX status req(0x66, 0x29)");
 }
 
 void ACHiClimate::send_write_frame_() {
-  this->rebuild_write_frame_from_last_status_();
+  this->build_base_long_frame_();
+  out_[13] = 0x65;        // команда записи
+  this->apply_intent_to_frame_();
+  this->compute_crc_(out_);
+
+  // Отправка
   this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGD(TAG, "Sent write frame (cmd 0x65)");
+
+  // Дамп для диагностики
+  std::string dump;
+  for (size_t i = 0; i < out_.size(); i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02X ", out_[i]);
+    dump += b;
+    if ((i + 1) % 16 == 0) dump += "\n";
+  }
+  ESP_LOGD(TAG, "TX write(0x65):\n%s", dump.c_str());
+
+  // После записи сразу попросим статус, чтобы HA не “откатывал” значения
+  this->set_timeout("post_write_status", 150, [this]() { this->send_status_request_(); });
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
-  // CRC как в legacy: сумма по [2..len-5] -> [len-4],[len-3]; хвост [len-2]=F4,[len-1]=FB
+  // Контрольная сумма: сумма по [2..len-5] в 16-бит (big-endian), затем 0xF4 0xFB в хвосте
   if (buf.size() < 8) return;
   const size_t n = buf.size();
   int csum = 0;
@@ -238,62 +266,57 @@ bool ACHiClimate::parse_next_frame_() {
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 20) return;
 
-  // Save template if this looks like a full frame (keep original header & trailer)
-  if (bytes.size() >= 50 && bytes[13] == 102 /*0x66*/) {
-    last_status_ = bytes;
-    have_status_template_ = true;
-  }
+  last_status_ = bytes;
 
-  // We only care about cmd=102 (status)
-  if (bytes[13] != 102) {
-    // 101 — unlock after write; ignore for state, but accept as acks
+  // Интересен cmd=102 (0x66)
+  if (bytes.size() > 13 && bytes[13] != 102) {
+    // 101 — “unlock/ack” после записи; игнорируем для состояния
     return;
   }
 
-  // Power (bit3 in [18])
-  bool new_power = (bytes[18] & 0b00001000) != 0;
-  // Mode — high nibble of [18]
-  uint8_t mode_raw = (bytes[18] >> 4) & 0x0F;
-  climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
-  switch (mode_raw) {
-    case 0: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
-    case 1: new_mode = climate::CLIMATE_MODE_HEAT;     break;
-    case 2: new_mode = climate::CLIMATE_MODE_COOL;     break;
-    case 3: new_mode = climate::CLIMATE_MODE_DRY;      break;
-    default: new_mode = climate::CLIMATE_MODE_AUTO;    break;
+  // Power (bit3 в [18])
+  if (bytes.size() > 18) {
+    bool new_power = (bytes[18] & 0b00001000) != 0;
+    this->power_ = new_power;
   }
 
-  // Fan — [16]
-  uint8_t wind_raw = bytes[16];
-  climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
-  if (wind_raw == 12) new_fan = climate::CLIMATE_FAN_LOW;
-  else if (wind_raw == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
-  else if (wind_raw == 16) new_fan = climate::CLIMATE_FAN_HIGH;
-  else if (wind_raw == 1)  new_fan = climate::CLIMATE_FAN_AUTO;
+  // Mode: верхняя тетрада [18]
+  if (bytes.size() > 18) {
+    uint8_t mode_raw = (bytes[18] >> 4) & 0x0F;
+    climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
+    switch (mode_raw) {
+      case 0: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
+      case 1: new_mode = climate::CLIMATE_MODE_HEAT;     break;
+      case 2: new_mode = climate::CLIMATE_MODE_COOL;     break;
+      case 3: new_mode = climate::CLIMATE_MODE_DRY;      break;
+      default: new_mode = climate::CLIMATE_MODE_AUTO;    break;
+    }
+    this->mode = this->power_ ? new_mode : climate::CLIMATE_MODE_OFF;
+  }
 
-  // Temperatures — setpoint and current
-  uint8_t tset = bytes[19];
-  uint8_t tcur = bytes[20];
+  // Fan — [16] (в статусе коды: 1/12/14/16)
+  if (bytes.size() > 16) {
+    uint8_t wind_raw = bytes[16];
+    climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
+    if (wind_raw == 12) new_fan = climate::CLIMATE_FAN_LOW;
+    else if (wind_raw == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
+    else if (wind_raw == 16) new_fan = climate::CLIMATE_FAN_HIGH;
+    else if (wind_raw == 1)  new_fan = climate::CLIMATE_FAN_AUTO;
+    this->fan_mode = new_fan;
+  }
 
-  // Swing flags — legacy mapping: up/down bit7, left/right bit6 at [35]
-  bool ud    = (bytes[35] & 0b10000000) != 0;
-  bool lr    = (bytes[35] & 0b01000000) != 0;
+  // Температуры — [19] уставка, [20] текущая
+  if (bytes.size() > 20) {
+    this->target_temperature  = float(bytes[19]);
+    this->current_temperature = float(bytes[20]);
+  }
 
-  // Publish into Climate
-  this->current_temperature = float(tcur);
-  this->target_temperature  = float(tset);
-  this->mode      = new_power ? new_mode : climate::CLIMATE_MODE_OFF;
-  this->fan_mode  = new_fan;
-  this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
-
-  // Mirror to internal state
-  this->power_ = new_power;
-  this->mode_  = new_mode;
-  this->fan_   = new_fan;
-  this->swing_ud_ = ud;
-  this->swing_lr_ = lr;
-  this->room_temp_   = float(tcur);
-  this->target_temp_ = float(tset);
+  // Качание — биты в [35]: bit7 UD, bit6 LR
+  if (bytes.size() > 35) {
+    bool ud = (bytes[35] & 0b10000000) != 0;
+    bool lr = (bytes[35] & 0b01000000) != 0;
+    this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
+  }
 
   this->publish_state();
 }
