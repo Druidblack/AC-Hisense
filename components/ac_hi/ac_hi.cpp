@@ -131,39 +131,41 @@ void ACHIComponent::update() {
 
 // --- неблокирующий loop() ---
 void ACHIComponent::loop() {
-  // читаем максимум 128 байт за вызов — non-blocking
-  uint8_t buf[128];
-  size_t n = this->read_array(buf, sizeof(buf));
-  if (n == 0) return;
+  // читаем только то, что уже есть в буфере UART — без ожиданий/таймаутов
+  size_t avail = this->available();
+  if (avail == 0) return;
 
-  // добавляем к общему RX-буферу
-  rx_.insert(rx_.end(), buf, buf + n);
+  // ограничим за один заход, чтобы не «жевать» слишком много за цикл
+  size_t chunk = avail > 96 ? 96 : avail;
 
-  // быстрый разбор всех полных кадров
-  for (;;) {
-    // поиск начала
-    size_t start = 0;
-    while (start + 1 < rx_.size() && !(rx_[start] == START0 && rx_[start + 1] == START1)) start++;
-    if (start + 1 >= rx_.size()) {
-      if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
-      break;
-    }
-
-    // поиск конца
-    size_t end = start + 2;
-    while (end + 1 < rx_.size() && !(rx_[end] == END0 && rx_[end + 1] == END1)) end++;
-    if (end + 1 >= rx_.size()) {
-      if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);
-      break;
-    }
-
-    // полный кадр [start..end+1]
-    std::vector<uint8_t> frame(rx_.begin() + start, rx_.begin() + end + 2);
-    this->handle_frame_(frame);
-
-    // удалить обработанный кадр
-    rx_.erase(rx_.begin(), rx_.begin() + end + 2);
+  for (size_t i = 0; i < chunk; i++) {
+    uint8_t b;
+    if (!this->read_byte(&b)) break;  // не должно блокировать, т.к. avail > 0
+    rx_.push_back(b);
   }
+
+  // быстрый разбор: обрабатываем максимум ОДИН полный кадр за один вызов loop()
+  // (это держит время выполнения маленьким и стабильным)
+  // ищем начало
+  size_t start = 0;
+  while (start + 1 < rx_.size() && !(rx_[start] == START0 && rx_[start + 1] == START1)) start++;
+  if (start + 1 >= rx_.size()) {
+    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);  // выбросить мусор слева
+    return;
+  }
+
+  // ищем конец
+  size_t end = start + 2;
+  while (end + 1 < rx_.size() && !(rx_[end] == END0 && rx_[end + 1] == END1)) end++;
+  if (end + 1 >= rx_.size()) {
+    if (start > 0) rx_.erase(rx_.begin(), rx_.begin() + start);  // оставим хвост с начала кадра
+    return;
+  }
+
+  // есть полный кадр [start..end+1] — обработать и удалить
+  std::vector<uint8_t> frame(rx_.begin() + start, rx_.begin() + end + 2);
+  this->handle_frame_(frame);
+  rx_.erase(rx_.begin(), rx_.begin() + end + 2);
 }
 
 void ACHIComponent::send_query_() {
