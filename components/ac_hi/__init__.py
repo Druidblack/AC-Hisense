@@ -35,16 +35,6 @@ CONFIG_SCHEMA = (
     .extend(uart.UART_DEVICE_SCHEMA)
 )
 
-def _mk_sensor(name, **kw):
-    cfg = {"name": name}
-    cfg.update(kw)
-    return sensor.new_sensor(cfg)
-
-def _mk_text_sensor(name, **kw):
-    cfg = {"name": name}
-    cfg.update(kw)
-    return text_sensor.new_text_sensor(cfg)
-
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -53,86 +43,108 @@ async def to_code(config):
     name_prefix = config[CONF_NAME_PREFIX]
 
     # --------- Text sensors ----------
-    power_text = await _mk_text_sensor(f"{name_prefix} Power Status")
+    power_text = cg.new_Pvariable(text_sensor.TextSensor())
+    await text_sensor.register_text_sensor(power_text, {"name": f"{name_prefix} Power Status"})
 
     # --------- Numeric sensors ----------
-    wind_s    = await _mk_sensor(f"{name_prefix} Wind", accuracy_decimals=0)
-    sleep_s   = await _mk_sensor(f"{name_prefix} Sleep", accuracy_decimals=0)
-    mode_s    = await _mk_sensor(f"{name_prefix} Mode", accuracy_decimals=0)
+    wind_s  = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(wind_s,  {"name": f"{name_prefix} Wind", "accuracy_decimals": 0})
 
-    t_set     = await _mk_sensor(f"{name_prefix} Temperature Set", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
-    t_cur     = await _mk_sensor(f"{name_prefix} Temperature Current", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
-    t_pipe    = await _mk_sensor(f"{name_prefix} Pipe Temperature Current", accuracy_decimals=0, unit_of_measurement="°C", device_class="temperature", state_class="measurement")
+    sleep_s = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(sleep_s, {"name": f"{name_prefix} Sleep", "accuracy_decimals": 0})
 
-    quiet_s   = await _mk_sensor(f"{name_prefix} Quiet", accuracy_decimals=0)
-    turbo_s   = await _mk_sensor(f"{name_prefix} Turbo", accuracy_decimals=0)
-    led_s     = await _mk_sensor(f"{name_prefix} LED", accuracy_decimals=0)
-    eco_s     = await _mk_sensor(f"{name_prefix} Economy", accuracy_decimals=0)
-    lr_s      = await _mk_sensor(f"{name_prefix} Left-Right", accuracy_decimals=0)
-    ud_s      = await _mk_sensor(f"{name_prefix} Up-Down", accuracy_decimals=0)
+    mode_s  = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(mode_s,  {"name": f"{name_prefix} Mode", "accuracy_decimals": 0})
+
+    t_set   = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(t_set,   {"name": f"{name_prefix} Temperature Set", "accuracy_decimals": 0, "unit_of_measurement": "°C", "device_class": "temperature", "state_class": "measurement"})
+
+    t_cur   = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(t_cur,   {"name": f"{name_prefix} Temperature Current", "accuracy_decimals": 0, "unit_of_measurement": "°C", "device_class": "temperature", "state_class": "measurement"})
+
+    t_pipe  = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(t_pipe,  {"name": f"{name_prefix} Pipe Temperature Current", "accuracy_decimals": 0, "unit_of_measurement": "°C", "device_class": "temperature", "state_class": "measurement"})
+
+    quiet_s = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(quiet_s, {"name": f"{name_prefix} Quiet", "accuracy_decimals": 0})
+
+    turbo_s = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(turbo_s, {"name": f"{name_prefix} Turbo", "accuracy_decimals": 0})
+
+    led_s   = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(led_s,   {"name": f"{name_prefix} LED", "accuracy_decimals": 0})
+
+    eco_s   = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(eco_s,   {"name": f"{name_prefix} Economy", "accuracy_decimals": 0})
+
+    lr_s    = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(lr_s,    {"name": f"{name_prefix} Left-Right", "accuracy_decimals": 0})
+
+    ud_s    = cg.new_Pvariable(sensor.Sensor())
+    await sensor.register_sensor(ud_s,    {"name": f"{name_prefix} Up-Down", "accuracy_decimals": 0})
 
     # --------- Switches ----------
-    power_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    power_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(power_sw.set_parent(var))
     cg.add(power_sw.set_type(ControlType.CTRL_POWER))
     await switch.register_switch(power_sw, {"name": f"{name_prefix} Power"})
 
-    quiet_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    quiet_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(quiet_sw.set_parent(var))
     cg.add(quiet_sw.set_type(ControlType.CTRL_QUIET))
     await switch.register_switch(quiet_sw, {"name": f"{name_prefix} Quiet Mode"})
 
-    turbo_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    turbo_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(turbo_sw.set_parent(var))
     cg.add(turbo_sw.set_type(ControlType.CTRL_TURBO))
     await switch.register_switch(turbo_sw, {"name": f"{name_prefix} Turbo Mode"})
 
-    led_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    led_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(led_sw.set_parent(var))
     cg.add(led_sw.set_type(ControlType.CTRL_LED))
     await switch.register_switch(led_sw, {"name": f"{name_prefix} LED"})
 
-    eco_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    eco_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(eco_sw.set_parent(var))
     cg.add(eco_sw.set_type(ControlType.CTRL_ECO))
     await switch.register_switch(eco_sw, {"name": f"{name_prefix} ECO Mode"})
 
-    ud_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    ud_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(ud_sw.set_parent(var))
     cg.add(ud_sw.set_type(ControlType.CTRL_UPDOWN))
     await switch.register_switch(ud_sw, {"name": f"{name_prefix} Up-Down Swing"})
 
-    lr_sw = cg.new_Pvariable(ac_hi_ns.class_("ACHISwitch"))
+    lr_sw = cg.new_Pvariable(ACHISwitch)
     cg.add(lr_sw.set_parent(var))
     cg.add(lr_sw.set_type(ControlType.CTRL_LEFTRIGHT))
     await switch.register_switch(lr_sw, {"name": f"{name_prefix} Left-Right Swing"})
 
     # --------- Number (setpoint) ----------
-    temp_num = cg.new_Pvariable(ac_hi_ns.class_("ACHINumber"))
+    temp_num = cg.new_Pvariable(ACHINumber)
     cg.add(temp_num.set_parent(var))
     cg.add(temp_num.set_type(ControlType.CTRL_TEMP))
     await number.register_number(
         temp_num,
         {
             "name": f"{name_prefix} Temperature",
-            "min_value": 18,
-            "max_value": 28,
-            "step": 1,
+            "min_value": 18.0,
+            "max_value": 28.0,
+            "step": 1.0,
         },
     )
 
     # --------- Selects ----------
-    mode_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    mode_sel = cg.new_Pvariable(ACHISelect)
     cg.add(mode_sel.set_parent(var))
     cg.add(mode_sel.set_type(ControlType.CTRL_MODE))
     await select.register_select(mode_sel, {"name": f"{name_prefix} Mode"})
 
-    wind_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    wind_sel = cg.new_Pvariable(ACHISelect)
     cg.add(wind_sel.set_parent(var))
     cg.add(wind_sel.set_type(ControlType.CTRL_WIND))
     await select.register_select(wind_sel, {"name": f"{name_prefix} Wind"})
 
-    sleep_sel = cg.new_Pvariable(ac_hi_ns.class_("ACHISelect"))
+    sleep_sel = cg.new_Pvariable(ACHISelect)
     cg.add(sleep_sel.set_parent(var))
     cg.add(sleep_sel.set_type(ControlType.CTRL_SLEEP))
     await select.register_select(sleep_sel, {"name": f"{name_prefix} Sleep"})
