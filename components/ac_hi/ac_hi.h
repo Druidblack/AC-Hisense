@@ -110,6 +110,10 @@ class ACHIComponent : public PollingComponent, public uart::UARTDevice {
   uint32_t write_deadline_ms_{0};
   int last_status_crc_{-1};
 
+  // перенос публикации в update()
+  std::vector<uint8_t> pending_status_;
+  bool has_pending_status_{false};
+
   // encoding tables
   const char* decode_mode_[8] = { "fan_only","heat","cool","dry","auto","auto","auto","auto" };
   const char* decode_wind_[19] = { "off","auto","auto","","","","","","","", "lowest","","low","","medium","","high","","highest" };

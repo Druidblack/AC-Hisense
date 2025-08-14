@@ -132,6 +132,12 @@ void ACHIComponent::update() {
   if (this->write_changes_ && (millis() >= this->write_deadline_ms_)) {
     this->maybe_send_write_();
   }
+
+  // публикуем состояние ТОЛЬКО здесь (а не в loop)
+  if (this->has_pending_status_) {
+    this->publish_states_from_102_(this->pending_status_);
+    this->has_pending_status_ = false;
+  }
 }
 
 // --- неблокирующий loop(): читаем только доступное, обрабатываем 1 кадр ---
@@ -139,7 +145,7 @@ void ACHIComponent::loop() {
   size_t avail = this->available();
   if (avail == 0) return;
 
-  size_t chunk = avail > 64 ? 64 : avail;  // ограничим время цикла
+  size_t chunk = avail > 32 ? 32 : avail;  // жёстче ограничим время цикла
   for (size_t i = 0; i < chunk; i++) {
     uint8_t b;
     if (!this->read_byte(&b)) break;  // non-blocking, т.к. avail > 0
@@ -162,10 +168,27 @@ void ACHIComponent::loop() {
     return;
   }
 
-  // обработать 1 полный кадр [start..end+1]
+  // 1 полный кадр [start..end+1] — проверим и отдадим в update()
   std::vector<uint8_t> frame(rx_.begin() + start, rx_.begin() + end + 2);
-  this->handle_frame_(frame);
   rx_.erase(rx_.begin(), rx_.begin() + end + 2);
+
+  if (frame.size() > 20 && frame[CMD_IDX] == 102 && !this->lock_update_) {
+    int crc = 0;
+    for (size_t i = 2; i < frame.size() - 4; i++) crc += frame[i];
+    if (crc != this->last_status_crc_) {
+      this->last_status_crc_ = crc;
+      this->pending_status_ = std::move(frame);
+      this->has_pending_status_ = true;   // публикация произойдёт в update()
+    }
+    this->state_ = State::IDLE;
+    return;
+  }
+
+  if (frame.size() > 20 && frame[CMD_IDX] == 101) {
+    this->unlock_on_101_(frame);
+    this->state_ = State::IDLE;
+    return;
+  }
 }
 
 void ACHIComponent::send_query_() {
@@ -176,21 +199,9 @@ void ACHIComponent::send_query_() {
 }
 
 void ACHIComponent::handle_frame_(const std::vector<uint8_t> &bytes) {
+  // (не используется для публикации — оставлено для совместимости, если понадобится)
   if (bytes.size() <= 20) return;
   if (!(bytes[0]==START0 && bytes[1]==START1)) return;
-
-  if (bytes[CMD_IDX] == 102 && !this->lock_update_) {
-    int crc = 0;
-    for (size_t i = 2; i < bytes.size()-4; i++) crc += bytes[i];
-
-    if (crc != this->last_status_crc_) {
-      this->last_status_crc_ = crc;
-      this->publish_states_from_102_(bytes);
-    } else {
-      ESP_LOGV(TAG, "Status unchanged (CRC)");
-    }
-    this->state_ = State::IDLE;
-  }
 
   if (bytes[CMD_IDX] == 101) {
     this->unlock_on_101_(bytes);
