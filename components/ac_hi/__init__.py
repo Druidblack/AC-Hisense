@@ -7,7 +7,6 @@ DEPENDENCIES = ['uart']
 AUTO_LOAD = ['sensor', 'text_sensor', 'number', 'select', 'switch', 'climate']
 
 CONF_AC_MODE_SELECT = "ac_mode_select"
-
 CONF_AC_WIND_SELECT = "ac_wind_select"
 CONF_AC_SLEEP_SELECT = "ac_sleep_select"
 CONF_TEMPERATURE_NUMBER = "temperature_number"
@@ -37,7 +36,7 @@ ACHi = ac_hi_ns.class_('ACHi', cg.PollingComponent, uart.UARTDevice)
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(ACHi),
 
-    cv.Optional(CONF_AC_MODE_SELECT): select.select_schema().extend(),
+    cv.Optional(CONF_AC_MODE_SELECT): cv.use_id(select.Select),
 
     cv.Optional(CONF_COMPR_FREQ):
         sensor.sensor_schema(device_class=DEVICE_CLASS_FREQUENCY,unit_of_measurement=UNIT_HERTZ,accuracy_decimals=0,state_class=STATE_CLASS_MEASUREMENT).extend(),
