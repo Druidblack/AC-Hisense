@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <cstring>  // memcpy
 
 namespace esphome {
 namespace ac_hi {
@@ -25,10 +26,10 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void set_update_interval(uint32_t ms) { update_interval_ms_ = ms; }
 
   // опциональные сенсоры
-  void set_tset_sensor(sensor::Sensor *s)   { tset_s_ = s; }
-  void set_tcur_sensor(sensor::Sensor *s)   { tcur_s_ = s; }
-  void set_tout_sensor(sensor::Sensor *s)   { tout_s_ = s; }
-  void set_tpipe_sensor(sensor::Sensor *s)  { tpipe_s_ = s; }
+  void set_tset_sensor(sensor::Sensor *s)     { tset_s_ = s; }
+  void set_tcur_sensor(sensor::Sensor *s)     { tcur_s_ = s; }
+  void set_tout_sensor(sensor::Sensor *s)     { tout_s_ = s; }
+  void set_tpipe_sensor(sensor::Sensor *s)    { tpipe_s_ = s; }
   void set_compfreq_sensor(sensor::Sensor *s) { compfreq_s_ = s; }
 
   void setup() override;
@@ -45,6 +46,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void compute_crc_(std::vector<uint8_t> &buf);
   void send_status_request_short_();       // короткий статус (0x66) — фиксированный кадр
   void send_status_request_long_clean_();  // длинный «чистый» статус 0x66 с обученной шапкой
+  void send_write_frame_();                // ЗАПИСЬ 0x65 + пост-опрос   <-- добавлено объявление
   void learn_header_(const std::vector<uint8_t> &bytes);
   void handle_status_(const std::vector<uint8_t> &bytes);
   void log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data);
@@ -59,7 +61,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   // входной буфер
   std::vector<uint8_t> rx_buf_;
 
-  // «обученная» шапка [2..12] для длинных кадров
+  // «обученная» шапка [2..12] для длинных пакетов
   uint8_t header_[11]{0x00};
   bool header_learned_{false};
 

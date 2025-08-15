@@ -13,7 +13,7 @@ static const char *const TAG = "ac_hi.climate";
 void ACHiClimate::setup() {
   ESP_LOGI(TAG, "Init climate over RS-485");
   // протокол: 9600 8N1
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
+  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);  // :contentReference[oaicite:1]{index=1}
 
   // дефолтная шапка (переобучится на первом реальном кадре)
   const uint8_t def_hdr[11] = {0x00,0x40,0x29,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00};
@@ -24,7 +24,7 @@ void ACHiClimate::setup() {
   this->mode = climate::CLIMATE_MODE_OFF;
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
-  this->publish_state();
+  this->publish_state();  // :contentReference[oaicite:2]{index=2}
 }
 
 void ACHiClimate::dump_config() {
@@ -70,13 +70,11 @@ void ACHiClimate::loop() {
   // разбираем полные кадры
   const uint8_t tail[2] = {0xF4, 0xFB};
   for (;;) {
-    // ищем начало
-    auto it_begin = std::search(rx_buf_.begin(), rx_buf_.end(), std::begin(tail), std::end(tail));
-    // поиск хвоста делаем сдвигом: минимальная длина кадра ~20
+    // ищем конец кадра (хвост)
     auto it_tail = std::search(rx_buf_.begin() + 2, rx_buf_.end(), std::begin(tail), std::end(tail));
     if (it_tail == rx_buf_.end()) break; // нет конца — ждём
 
-    // собрать кадр
+    // собрать кадр от начала буфера до хвоста (включая хвост)
     std::vector<uint8_t> frame(rx_buf_.begin(), it_tail + 2);
     learn_header_(frame);
     this->log_hex_dump_("RX frame", frame);
@@ -163,7 +161,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
     suppress_until_ms_ = millis() + 2500;
   }
 
-  this->publish_state();
+  this->publish_state();  // уведомляем HA об обновлении состояния устройства :contentReference[oaicite:3]{index=3}
 }
 
 // ======================= Protocol I/O =======================
@@ -222,8 +220,7 @@ void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
 }
 
 void ACHiClimate::send_status_request_short_() {
-  // КОРОТКИЙ запрос статуса (cmd 0x66) — бесшумный и стабильный.
-  // ВНИМАНИЕ: у этого формата однобайтный CRC (последний перед F4 FB). Поэтому оставляем фиксированный кадр.
+  // КОРОТКИЙ запрос статуса (cmd 0x66) — фиксированный кадр (однобайтный CRC перед F4 FB)
   // F4 F5 00 40 0C 00 00 01 01 FE 01 00 00 66 00 00 00 01 B3 F4 FB
   const uint8_t req[] = {
     0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
@@ -264,7 +261,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
 
   if (cmd == 101) {
     // ACK после записи — запросим ещё и длинный статус.
-    this->set_timeout("after_ack_long_status", 120, [this]() { this->send_status_request_long_clean_(); });
+    this->set_timeout("after_ack_long_status", 120, [this]() { this->send_status_request_long_clean_(); }); // :contentReference[oaicite:4]{index=4}
     this->last_rx_ms_ = millis();
     return;
   }
@@ -327,8 +324,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
   }
 
-  // Доп-датчики: место под outdoor/pipe/частоту компрессора — если известны байты, публикуем
-  // (в legacy они были, но смещения зависят от модели; заполняй по месту — или пришли дамп, добавлю точно)
+  // Доп-датчики — места под outdoor/pipe/частоту компрессора (если известны байты, можно раскомментировать)
   if (tout_s_)   {/* tout_s_->publish_state(...); */}
   if (tpipe_s_)  {/* tpipe_s_->publish_state(...); */}
   if (compfreq_s_) {/* compfreq_s_->publish_state(...); */}
@@ -336,8 +332,6 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   this->publish_state();
   this->last_rx_ms_ = millis();
 }
-
-// ======================= Logging helpers ========
 
 void ACHiClimate::log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data) {
   std::string dump;
@@ -351,37 +345,8 @@ void ACHiClimate::log_hex_dump_(const char *prefix, const std::vector<uint8_t> &
   ESP_LOGD(TAG, "%s:\n%s", prefix, dump.c_str());
 }
 
-// ======================= Write (private) =======================
+// ======================= Write =======================
 
-void ACHiClimate::send_status_request_short_() {
-  const uint8_t req[] = {
-    0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
-  };
-  this->write_array(req, sizeof(req));
-  this->flush();
-  ESP_LOGD(TAG, "TX status req (0x66 short)");
-}
-
-void ACHiClimate::send_status_request_long_clean_() {
-  this->build_base_long_frame_();
-  out_[13] = 0x66;
-  this->compute_crc_(out_);
-  this->write_array(out_.data(), out_.size());
-  this->flush();
-  ESP_LOGD(TAG, "TX status req (0x66 long, clean) hdr:%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-           out_[2],out_[3],out_[4],out_[5],out_[6],out_[7],out_[8],out_[9],out_[10],out_[11],out_[12]);
-}
-
-void ACHiClimate::build_base_long_frame_(); // уже выше
-
-// Отправка записи + пост-опрос
-static inline void _noop() {}
-
-void ACHiClimate::apply_intent_to_frame_();  // уже выше
-
-void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf); // уже выше
-
-// Отправка длиной записи с текущим намерением
 void ACHiClimate::send_write_frame_() {
   this->build_base_long_frame_();
   out_[13] = 0x65;     // запись
@@ -391,8 +356,8 @@ void ACHiClimate::send_write_frame_() {
   this->flush();
   this->log_hex_dump_("TX write(0x65)", out_);
 
-  // Пост-опрос: короткий сразу + длинный с задержкой
-  this->set_timeout("post_write_status_short", 120, [this]() { this->send_status_request_short_(); });
+  // Пост-опрос: короткий сразу + длинный с небольшой задержкой
+  this->set_timeout("post_write_status_short", 120, [this]() { this->send_status_request_short_(); });  // :contentReference[oaicite:5]{index=5}
   this->set_timeout("post_write_status_long",  280, [this]() { this->send_status_request_long_clean_(); });
 }
 
