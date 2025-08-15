@@ -7,7 +7,6 @@
 #include "esphome/components/sensor/sensor.h"
 #include <vector>
 #include <string>
-#include <cmath>
 #include <cstring>
 
 namespace esphome {
@@ -16,7 +15,7 @@ namespace ac_hi {
 /**
  * ACHiClimate — ESPHome climate для Ballu/Hisense RS-485.
  * Кадры: F4 F5 ... F4 FB, статус 0x66, запись 0x65.
- * MIRROR-WRITE: берём последний 0x66 и меняем только нужные поля.
+ * MIRROR-WRITE: копируем последний 0x66 и изменяем ТОЛЬКО [18] (питание+режим) и [19] (уставка).
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
@@ -41,7 +40,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void learn_from_status_(const std::vector<uint8_t> &bytes); // учим заголовок/служебные поля
   void handle_status_(const std::vector<uint8_t> &bytes);
   void send_status_request_short_();                          // короткий 0x66
-  void send_write_frame_();                                   // MIRROR-WRITE на базе последнего статуса
+  void send_write_frame_();                                   // MIRROR-WRITE
   void compute_crc_(std::vector<uint8_t> &buf);
   void log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data);
 
@@ -56,13 +55,13 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   uint8_t  expected_mode_byte_{0};
   uint32_t guard_deadline_ms_{0};
 
-  // накопитель входящих байт
+  // входной буфер
   std::vector<uint8_t> rx_buf_;
 
-  // заголовок/служебные поля, выученные из статуса
+  // служебные поля, выученные из статуса
   uint8_t header_[11]{0x01,0x40,0x29,0x01,0x00,0xFE,0x01,0x01,0x01,0x01,0x00}; // дефолт, перезапишем
   uint8_t fld14_{0x00};     // [14]
-  uint8_t fld15_{0x01};     // [15] — у тебя всегда 0x01
+  uint8_t fld15_{0x01};     // [15] — у тебя 0x01
   uint8_t fld23_{0x80};     // [23] — у тебя 0x80
   bool header_learned_{false};
 
@@ -70,18 +69,13 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   std::vector<uint8_t> last_status_;
 
   // намерение
-  bool   power_{false};
-  float  target_temp_{24};
+  bool    power_{false};
+  float   target_temp_{24};
   uint8_t temp_byte_{24};     // просто °C
-  bool swing_ud_{false};
-  bool swing_lr_{false};
 
-  // ВАЖНО: power-бит = 0x08. OFF=0x00, ON=0x08
-  uint8_t power_bin_{0};      // 0x00=OFF, 0x08=ON
+  // ВАЖНО: power-бит = 0x08 (ON) / 0x00 (OFF)
+  uint8_t power_bin_{0};
   uint8_t mode_bin_{0};       // 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
-  uint8_t turbo_bin_{0};
-  uint8_t eco_bin_{0};
-  uint8_t quiet_bin_{0};
 
   // сенсоры (опц.)
   sensor::Sensor *tset_s_{nullptr};

@@ -9,19 +9,18 @@ namespace ac_hi {
 static const char *const TAG = "ac_hi.climate";
 
 void ACHiClimate::setup() {
-  ESP_LOGI(TAG, "Init climate over RS-485");
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);  // проверка UART :contentReference[oaicite:0]{index=0}
-
+  // проверка UART-конфигурации (9600 8N1)
+  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);  // api docs: UARTDevice::check_uart_settings
   // стартовое состояние
   this->target_temperature = target_temp_;
   this->mode = climate::CLIMATE_MODE_OFF;
-  this->fan_mode = climate::CLIMATE_FAN_AUTO;
+  this->fan_mode = climate::CLIMATE_FAN_AUTO;   // фан пока только авто (безопасно для приёма)
   this->swing_mode = climate::CLIMATE_SWING_OFF;
-  this->publish_state();  // опубликовать состояние в HA :contentReference[oaicite:1]{index=1}
+  this->publish_state(); // уведомить HA
 }
 
 void ACHiClimate::dump_config() {
-  ESP_LOGCONFIG(TAG, "AC-Hi (Ballu/Hisense) Climate (mirror-write)");
+  ESP_LOGCONFIG(TAG, "AC-Hi Climate (Ballu/Hisense) — mirror-write [18],[19] only");
   ESP_LOGCONFIG(TAG, "  Update interval: %u ms", (unsigned)update_interval_ms_);
 }
 
@@ -35,12 +34,8 @@ climate::ClimateTraits ACHiClimate::traits() {
       climate::CLIMATE_MODE_AUTO,
       climate::CLIMATE_MODE_FAN_ONLY,
   });
-  t.set_supported_fan_modes({
-      climate::CLIMATE_FAN_AUTO,
-      climate::CLIMATE_FAN_LOW,
-      climate::CLIMATE_FAN_MEDIUM,
-      climate::CLIMATE_FAN_HIGH,
-  });
+  // чтобы не рисковать при записи, оставляем управляемую скорость только AUTO
+  t.set_supported_fan_modes({ climate::CLIMATE_FAN_AUTO });
   t.set_supported_swing_modes({
       climate::CLIMATE_SWING_OFF,
       climate::CLIMATE_SWING_BOTH,
@@ -87,22 +82,19 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
-      power_bin_ = 0x00;      // OFF = 0x00  (ВАЖНО!)
-      mode_bin_  = 0x00;      // можно занулить тетрадку режима
+      power_bin_ = 0x00;      // OFF
+      mode_bin_  = 0x00;
       this->mode = climate::CLIMATE_MODE_OFF;
       this->power_ = false;
     } else {
-      power_bin_ = 0x08;      // ON  = 0x08  (ВАЖНО!)
+      power_bin_ = 0x08;      // ON
       this->mode = m;
       this->power_ = true;
-
-      // индексы: 0=FAN_ONLY,1=HEAT,2=COOL,3=DRY,4=AUTO
       uint8_t idx = 4; // AUTO
       if (m == climate::CLIMATE_MODE_HEAT) idx = 1;
       else if (m == climate::CLIMATE_MODE_COOL) idx = 2;
       else if (m == climate::CLIMATE_MODE_DRY)  idx = 3;
       else if (m == climate::CLIMATE_MODE_FAN_ONLY) idx = 0;
-
       mode_bin_ = uint8_t(idx << 4);
     }
     need_write = true;
@@ -114,34 +106,28 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
     if (t > 30.0f) t = 30.0f;
     this->target_temperature = t;
     target_temp_ = t;
-    temp_byte_ = uint8_t(t); // целые °C
+    temp_byte_ = static_cast<uint8_t>(t); // целые °C
     need_write = true;
   }
 
-  if (call.get_swing_mode().has_value()) {
-    auto s = *call.get_swing_mode();
-    swing_ud_ = (s == climate::CLIMATE_SWING_BOTH);
-    swing_lr_ = (s == climate::CLIMATE_SWING_BOTH);
-    this->swing_mode = s;
-    need_write = true;
-  }
-
+  // (на этом этапе мы сознательно НЕ меняем [16], [32..35] — см. send_write_frame_)
   if (need_write) {
-    // ожидаемый [18] = (mode<<4) + power(0x00/0x08)
-    expected_mode_byte_   = uint8_t(mode_bin_ + power_bin_);
+    expected_mode_byte_     = uint8_t(mode_bin_ + power_bin_);
     guard_mode_until_match_ = true;
-    guard_deadline_ms_      = millis() + 6000;   // ждём до 6с подтверждение тем же [18]
+    guard_deadline_ms_      = millis() + 6000;   // ждём подтверждение до 6с
     suppress_until_ms_      = millis() + 2500;
 
     this->send_write_frame_();
+    // чтобы не сдублировать ближайший периодический опрос, чуть сдвинем
+    last_poll_ = millis() + 500;  // следующий короткий опрос не раньше чем через 0.5с
   }
 
-  this->publish_state();  // обновить карточку HA :contentReference[oaicite:2]{index=2}
+  this->publish_state(); // обновить карточку HA
 }
 
 void ACHiClimate::send_status_request_short_() {
   // Короткий 0x66 (стандартный)
-  const uint8_t req[] = {
+  static const uint8_t req[] = {
     0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
   };
   this->write_array(req, sizeof(req));
@@ -149,15 +135,14 @@ void ACHiClimate::send_status_request_short_() {
   ESP_LOGD(TAG, "TX status req (0x66 short)");
 }
 
-// ======= MIRROR-WRITE =======
+// ======= MIRROR-WRITE: меняем ТОЛЬКО [18] и [19] =======
 void ACHiClimate::send_write_frame_() {
   std::vector<uint8_t> out;
 
   if (!last_status_.empty()) {
-    // копируем статус целиком (такая же длина, те же служебные байты)
-    out = last_status_;
+    out = last_status_;              // копируем статус целиком (та же длина/поля)
   } else {
-    // аварийно: заготовка (50 байт), но у тебя status длинный — лучше дождаться last_status_
+    // экстренно: заготовка (редкий случай старта без статуса)
     out.assign(50, 0x00);
     out[0] = 0xF4; out[1] = 0xF5;
     for (int i = 0; i < 11; i++) out[2 + i] = header_[i];
@@ -167,22 +152,15 @@ void ACHiClimate::send_write_frame_() {
   const size_t n = out.size();
   if (n < 24) return;
 
+  // строго сохраняем «родные» служебные байты
   out[13] = 0x65;      // команда = запись
   out[14] = fld14_;    // как в статусе
   out[15] = fld15_;    // адрес/канал
-  // [16] не трогаем (в твоих статусах там часто 0x01/0x00)
-  out[18] = expected_mode_byte_;  // режим+питание (power=0x08!)
+  // [16] не трогаем — как в статусе
+  // МЕНЯЕМ ТОЛЬКО:
+  out[18] = expected_mode_byte_;  // режим+питание (power=0x08 / 0x00)
   out[19] = temp_byte_;           // уставка (целые °C)
-
-  // свинги/флаги — сведены к OFF/BOTH (оставлю как раньше)
-  if (n > 32) {
-    uint8_t updown    = swing_ud_ ? 0b00110000 : 0b00010000;
-    uint8_t leftright = swing_lr_ ? 0b00001100 : 0b00000100;
-    out[32] = uint8_t(updown + leftright);
-  }
-  if (n > 33) out[33] = uint8_t(turbo_bin_ + eco_bin_);
-  if (n > 35) out[35] = quiet_bin_;
-  if (n > 23) out[23] = fld23_;  // оставить нативный 0x80
+  // [23], [32..35] и прочее — НЕ трогаем
 
   // CRC: сумма по [2..n-5] → [n-4]=hi, [n-3]=lo
   int csum = 0;
@@ -196,14 +174,15 @@ void ACHiClimate::send_write_frame_() {
   this->flush();
   this->log_hex_dump_("TX write(0x65)", out);
 
-  // пост-опрос: короткий статус
-  this->set_timeout("post_write_status_short", 180, [this]() { this->send_status_request_short_(); });  // таймеры в компонентах :contentReference[oaicite:3]{index=3}
+  // пост-опрос: короткий статус (через ~180 мс)
+  this->set_timeout("post_write_status_short", 180, [this]() { this->send_status_request_short_(); });
 }
 
 void ACHiClimate::learn_from_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() <= 24) return;
   if (bytes[13] != 0x66) return; // только валидный статус
 
+  // шапка [2..12]
   for (int i = 0; i < 11; i++) header_[i] = bytes[2 + i];
   fld14_ = bytes[14];
   fld15_ = bytes[15];
@@ -216,7 +195,7 @@ void ACHiClimate::learn_from_status_(const std::vector<uint8_t> &bytes) {
              header_[5],header_[6],header_[7],header_[8],header_[9],header_[10],
              fld14_, fld15_, fld23_);
   }
-  last_status_ = bytes; // для mirror-write
+  last_status_ = bytes; // сохранить для mirror-write
 }
 
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
@@ -256,7 +235,7 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     }
 
     if (allow_mode_update) {
-      bool rx_power = (b & 0x08) != 0;  // ← ключевое изменение — ровно 0x08
+      bool rx_power = (b & 0x08) != 0;
       if (!rx_power) {
         this->mode = climate::CLIMATE_MODE_OFF;
         this->power_ = false;
@@ -270,13 +249,6 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
         else             this->mode = climate::CLIMATE_MODE_AUTO;
       }
     }
-  }
-
-  // свинг (если будут биты — сведём к BOTH/OFF)
-  if (bytes.size() > 35) {
-    bool ud = (bytes[35] & 0x80) != 0;
-    bool lr = (bytes[35] & 0x40) != 0;
-    this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
   }
 
   this->publish_state();
