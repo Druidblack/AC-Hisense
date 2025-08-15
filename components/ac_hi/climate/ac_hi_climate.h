@@ -62,7 +62,7 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
 
   // write-intent (по рабочему legacy yaml)
   uint8_t power_bin_{0x04};                 // база 0x04; ON добавляет bit3
-  uint8_t mode_bin_{0x10};                  // ((idx<<1)|1)<<4  — odd-nibble схема
+  uint8_t mode_bin_{0x40};                  // idx<<4 — код режима в старшем полубайте
   uint8_t wind_code_{0x01};                 // 1=auto; 12/14/16=low/med/high
   uint8_t temp_byte_{(24u << 1) | 1u};      // ((°C)<<1)|1
   uint8_t updown_bin_{0x10};                // 0x30 on, 0x10 off -> [32]

@@ -314,6 +314,7 @@ void ACHIComponent::on_switch(ControlType t, bool state) {
   switch (t) {
     case CTRL_POWER:
       this->power_bin_ = state ? 0b00001100 : 0b00000100;
+      if (!state) this->mode_bin_ = 0x00;  // clear mode when turning off
       this->lock_update_ = true;
       this->schedule_write_();
       break;
@@ -373,7 +374,7 @@ void ACHIComponent::on_select(ControlType t, const std::string &value) {
     else if (value == "cool") idx = 2;
     else if (value == "dry") idx = 3;
     else if (value == "auto") idx = 4;
-    uint8_t mode = ((idx << 1) | 0x01) << 4;
+    uint8_t mode = idx << 4;
     this->mode_bin_ = mode;
     this->lock_update_ = true;
     this->schedule_write_();
