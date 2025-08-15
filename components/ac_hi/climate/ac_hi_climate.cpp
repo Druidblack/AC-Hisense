@@ -20,7 +20,7 @@ void ACHiClimate::setup() {
   this->build_base_long_frame_();
 
   // Первый опрос статуса (короткий, «тихий»)
-  this->set_timeout("init_status", 500, [this]() { this->send_status_request_(); });
+  this->set_timeout("init_status", 500, [this]() { this->send_status_request_short_(); });
 }
 
 void ACHiClimate::dump_config() {
@@ -80,7 +80,7 @@ void ACHiClimate::loop() {
   // Периодический короткий опрос
   if (now - this->last_poll_ >= this->update_interval_ms_) {
     this->last_poll_ = now;
-    this->send_status_request_();
+    this->send_status_request_short_();
   }
 
   // Если давно не слышим ответов — редкий длинный «чистый» опрос (без пищалки-спама)
@@ -156,14 +156,13 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
 // ======================= Protocol I/O =======================
 
 void ACHiClimate::build_base_long_frame_() {
-  // Длинный “базовый” пакет 50 байт (тип 0x29) — по рабочему yaml
+  // Длинный “базовый” пакет 50 байт (тип 0x29)
   out_.assign(50, 0x00);
   out_[0]  = 0xF4; out_[1]  = 0xF5;
-  out_[2]  = 0x00; out_[3]  = 0x40;
-  out_[4]  = 0x29;
-  out_[5]  = 0x00; out_[6]  = 0x00; out_[7]  = 0x01;
-  out_[8]  = 0x01; out_[9]  = 0xFE; out_[10] = 0x01;
-  out_[11] = 0x00; out_[12] = 0x00;
+
+  // заголовок [2..12] — дефолтный либо обученный
+  for (int i = 0; i < 11; i++) out_[2 + i] = header_[i];
+
   // [13] — команда (0x65 write / 0x66 status)
   // [23] — в рабочем yaml был 0x04 (оставляем)
   out_[23] = 0x04;
@@ -195,8 +194,9 @@ void ACHiClimate::apply_intent_to_frame_() {
   out_[35] = quiet_bin_;
 }
 
-void ACHiClimate::send_status_request_() {
-  // КОРОТКИЙ запрос статуса (cmd 0x66) — бесшумный и стабильный
+void ACHiClimate::send_status_request_short_() {
+  // КОРОТКИЙ запрос статуса (cmd 0x66) — бесшумный и стабильный.
+  // ВНИМАНИЕ: у этого формата однобайтный CRC (последний перед F4 FB). Поэтому оставляем фиксированный кадр.
   // F4 F5 00 40 0C 00 00 01 01 FE 01 00 00 66 00 00 00 01 B3 F4 FB
   const uint8_t req[] = {
     0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,0x00,0x00,0x00,0x01,0xB3,0xF4,0xFB
@@ -207,14 +207,16 @@ void ACHiClimate::send_status_request_() {
 }
 
 void ACHiClimate::send_status_request_long_clean_() {
-  // ДЛИННЫЙ «чистый» запрос статуса 0x29/0x66 — без заполнения управляющих полей
+  // ДЛИННЫЙ «чистый» запрос статуса 0x29/0x66 — без заполнения управляющих полей.
+  // Используем ОБУЧЕННУЮ шапку [2..12], чтобы адреса соответствовали блоку.
   this->build_base_long_frame_();
   out_[13] = 0x66;
   // [16],[18],[19],[32] оставляем по нулям, только CRC/хвост
   this->compute_crc_(out_);
   this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGD(TAG, "TX status req (0x66 long, clean)");
+  ESP_LOGD(TAG, "TX status req (0x66 long, clean) hdr:%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+           out_[2],out_[3],out_[4],out_[5],out_[6],out_[7],out_[8],out_[9],out_[10],out_[11],out_[12]);
 }
 
 void ACHiClimate::send_write_frame_() {
@@ -229,12 +231,13 @@ void ACHiClimate::send_write_frame_() {
   // Дамп для диагностики
   this->log_hex_dump_("TX write(0x65)", out_);
 
-  // После записи запросим статус (короткий) — без звука
-  this->set_timeout("post_write_status", 180, [this]() { this->send_status_request_(); });
+  // После записи запросим статус: короткий сразу + длинный (через 150 мс) с обученной шапкой
+  this->set_timeout("post_write_status_short", 120, [this]() { this->send_status_request_short_(); });
+  this->set_timeout("post_write_status_long",  280, [this]() { this->send_status_request_long_clean_(); });
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
-  // Сумма по [2..len-5] → [len-4],[len-3], затем 0xF4 0xFB
+  // ДЛИННЫЙ формат: сумма по [2..len-5] → [len-4],[len-3], затем 0xF4 0xFB
   if (buf.size() < 8) return;
   const size_t n = buf.size();
   int csum = 0;
@@ -259,12 +262,15 @@ bool ACHiClimate::parse_next_frame_() {
       if (!rb_pop_(b2)) { rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE; return false; }
       if (b2 == 0xF5) {
         std::vector<uint8_t> frame;
-        frame.reserve(96);
+        frame.reserve(160);
         frame.push_back(0xF4); frame.push_back(0xF5);
         int guard = 0;
         while (rb_pop_(b)) {
           frame.push_back(b);
           if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
+            // обучимся шапке с ЛЮБОГО кадра
+            learn_header_(frame);
+
             // ЛОГ RX — дамп всего кадра
             this->log_hex_dump_("RX frame", frame);
 
@@ -272,7 +278,7 @@ bool ACHiClimate::parse_next_frame_() {
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
-          if (++guard > 2048) break; // защита от бесконечной «каши»
+          if (++guard > 4096) break; // защита от «каши»
         }
         // если мы тут — хвост не увидели, прерываем
         return false;
@@ -286,6 +292,18 @@ bool ACHiClimate::parse_next_frame_() {
   return false;
 }
 
+void ACHiClimate::learn_header_(const std::vector<uint8_t> &bytes) {
+  if (bytes.size() <= 13) return;
+  for (int i = 0; i < 11; i++) header_[i] = bytes[2 + i];
+  if (!header_learned_) {
+    header_learned_ = true;
+    ESP_LOGI(TAG, "Learned header [2..12]: %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X",
+             header_[0],header_[1],header_[2],header_[3],header_[4],
+             header_[5],header_[6],header_[7],header_[8],header_[9],header_[10]);
+  }
+  this->last_rx_ms_ = millis();
+}
+
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 20) return;
 
@@ -294,12 +312,14 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   ESP_LOGD(TAG, "RX summary: cmd=%u len=%u", cmd, (unsigned)bytes.size());
 
   if (cmd == 101) {
-    // ACK после записи — не публикуем, просто отметим активность
+    // ACK после записи — не публикуем состояние, но шапку мы уже выучили.
+    // Дополнительно триггерим длинный опрос с обученной шапкой (на случай, если очереди таймеров нет)
+    this->set_timeout("after_ack_long_status", 120, [this]() { this->send_status_request_long_clean_(); });
     this->last_rx_ms_ = millis();
     return;
   }
   if (cmd != 102) {
-    // неизвестный тип — пропустим
+    // неизвестный тип — пропустим, но отметим активность
     this->last_rx_ms_ = millis();
     return;
   }
