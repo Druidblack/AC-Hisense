@@ -8,16 +8,15 @@
 #include <vector>
 #include <string>
 #include <cmath>
-#include <cstring>  // memcpy
+#include <cstring>
 
 namespace esphome {
 namespace ac_hi {
 
 /**
- * ACHiClimate — ESPHome climate для кондиционеров Ballu/Hisense по RS-485.
- * Кадры: F4 F5 ... F4 FB
- * Команды: запись 0x65, статус 0x66, ACK 0x101
- * Поля: [16]=fan code, [18]=power/mode, [19]=Tset, [20]=Tcur, свинги/флаги вокруг [32..37].
+ * ACHiClimate — ESPHome climate для Ballu/Hisense RS-485.
+ * Кадры: F4 F5 ... F4 FB, статус 0x66, запись 0x65.
+ * ВАЖНО: запись строим на основе последнего статус-кадра (mirror-write).
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
@@ -39,13 +38,11 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void control(const climate::ClimateCall &call) override;
 
   // ===== I/O helpers =====
-  void build_base_long_frame_();
-  void apply_intent_to_frame_();
-  void compute_crc_(std::vector<uint8_t> &buf);
-  void send_status_request_short_();       // короткий статус (0x66)
-  void send_write_frame_();                // запись 0x65 + пост-опрос
-  void learn_header_from_status_(const std::vector<uint8_t> &bytes);
+  void learn_from_status_(const std::vector<uint8_t> &bytes); // учим заголовок/служебные поля
   void handle_status_(const std::vector<uint8_t> &bytes);
+  void send_status_request_short_();                          // короткий 0x66
+  void send_write_frame_();                                   // MIRROR-WRITE на базе последнего статуса
+  void compute_crc_(std::vector<uint8_t> &buf);
   void log_hex_dump_(const char *prefix, const std::vector<uint8_t> &data);
 
   // ===== runtime =====
@@ -53,38 +50,39 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   uint32_t last_poll_{0};
   uint32_t last_rx_ms_{0};
 
-  // анти-откат (простое окно)
+  // анти-откат
   uint32_t suppress_until_ms_{0};
-
-  // строгая защита до совпадения ожидаемого режима
   bool     guard_mode_until_match_{false};
   uint8_t  expected_mode_byte_{0};
   uint32_t guard_deadline_ms_{0};
 
-  // входной буфер
+  // накопитель входящих байт
   std::vector<uint8_t> rx_buf_;
 
-  // «обученная» шапка [2..12]
-  uint8_t header_[11]{0x00};
+  // заголовок/служебные поля, выученные из статуса
+  uint8_t header_[11]{0x01,0x40,0x29,0x01,0x00,0xFE,0x01,0x01,0x01,0x01,0x00}; // дефолт, перезапишем
+  uint8_t fld14_{0x00};     // [14]
+  uint8_t fld15_{0x01};     // [15] — у тебя всегда 0x01
+  uint8_t fld23_{0x80};     // [23] — у тебя 0x80
   bool header_learned_{false};
 
-  // исходящий длинный кадр (~50 байт)
-  std::vector<uint8_t> out_;
+  // последний валидный статус-кадр (для mirror-write)
+  std::vector<uint8_t> last_status_;
 
-  // текущее намерение/состояние
+  // намерение
   bool   power_{false};
-  float  target_temp_{24};
-  uint8_t temp_byte_{24};     // ТЕПЕРЬ это просто °C (как в статусе)
-  uint8_t wind_code_{1};      // status: auto=1, low~12, med~14, high~16
+  float  target_temp_{23};
+  uint8_t temp_byte_{23};     // просто °C
+  // fan оставим авто; твоё поле [16] в статусе = 0x00, не трогаем его при записи
   bool swing_ud_{false};
   bool swing_lr_{false};
   uint8_t power_bin_{0};      // 0b00001100=ON, 0b00000100=OFF
-  uint8_t mode_bin_{0};       // старшая тетрада: 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
+  uint8_t mode_bin_{0};       // 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
   uint8_t turbo_bin_{0};
   uint8_t eco_bin_{0};
   uint8_t quiet_bin_{0};
 
-  // сенсоры (опционально)
+  // сенсоры (опц.)
   sensor::Sensor *tset_s_{nullptr};
   sensor::Sensor *tcur_s_{nullptr};
   sensor::Sensor *tout_s_{nullptr};
