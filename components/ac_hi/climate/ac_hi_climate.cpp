@@ -348,9 +348,26 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     else if (w == 0x16)   this->fan_mode = climate::CLIMATE_FAN_HIGH;
   }
 
-  // Режим/питание в 0x66 на вашей модели кодируются не так, как в «записи».
-  // Чтобы НЕ ломать отображение в HA, здесь их не трогаем, пока нет 100% карты полей.
-  // (Режим меняется верно через control() и ACK, а статусное обновление температур уже работает.)
+  // Питание и режим работы: в статусе 0x66 они приходят в байте [18].
+  if (bytes.size() > 18) {
+    uint8_t b = bytes[18];
+    this->power_ = (b & 0x08) != 0;
+    if (!this->power_) {
+      this->mode = climate::CLIMATE_MODE_OFF;
+    } else {
+      uint8_t m = (b >> 4) & 0x07;
+      if (m == 0)
+        this->mode = climate::CLIMATE_MODE_FAN_ONLY;
+      else if (m == 1)
+        this->mode = climate::CLIMATE_MODE_HEAT;
+      else if (m == 2)
+        this->mode = climate::CLIMATE_MODE_COOL;
+      else if (m == 3)
+        this->mode = climate::CLIMATE_MODE_DRY;
+      else
+        this->mode = climate::CLIMATE_MODE_AUTO;
+    }
+  }
 
   this->publish_state();
   this->last_rx_ms_ = millis();
