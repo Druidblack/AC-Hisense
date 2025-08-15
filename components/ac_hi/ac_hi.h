@@ -151,7 +151,7 @@ class ACHIComponent : public PollingComponent, public uart::UARTDevice {
 
   // pending bit fields
   uint8_t power_bin_{0};
-  uint8_t mode_bin_{0};
+  uint8_t mode_bin_{0};             // idx<<4 — код режима
   uint8_t updown_bin_{0};
   uint8_t leftright_bin_{0};
   uint8_t turbo_bin_{0};

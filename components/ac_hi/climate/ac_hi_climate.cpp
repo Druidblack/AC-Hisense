@@ -100,6 +100,7 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
       power_bin_ = 0b00000100; // keep bit2, clear bit3
+      mode_bin_ = 0x00;        // clear mode when powering off
       this->mode = climate::CLIMATE_MODE_OFF;
       this->power_ = false;
     } else {
@@ -107,15 +108,15 @@ void ACHiClimate::control(const climate::ClimateCall &call) {
       this->mode = m;
       this->power_ = true;
 
-      // индексы: 0=FAN_ONLY,1=HEAT,2=COOL,3=DRY,4=AUTO → odd-nibble при записи
+      // индексы: 0=FAN_ONLY,1=HEAT,2=COOL,3=DRY,4=AUTO
       uint8_t idx = 4; // auto
       if (m == climate::CLIMATE_MODE_HEAT) idx = 1;
       else if (m == climate::CLIMATE_MODE_COOL) idx = 2;
       else if (m == climate::CLIMATE_MODE_DRY)  idx = 3;
       else if (m == climate::CLIMATE_MODE_FAN_ONLY) idx = 0;
 
-      // код в старшем полубайте = ((idx<<1)|1)
-      mode_bin_ = uint8_t((((idx << 1) | 0x01) << 4));
+      // код в старшем полубайте = idx<<4
+      mode_bin_ = uint8_t(idx << 4);
     }
     need_write = true;
   }
