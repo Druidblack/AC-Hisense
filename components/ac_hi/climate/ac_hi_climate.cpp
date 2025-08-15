@@ -16,7 +16,7 @@ void ACHiClimate::setup() {
   // Базовая уставка, чтобы ползунок температуры был доступен сразу
   this->target_temperature = 24.0f;
 
-  // Сформируем базовый длинный кадр (тип 0x29) — используется для записи и для опроса статуса
+  // Сформируем базовый длинный кадр (тип 0x29)
   this->build_base_long_frame_();
 
   // Первый опрос статуса (длинный, «чистый»)
@@ -71,6 +71,12 @@ void ACHiClimate::loop() {
   if (now - this->last_poll_ >= this->update_interval_ms_) {
     this->last_poll_ = now;
     this->send_status_request_();
+  }
+
+  // если давно не получали RX — чуть ускорим следующий опрос
+  if (now - this->last_rx_ms_ > 10000 && now - this->last_poll_ > 1200) {
+    this->send_status_request_();
+    this->last_poll_ = now;
   }
 }
 
@@ -143,11 +149,10 @@ void ACHiClimate::build_base_long_frame_() {
   // Длинный “базовый” пакет 50 байт (тип 0x29)
   out_.assign(50, 0x00);
   out_[0]  = 0xF4; out_[1]  = 0xF5;
-  out_[2]  = 0x00; out_[3]  = 0x40;
-  out_[4]  = 0x29;
-  out_[5]  = 0x00; out_[6]  = 0x00; out_[7]  = 0x01;
-  out_[8]  = 0x01; out_[9]  = 0xFE; out_[10] = 0x01;
-  out_[11] = 0x00; out_[12] = 0x00;
+
+  // заголовок [2..12] — из обученного, либо дефолтного массива
+  for (int i = 0; i < 11; i++) out_[2 + i] = header_[i];
+
   // [13] — команда (0x65 write / 0x66 status)
   out_[48] = 0xF4; out_[49] = 0xFB;
 }
@@ -173,16 +178,17 @@ void ACHiClimate::apply_intent_to_frame_() {
 
 void ACHiClimate::send_status_request_() {
   // ДЛИННЫЙ запрос статуса (0x29 + cmd 0x66), «чистый»: без проставления полей управления
-  // Это не триггерит звуковую индикацию и возвращает полный статус блока (см. тред по ESPHome/Hisense). :contentReference[oaicite:1]{index=1}
+  // ВАЖНО: используем обученный заголовок (иначе некоторые юниты не отвечают).
   this->build_base_long_frame_();
   out_[13] = 0x66;
 
-  // Важно: не трогаем [16],[18],[19],[32] — оставляем 0x00
+  // Не трогаем [16],[18],[19],[32] — оставляем 0x00
   this->compute_crc_(out_);
 
   this->write_array(out_.data(), out_.size());
   this->flush();
-  ESP_LOGVV(TAG, "TX status req (0x66 long, clean)");
+  ESP_LOGVV(TAG, "TX status req (0x66 long, clean) with hdr: %02X %02X %02X ...",
+            out_[2], out_[3], out_[4]);
 }
 
 void ACHiClimate::send_write_frame_() {
@@ -204,8 +210,8 @@ void ACHiClimate::send_write_frame_() {
   }
   ESP_LOGD(TAG, "TX write(0x65):\n%s", dump.c_str());
 
-  // После записи запросим статус (длинный «чистый») — без звука
-  this->set_timeout("post_write_status", 200, [this]() { this->send_status_request_(); });
+  // После записи ожидаем ACK → выучим заголовок → запросим статус
+  this->set_timeout("post_write_status", 220, [this]() { this->send_status_request_(); });
 }
 
 void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
@@ -225,7 +231,7 @@ void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
 // Frames start with F4 F5 and end with F4 FB
 bool ACHiClimate::parse_next_frame_() {
   // sync to start
-  size_t cnt = 0;
+  size_t scanned = 0;
   uint8_t b;
   while (rb_pop_(b)) {
     if (b == 0xF4) {
@@ -233,33 +239,59 @@ bool ACHiClimate::parse_next_frame_() {
       if (!rb_pop_(b2)) { rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE; return false; }
       if (b2 == 0xF5) {
         std::vector<uint8_t> frame;
+        frame.reserve(96);
         frame.push_back(0xF4); frame.push_back(0xF5);
         int guard = 0;
         while (rb_pop_(b)) {
           frame.push_back(b);
           if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
+            // обучимся заголовку с ЛЮБОГО кадра
+            learn_header_(frame);
+
+            // обработка статуса
             if (frame.size() >= 20) handle_status_(frame);
             return true;
           }
-          if (++guard > 512) break;
+          if (++guard > 1024) break; // защита от бесконечного потока без хвоста
         }
         return false;
       } else {
-        // put back b2
+        // откат b2 назад
         rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE;
       }
     }
-    if (++cnt > RB_SIZE) break;
+    if (++scanned > RB_SIZE) break;
   }
   return false;
+}
+
+void ACHiClimate::learn_header_(const std::vector<uint8_t> &bytes) {
+  if (bytes.size() <= 12) return;
+  // запомним [2..12]
+  for (int i = 0; i < 11; i++) header_[i] = bytes[2 + i];
+  if (!header_learned_) {
+    header_learned_ = true;
+    ESP_LOGI(TAG, "Learned header: %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X",
+             header_[0],header_[1],header_[2],header_[3],header_[4],
+             header_[5],header_[6],header_[7],header_[8],header_[9],header_[10]);
+  }
+  this->last_rx_ms_ = millis();
 }
 
 void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 20) return;
 
-  // Интересен cmd=0x66 (102). Ответ обычно длинный 0x29, cmd=0x66.
-  if (bytes.size() > 13 && bytes[13] != 102) {
-    // 101 — ack после записи; игнор для состояния
+  // Команда (ACK=101, STATUS=102)
+  uint8_t cmd = (bytes.size() > 13) ? bytes[13] : 0x00;
+
+  if (cmd == 101) {
+    // ACK после записи — ничего не публикуем, но заголовок уже выучен в learn_header_()
+    ESP_LOGV(TAG, "RX ACK (101), len=%u", (unsigned)bytes.size());
+    return;
+  }
+  if (cmd != 102) {
+    // неизвестный тип — пропустим
+    ESP_LOGVV(TAG, "RX non-status cmd=%u, len=%u", cmd, (unsigned)bytes.size());
     return;
   }
 
@@ -295,20 +327,28 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     this->fan_mode = new_fan;
   }
 
-  // Температуры — [19] уставка, [20] текущая (в °C)
+  // Температуры — типичный вариант: [19] уставка, [20] текущая (в °C).
+  // Если получим явный мусор, не затираем разумные значения.
   if (bytes.size() > 20) {
-    this->target_temperature  = float(bytes[19]);
-    this->current_temperature = float(bytes[20]);
+    uint8_t tset = bytes[19];
+    uint8_t tcur = bytes[20];
+    if (tset >= 8 && tset <= 45) this->target_temperature  = float(tset);
+    if (tcur >= 8 && tcur <= 45) this->current_temperature = float(tcur);
   }
 
-  // Качание — биты в [35]: bit7 UD, bit6 LR
+  // Качание — биты в [35]: bit7 UD, bit6 LR (если поле присутствует)
   if (bytes.size() > 35) {
     bool ud = (bytes[35] & 0b10000000) != 0;
     bool lr = (bytes[35] & 0b01000000) != 0;
     this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
   }
 
+  ESP_LOGV(TAG, "RX status: power=%d mode=%d fan=%d t=%.1f/%.1f",
+           int(this->power_), int(this->mode), int(this->fan_mode),
+           this->current_temperature, this->target_temperature);
+
   this->publish_state();
+  this->last_rx_ms_ = millis();
 }
 
 }  // namespace ac_hi
