@@ -16,7 +16,7 @@ namespace ac_hi {
  * Чтение статуса:
  *   - периодически шлём короткий кадр (cmd 0x66, фиксированный однобайтный CRC);
  *   - после первого же входящего кадра «обучаемся» заголовку [2..12] и
- *     дополнительно опрашиваем длинным «чистым» 0x29/0x66 с ДВУХБАЙТНЫМ CRC.
+ *     дополнительно опрашиваем длинным «чистым» 0x29/0x66 с двухбайтным CRC.
  * Запись — длинным 0x29/0x65.
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
@@ -39,7 +39,9 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   void build_base_long_frame_();            // заполнить out_ базовым шаблоном (50 байт) + шапка
   void apply_intent_to_frame_();            // проставить power/mode/temp/fan/swing в out_
   void compute_crc_(std::vector<uint8_t> &buf);
-  bool parse_next_frame_();
+
+  // разбор входящего потока (с накоплением между итерациями)
+  void process_rx_buffer_();
   void handle_status_(const std::vector<uint8_t> &bytes);
 
   // обучение заголовка [2..12]
@@ -76,23 +78,14 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
   uint8_t header_[11] = {0x00,0x40, 0x29, 0x00,0x00,0x01, 0x01,0xFE,0x01,0x00,0x00};
   bool header_learned_{false};
 
-  // RX ring buffer
-  static constexpr size_t RB_SIZE = 1024;
-  uint8_t rb_[RB_SIZE]{};
-  size_t rb_head_{0}, rb_tail_{0};
+  // НАКОПИТЕЛЬ ВХОДЯЩЕГО ПОТОКА (устойчив к разрывам кадра между итерациями)
+  std::vector<uint8_t> rx_buf_;
 
   // timing
   uint32_t last_poll_{0};
   uint32_t last_rx_ms_{0};
   uint32_t last_long_status_ms_{0};
   uint32_t update_interval_ms_{2000};
-
-  // helpers
-  void rb_push_(uint8_t b) { rb_[rb_head_] = b; rb_head_ = (rb_head_ + 1) % RB_SIZE; }
-  bool rb_pop_(uint8_t &b) {
-    if (rb_head_ == rb_tail_) return false;
-    b = rb_[rb_tail_]; rb_tail_ = (rb_tail_ + 1) % RB_SIZE; return true;
-  }
 };
 
 }  // namespace ac_hi

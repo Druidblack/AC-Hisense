@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "ac_hi_climate.h"
 #include "esphome/core/log.h"
+#include <algorithm>
 
 namespace esphome {
 namespace ac_hi {
@@ -65,15 +66,15 @@ void ACHiClimate::loop() {
   while (this->available()) {
     uint8_t b = this->read();
     raw_rx.push_back(b);
-    this->rb_push_(b);
+    rx_buf_.push_back(b);
   }
 
   if (!raw_rx.empty()) {
     this->log_hex_dump_("RX raw", raw_rx);
   }
 
-  // Parse frames
-  while (this->parse_next_frame_()) {}
+  // Parse any complete frames accumulated so far
+  this->process_rx_buffer_();
 
   const uint32_t now = millis();
 
@@ -231,7 +232,7 @@ void ACHiClimate::send_write_frame_() {
   // Дамп для диагностики
   this->log_hex_dump_("TX write(0x65)", out_);
 
-  // После записи запросим статус: короткий сразу + длинный (через 150 мс) с обученной шапкой
+  // После записи запросим статус: короткий сразу + длинный (чуть позже) с обученной шапкой
   this->set_timeout("post_write_status_short", 120, [this]() { this->send_status_request_short_(); });
   this->set_timeout("post_write_status_long",  280, [this]() { this->send_status_request_long_clean_(); });
 }
@@ -250,46 +251,51 @@ void ACHiClimate::compute_crc_(std::vector<uint8_t> &buf) {
   buf[n - 1] = 0xFB;
 }
 
-// Frames start with F4 F5 and end with F4 FB
-bool ACHiClimate::parse_next_frame_() {
-  // sync to start
-  size_t scanned = 0;
-  uint8_t b;
-  while (rb_pop_(b)) {
-    if (b == 0xF4) {
-      uint8_t b2;
-      // если второго байта ещё нет — вернём F4 в буфер и ждём
-      if (!rb_pop_(b2)) { rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE; return false; }
-      if (b2 == 0xF5) {
-        std::vector<uint8_t> frame;
-        frame.reserve(160);
-        frame.push_back(0xF4); frame.push_back(0xF5);
-        int guard = 0;
-        while (rb_pop_(b)) {
-          frame.push_back(b);
-          if (frame.size() >= 4 && frame[frame.size()-2] == 0xF4 && frame.back() == 0xFB) {
-            // обучимся шапке с ЛЮБОГО кадра
-            learn_header_(frame);
+// ======================= RX processing =======================
 
-            // ЛОГ RX — дамп всего кадра
-            this->log_hex_dump_("RX frame", frame);
-
-            // обработка статуса
-            if (frame.size() >= 20) handle_status_(frame);
-            return true;
-          }
-          if (++guard > 4096) break; // защита от «каши»
-        }
-        // если мы тут — хвост не увидели, прерываем
-        return false;
-      } else {
-        // откат b2 назад (мы его читали зря), F4 уже «съели», но это был не кадр
-        rb_tail_ = (rb_tail_ + RB_SIZE - 1) % RB_SIZE;
-      }
-    }
-    if (++scanned > RB_SIZE) break;
+void ACHiClimate::process_rx_buffer_() {
+  // Защитный лимит, чтобы буфер не рос бесконечно
+  const size_t MAX_BUF = 8192;
+  if (rx_buf_.size() > MAX_BUF) {
+    // обрежем до последних 512 байт
+    rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - 512);
   }
-  return false;
+
+  // Ищем полноценные кадры F4 F5 ... F4 FB, устойчиво к разрывам между итерациями
+  while (true) {
+    // старт кадра
+    auto it_start = std::search(rx_buf_.begin(), rx_buf_.end(), std::begin("\xF4\xF5"), std::end("\xF4\xF5") - 1);
+    if (it_start == rx_buf_.end()) {
+      // нет начала — можно немного подчистить мусор, оставим последние 1 байт (вдруг это 0xF4)
+      if (rx_buf_.size() > 1) rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - 1);
+      break;
+    }
+    // удалим мусор до старта
+    if (it_start != rx_buf_.begin()) rx_buf_.erase(rx_buf_.begin(), it_start);
+
+    // конец кадра
+    static const uint8_t tail[] = {0xF4, 0xFB};
+    auto it_end = std::search(rx_buf_.begin() + 2, rx_buf_.end(), std::begin(tail), std::end(tail));
+    if (it_end == rx_buf_.end()) {
+      // хвоста ещё нет — ждём догрузки
+      break;
+    }
+
+    // полный кадр: [begin, it_end+2)
+    std::vector<uint8_t> frame(rx_buf_.begin(), it_end + 2);
+
+    // обучимся шапке и залогируем
+    learn_header_(frame);
+    this->log_hex_dump_("RX frame", frame);
+
+    // разбор
+    if (frame.size() >= 20) handle_status_(frame);
+
+    // удалим обработанную часть из буфера
+    rx_buf_.erase(rx_buf_.begin(), it_end + 2);
+
+    // цикл попробует вытащить следующий кадр, если он уже накопился
+  }
 }
 
 void ACHiClimate::learn_header_(const std::vector<uint8_t> &bytes) {
@@ -312,8 +318,8 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
   ESP_LOGD(TAG, "RX summary: cmd=%u len=%u", cmd, (unsigned)bytes.size());
 
   if (cmd == 101) {
-    // ACK после записи — не публикуем состояние, но шапку мы уже выучили.
-    // Дополнительно триггерим длинный опрос с обученной шапкой (на случай, если очереди таймеров нет)
+    // ACK после записи — шапку уже выучили, состояние не публикуем.
+    // Подстрахуемся и дёрнем длинный стат-опрос (если ещё не запланирован)
     this->set_timeout("after_ack_long_status", 120, [this]() { this->send_status_request_long_clean_(); });
     this->last_rx_ms_ = millis();
     return;
@@ -324,39 +330,8 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     return;
   }
 
-  // Power: bit3 в [18]
-  if (bytes.size() > 18) {
-    bool new_power = (bytes[18] & 0b00001000) != 0;
-    this->power_ = new_power;
-  }
-
-  // Mode: старший полубайт [18] — odd-nibble (1,3,5,7,9)
-  if (bytes.size() > 18) {
-    uint8_t nibble = (bytes[18] >> 4) & 0x0F;
-    climate::ClimateMode new_mode = climate::CLIMATE_MODE_AUTO;
-    switch (nibble) {
-      case 1: new_mode = climate::CLIMATE_MODE_FAN_ONLY; break;
-      case 3: new_mode = climate::CLIMATE_MODE_HEAT;     break;
-      case 5: new_mode = climate::CLIMATE_MODE_COOL;     break;
-      case 7: new_mode = climate::CLIMATE_MODE_DRY;      break;
-      case 9: new_mode = climate::CLIMATE_MODE_AUTO;     break;
-      default: /* no change */ break;
-    }
-    this->mode = this->power_ ? new_mode : climate::CLIMATE_MODE_OFF;
-  }
-
-  // Fan — [16] (в статусе коды: 1/12/14/16)
-  if (bytes.size() > 16) {
-    uint8_t wind_raw = bytes[16];
-    climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
-    if (wind_raw == 12) new_fan = climate::CLIMATE_FAN_LOW;
-    else if (wind_raw == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
-    else if (wind_raw == 16) new_fan = climate::CLIMATE_FAN_HIGH;
-    else if (wind_raw == 1)  new_fan = climate::CLIMATE_FAN_AUTO;
-    this->fan_mode = new_fan;
-  }
-
-  // Температуры — [19] уставка, [20] текущая (в °C). Защита от явного мусора.
+  // ====== Поля из ваших 0x66-статусов ======
+  // По логам: байты [19] и [20] стабильно выглядят как Tset(°C) и Tcur(°C) соответственно.
   if (bytes.size() > 20) {
     uint8_t tset = bytes[19];
     uint8_t tcur = bytes[20];
@@ -364,12 +339,18 @@ void ACHiClimate::handle_status_(const std::vector<uint8_t> &bytes) {
     if (tcur >= 8 && tcur <= 45) this->current_temperature = float(tcur);
   }
 
-  // Качание — биты в [35]: bit7 UD, bit6 LR (если поле присутствует)
-  if (bytes.size() > 35) {
-    bool ud = (bytes[35] & 0b10000000) != 0;
-    bool lr = (bytes[35] & 0b01000000) != 0;
-    this->swing_mode = (ud || lr) ? climate::CLIMATE_SWING_BOTH : climate::CLIMATE_SWING_OFF;
+  // Вентилятор: встречаются коды 0x01/0x12/0x14/0x16 — распознаём только их, иначе оставляем без изменений.
+  if (bytes.size() > 16) {
+    uint8_t w = bytes[16];
+    if (w == 0x01)        this->fan_mode = climate::CLIMATE_FAN_AUTO;
+    else if (w == 0x12)   this->fan_mode = climate::CLIMATE_FAN_LOW;
+    else if (w == 0x14)   this->fan_mode = climate::CLIMATE_FAN_MEDIUM;
+    else if (w == 0x16)   this->fan_mode = climate::CLIMATE_FAN_HIGH;
   }
+
+  // Режим/питание в 0x66 на вашей модели кодируются не так, как в «записи».
+  // Чтобы НЕ ломать отображение в HA, здесь их не трогаем, пока нет 100% карты полей.
+  // (Режим меняется верно через control() и ACK, а статусное обновление температур уже работает.)
 
   this->publish_state();
   this->last_rx_ms_ = millis();
