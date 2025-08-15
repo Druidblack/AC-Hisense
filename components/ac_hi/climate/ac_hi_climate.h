@@ -16,7 +16,7 @@ namespace ac_hi {
 /**
  * ACHiClimate — ESPHome climate для Ballu/Hisense RS-485.
  * Кадры: F4 F5 ... F4 FB, статус 0x66, запись 0x65.
- * ВАЖНО: запись строим на основе последнего статус-кадра (mirror-write).
+ * MIRROR-WRITE: берём последний 0x66 и меняем только нужные поля.
  */
 class ACHiClimate : public climate::Climate, public Component, public uart::UARTDevice {
  public:
@@ -71,12 +71,13 @@ class ACHiClimate : public climate::Climate, public Component, public uart::UART
 
   // намерение
   bool   power_{false};
-  float  target_temp_{23};
-  uint8_t temp_byte_{23};     // просто °C
-  // fan оставим авто; твоё поле [16] в статусе = 0x00, не трогаем его при записи
+  float  target_temp_{24};
+  uint8_t temp_byte_{24};     // просто °C
   bool swing_ud_{false};
   bool swing_lr_{false};
-  uint8_t power_bin_{0};      // 0b00001100=ON, 0b00000100=OFF
+
+  // ВАЖНО: power-бит = 0x08. OFF=0x00, ON=0x08
+  uint8_t power_bin_{0};      // 0x00=OFF, 0x08=ON
   uint8_t mode_bin_{0};       // 0=FAN,1=HEAT,2=COOL,3=DRY,4=AUTO
   uint8_t turbo_bin_{0};
   uint8_t eco_bin_{0};
