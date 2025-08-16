@@ -1,5 +1,6 @@
 #include "ac_hi.h"
 #include <cmath>
+#include <algorithm>  // std::min/std::max
 
 namespace esphome {
 namespace ac_hi {
@@ -79,9 +80,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_target_temperature().has_value()) {
     auto t = *call.get_target_temperature();
-    if (!isnan(t)) {
-      uint8_t c = static_cast<uint8_t>(roundf(t));
-      c = std::max<uint8_t>(18, std::min<uint8_t>(28, c));
+    if (!std::isnan(t)) {  // <cmath> std::isnan
+      uint8_t c = static_cast<uint8_t>(std::round(t));  // <cmath> std::round
+      c = std::max<uint8_t>(18, std::min<uint8_t>(28, c));  // <algorithm> std::min/max
       this->target_c_ = c;
       need_write = true;
     }

@@ -50,8 +50,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void control(const climate::ClimateCall &call) override;
   climate::ClimateTraits traits() override;
 
-  // UART
-  void set_uart_parent(uart::UARTComponent *parent) { this->set_parent(parent); }
+  // UART: метод set_uart_parent(...) унаследован из uart::UARTDevice
 
  protected:
   // Protocol helpers
