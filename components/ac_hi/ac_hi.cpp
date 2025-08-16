@@ -1,9 +1,12 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <algorithm>
+#include "esphome/core/log.h"
 
 namespace esphome {
 namespace ac_hi {
+
+static const char *TAG = "ac_hi";
 
 // ---- Локальные хелперы для (де)кодирования режима ----
 // Целевая раскладка nibble (byte[18] >> 4):
@@ -239,6 +242,7 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
 void ACHIClimate::send_query_status_() {
   for (auto b : this->query_) this->write_byte(b);
   this->flush();
+  ESP_LOGD(TAG, "TX: %s", format_hex_pretty(this->query_).c_str());
 }
 
 void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) {
@@ -266,6 +270,7 @@ void ACHIClimate::send_write_changes_() {
   this->calc_and_patch_crc_(frame);
   for (auto b : frame) this->write_byte(b);
   this->flush();
+  ESP_LOGD(TAG, "TX: %s", format_hex_pretty(frame).c_str());
 }
 
 // ---- RX сканер/парсер ----
@@ -354,6 +359,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
 }
 
 void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
+  ESP_LOGD(TAG, "RX: %s", format_hex_pretty(b).c_str());
   if (b.size() < 20) return;
 
   const uint8_t cmd = b[13];
