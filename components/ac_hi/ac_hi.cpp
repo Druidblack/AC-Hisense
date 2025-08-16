@@ -1,17 +1,14 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <algorithm>
-#include <cstdio>
 
 namespace esphome {
 namespace ac_hi {
 
-static const char *const TAG = "ac_hi.climate";
-
 // ---- Локальные хелперы для (де)кодирования режима ----
-// У конкретных плат Hisense попадается раскладка nibble режима (byte[18] >> 4):
+// У конкретных плат Hisense встречается раскладка nibble режима (byte[18] >> 4):
 // 0x01=HEAT, 0x03=COOL, 0x05=DRY, 0x07=FAN_ONLY, 0x09=AUTO.
-// (Именно по ней корректно совпадают индикации HA и самого блока.)
+// Эта таблица согласует индикации HA и самого блока.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
     case 0x01: return climate::CLIMATE_MODE_HEAT;
@@ -35,7 +32,7 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
 }
 
 void ACHIClimate::setup() {
-  ESP_LOGI(TAG, "Setup AC-Hi climate");
+  // Без лишнего логирования
   this->mode = climate::CLIMATE_MODE_OFF;
   this->target_temperature = 24;
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
@@ -57,12 +54,11 @@ void ACHIClimate::loop() {
     rx_.push_back(c);
   }
 
-  // Если буфер слишком разросся — мягкая компакция (по скользящему окну)
+  // Скользящее окно/компакция буфера
   if (rx_start_ > RX_COMPACT_THRESHOLD) {
     rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
     rx_start_ = 0;
   }
-  // Ограничим абсолютный размер буфера
   if (rx_.size() - rx_start_ > 4096) {
     size_t remain = rx_.size() - rx_start_;
     if (remain >= 1 && rx_.back() == HI_HDR0) {
@@ -76,7 +72,7 @@ void ACHIClimate::loop() {
     }
   }
 
-  // Пробуем извлечь кадры с ограничением по времени/количеству (чтобы не блокировать цикл)
+  // Пробуем извлечь кадры с ограничением по времени/количеству
   this->try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
 }
 
@@ -146,8 +142,6 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     // Сборка TX-кадра
     uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
     uint8_t mode_hi_nibble = encode_nibble_from_mode(this->mode_);
-    // Протокол требует ((code<<1)|1) << 4, где code из {0,1,2,3,4}
-    // Для набора выше это просто nibble из {1,3,5,7,9} << 4
     uint8_t mode_hi = static_cast<uint8_t>(mode_hi_nibble << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
@@ -198,7 +192,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 // ---- Кодирование полей ----
 
 uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // Сформировать «старший полубайт»: берём nibble из {1,3,5,7,9} и просто <<4
+  // Сформировать «старший полубайт»: берём nibble из {1,3,5,7,9} и <<4
   return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
 }
 
@@ -236,12 +230,10 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
   return on ? 0b00110000 : 0b00010000;
 }
 
-// ---- Транспорт/CRC/логирование ----
+// ---- Транспорт/CRC ----
 
 void ACHIClimate::send_query_status_() {
-  // Короткий запрос — отправляем как есть (CRC уже в шаблоне), логируем
-  this->log_hex_frame_("TX", this->query_, "query(0x66)");
-  for (auto b : this->query_) this->write_byte(b);  // совместимо с UARTDevice
+  for (auto b : this->query_) this->write_byte(b);
   this->flush();
 }
 
@@ -268,42 +260,8 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
 void ACHIClimate::send_write_changes_() {
   auto frame = this->tx_bytes_;
   this->calc_and_patch_crc_(frame);
-  this->log_hex_frame_("TX", frame, "write");
-  for (auto b : frame) this->write_byte(b);  // по-байтовая отправка
+  for (auto b : frame) this->write_byte(b);
   this->flush();
-}
-
-void ACHIClimate::log_hex_frame_(const char *dir, const std::vector<uint8_t> &data, const char *note) const {
-  // Печатаем заголовок с длиной и суммой; без Arduino String
-  size_t n = data.size();
-  uint16_t crc = 0;
-  for (size_t i = 2; i < (n >= 4 ? n - 4 : 0); i++) crc = static_cast<uint16_t>(crc + data[i]);
-
-  char decl_buf[8];
-  const char *decl_str = "-";
-  if (n > 5) {
-    std::snprintf(decl_buf, sizeof(decl_buf), "0x%02X", static_cast<unsigned>(data[4]));
-    decl_str = decl_buf;
-  }
-
-  ESP_LOGD(TAG, "%s frame (%s): len=%u, decl_len=%s, crc_sum=0x%04X",
-           dir, (note ? note : "-"),
-           static_cast<unsigned>(n),
-           decl_str,
-           crc);
-
-  // Печатаем покадрово (по 16 байт), чтобы не раздувать одну строку
-  char line[3 * 16 + 64];
-  for (size_t i = 0; i < n; i += 16) {
-    size_t chunk = std::min(static_cast<size_t>(16), n - i);
-    int pos = 0;
-    pos += std::snprintf(line + pos, sizeof(line) - pos, "%s [%03u..%03u]: ",
-                         dir, static_cast<unsigned>(i), static_cast<unsigned>(i + chunk - 1));
-    for (size_t j = 0; j < chunk && pos < static_cast<int>(sizeof(line) - 4); j++) {
-      pos += std::snprintf(line + pos, sizeof(line) - pos, "%02X ", static_cast<unsigned>(data[i + j]));
-    }
-    ESP_LOGV(TAG, "%s", line);
-  }
 }
 
 // ---- RX сканер/парсер ----
@@ -317,23 +275,16 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
          (esphome::millis() - start) < budget_ms &&
          this->extract_next_frame_(frame)) {
 
-    // Логируем принятый кадр
-    this->log_hex_frame_("RX", frame, "raw");
-
     // На входе используем сумму как «детектор изменений», а не жёсткий CRC-drop
     uint16_t sum = 0;
     for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
-    ESP_LOGV(TAG, "<< RX sum(bytes[2..n-5])=0x%04X", sum);
-
-    if (frame.size() > 5) {
-      uint8_t decl = frame[4];
-      ESP_LOGV(TAG, "<< Declared len=0x%02X, expected_total=%u, actual=%u",
-               decl, static_cast<unsigned>(decl + 9U), static_cast<unsigned>(frame.size()));
-    }
 
     // Разбор
     this->handle_frame_(frame);
     handled++;
+
+    // Сохраняем последнюю сумму, чтобы подавлять повторы
+    last_status_crc_ = sum;
   }
 }
 
@@ -366,7 +317,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
 
   rx_start_ = i;
 
-  // 2) Попытка среза по объявленной длине
+  // 2) Попытка среза по объявленной длине: полный размер = bytes[4] + 9
   if (rx_.size() > rx_start_ + 5) {
     uint8_t decl = rx_[rx_start_ + 4];
     size_t expected_total = static_cast<size_t>(decl) + 9U;
@@ -402,38 +353,24 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   if (b.size() < 20) return;
 
   const uint8_t cmd = b[13];
-  const uint8_t typ = b[2];
-
-  ESP_LOGV(TAG, "<< Frame: cmd=%u (0x%02X), typ=%u, decl_len=0x%02X", cmd, cmd, typ, (b.size() > 5 ? b[4] : 0));
 
   if (cmd == 102 /*0x66 status resp*/ ) {
     this->parse_status_102_(b);
   } else if (cmd == 101 /*0x65 ack*/) {
     this->handle_ack_101_();
   } else {
-    ESP_LOGD(TAG, "<< Unknown/unsupported cmd=0x%02X", cmd);
+    // неизвестные кадры игнорируем без логов
   }
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
-  // Детектор изменений (сумма)
-  uint16_t crc = 0;
-  for (size_t i = 2; i < bytes.size() - 4; i++) crc = static_cast<uint16_t>(crc + bytes[i]);
-  if (crc == last_status_crc_) {
-    ESP_LOGV(TAG, "<< Status 102: unchanged");
-    return;
-  }
-  last_status_crc_ = crc;
-
   // Питание (байт 18, бит 3)
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
 
-  // Режим — читаем ВЕРХНИЙ полубайт и маппим по таблице «1,3,5,7,9»
+  // Режим — читаем верхний полубайт и маппим по таблице «1,3,5,7,9»
   uint8_t nib = static_cast<uint8_t>((bytes[18] >> 4) & 0x0F);
-  climate::ClimateMode new_mode = decode_mode_from_nibble(nib);
-  ESP_LOGV(TAG, "<< Raw mode nibble=0x%X -> %d", nib, static_cast<int>(new_mode));
-  this->mode_ = new_mode;
+  this->mode_ = decode_mode_from_nibble(nib);
 
   // Скорость вентилятора (байт 16)
   uint8_t raw_wind = bytes[16];
@@ -501,7 +438,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 }
 
 void ACHIClimate::handle_ack_101_() {
-  ESP_LOGD(TAG, "<< ACK 0x101 received; unlock writes");
   this->writing_lock_ = false;
   this->pending_write_ = false;
 }

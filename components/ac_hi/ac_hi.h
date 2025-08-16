@@ -3,7 +3,6 @@
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
-#include "esphome/core/log.h"
 #include "esphome/core/hal.h"  // esphome::millis()
 
 // Подключаем заголовок сенсоров только если платформа sensor реально присутствует в билде
@@ -33,7 +32,7 @@ static constexpr uint8_t HI_HDR1 = 0xF5;
 static constexpr uint8_t HI_TAIL0 = 0xF4;
 static constexpr uint8_t HI_TAIL1 = 0xFB;
 
-// Ограничители, чтобы loop() не блокировал цикл приложения (см. рекомендации ESPHome)
+// Ограничители, чтобы loop() не блокировал цикл приложения
 static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;   // не более 2 кадров за один проход loop()
 static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;  // и не более 20 мс парсинга за проход
 static constexpr size_t   RX_COMPACT_THRESHOLD = 512; // после потребления >512 байт делаем compaction
@@ -44,7 +43,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Config
   void set_enable_presets(bool v) { enable_presets_ = v; }
+#ifdef USE_SENSOR
   void set_pipe_sensor(sensor::Sensor *s) { pipe_sensor_ = s; }
+#else
+  void set_pipe_sensor(void *) {}
+#endif
 
   void setup() override;
   void loop() override;
@@ -53,8 +56,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Climate API
   void control(const climate::ClimateCall &call) override;
   climate::ClimateTraits traits() override;
-
-  // UART: метод set_uart_parent(...) унаследован из uart::UARTDevice
 
  protected:
   // ---- Протокол/транспорт ----
@@ -70,16 +71,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
-  // Логирование/дампы
-  void log_hex_frame_(const char *dir, const std::vector<uint8_t> &data, const char *note = nullptr) const;
-
   // Буфер входящего потока (скользящее окно: rx_start_ — смещение начала данных)
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
 
   bool writing_lock_{false};
   bool pending_write_{false};
-  uint32_t last_rx_ms_{0};
 
   // Базовый кадр записи (как в YAML initial vector)
   std::vector<uint8_t> tx_bytes_ = {
@@ -136,7 +133,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_swing_lr_(bool on);
 
   // Сенсор трубки (опционально)
+#ifdef USE_SENSOR
   sensor::Sensor *pipe_sensor_{nullptr};
+#else
+  void *pipe_sensor_{nullptr};
+#endif
 
   // Флаги
   bool enable_presets_{true};
