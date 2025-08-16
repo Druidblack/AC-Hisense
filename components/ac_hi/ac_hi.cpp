@@ -180,7 +180,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   // Оптимистично публикуем ожидаемое состояние
-/*  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
+  this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->target_temperature = this->target_c_;
   this->fan_mode = this->fan_;
   this->swing_mode = this->swing_;
@@ -191,7 +191,6 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
-*/
 }
 
 // ---- Кодирование полей ----
