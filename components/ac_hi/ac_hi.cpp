@@ -293,7 +293,7 @@ void ACHIClimate::log_hex_frame_(const char *dir, const std::vector<uint8_t> &da
 void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   std::vector<uint8_t> frame;
   uint8_t handled = 0;
-  const uint32_t start = esphome::millis();  // использовать HAL ESPHome, не Arduino String/таймеры :contentReference[oaicite:1]{index=1}
+  const uint32_t start = esphome::millis();
 
   while (handled < MAX_FRAMES_PER_LOOP &&
          (esphome::millis() - start) < budget_ms &&
@@ -302,14 +302,12 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     // Логируем принятый кадр
     this->log_hex_frame_("RX", frame, "raw");
 
-    // Валидация CRC
+    // Для RX используем сумму байтов как «детектор изменений» (как в hisense.yaml),
+    // а НЕ жёсткую проверку CRC — разные ревизии блоков могут иметь иные поля/счётчики.
+    // (При несоответствии «классическому» CRC кадр всё равно разбираем.)
     uint16_t sum = 0;
-    if (!this->validate_crc_(frame, &sum)) {
-      ESP_LOGW(TAG, "<< Drop: CRC mismatch (sum=0x%04X, got=%02X %02X)", sum,
-               frame[frame.size() - 4], frame[frame.size() - 3]);
-      handled++;
-      continue;
-    }
+    for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
+    ESP_LOGV(TAG, "<< RX sum(bytes[2..n-5])=0x%04X", sum);
 
     // Информативная диагностика длины (полный размер = decl_len + 9)
     if (frame.size() > 5) {
@@ -357,7 +355,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   rx_start_ = i;
 
   // 2) При достаточной длине можем вычислить ожидаемый конец из decl_len
-  // Полный размер кадра = bytes[4] + 9 (см. hisense.yaml: у TX 0x29 => 50 байт)
+  // Полный размер кадра = bytes[4] + 9 (см. примеры: TX 0x29 => 50 байт; RX 0x8D => 150 байт)
   if (rx_.size() > rx_start_ + 5) {
     uint8_t decl = rx_[rx_start_ + 4];
     size_t expected_total = static_cast<size_t>(decl) + 9U;
