@@ -1,12 +1,9 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <algorithm>
-#include "esphome/core/log.h"
 
 namespace esphome {
 namespace ac_hi {
-
-static const char *TAG = "ac_hi";
 
 // ---- Локальные хелперы для (де)кодирования режима ----
 // Целевая раскладка nibble (byte[18] >> 4):
@@ -14,7 +11,7 @@ static const char *TAG = "ac_hi";
 // Иного здесь нет — AUTO не поддерживается и в HA не объявляется.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
-    case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
+    case 0x00: return climate::CLIMATE_MODE_AUTO;
     case 0x01: return climate::CLIMATE_MODE_HEAT;
     case 0x02: return climate::CLIMATE_MODE_COOL;
     case 0x03: return climate::CLIMATE_MODE_DRY;
@@ -78,13 +75,13 @@ void ACHIClimate::loop() {
 climate::ClimateTraits ACHIClimate::traits() {
   climate::ClimateTraits t{};
   t.set_supports_action(false);
-  // Без AUTO
   t.set_supported_modes({
     climate::CLIMATE_MODE_OFF,
     climate::CLIMATE_MODE_COOL,
     climate::CLIMATE_MODE_HEAT,
     climate::CLIMATE_MODE_DRY,
-    climate::CLIMATE_MODE_FAN_ONLY
+    climate::CLIMATE_MODE_FAN_ONLY,
+    climate::CLIMATE_MODE_AUTO,
   });
   t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
                              climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
@@ -96,7 +93,7 @@ climate::ClimateTraits ACHIClimate::traits() {
                              climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
   }
   t.set_visual_min_temperature(16);
-  t.set_visual_max_temperature(32);
+  t.set_visual_max_temperature(30);
   t.set_visual_temperature_step(1.0f);
   t.set_supports_current_temperature(true);
   return t;
@@ -120,7 +117,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto t = *call.get_target_temperature();
     if (!std::isnan(t)) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
-      c = std::max<uint8_t>(16, std::min<uint8_t>(32, c));
+      c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
       this->target_c_ = c;
       need_write = true;
     }
@@ -146,7 +143,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (need_write) {
     // Сборка TX-кадра
-    uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
+    uint8_t power_bin = this->power_on_ ? 0b00001000 : 0b00000000;  // low nibble
     uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
@@ -242,7 +239,6 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
 void ACHIClimate::send_query_status_() {
   for (auto b : this->query_) this->write_byte(b);
   this->flush();
-  ESP_LOGD(TAG, "TX: %s", format_hex_pretty(this->query_).c_str());
 }
 
 void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) {
@@ -270,7 +266,6 @@ void ACHIClimate::send_write_changes_() {
   this->calc_and_patch_crc_(frame);
   for (auto b : frame) this->write_byte(b);
   this->flush();
-  ESP_LOGD(TAG, "TX: %s", format_hex_pretty(frame).c_str());
 }
 
 // ---- RX сканер/парсер ----
@@ -359,7 +354,6 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
 }
 
 void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
-  ESP_LOGD(TAG, "RX: %s", format_hex_pretty(b).c_str());
   if (b.size() < 20) return;
 
   const uint8_t cmd = b[13];
@@ -404,7 +398,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 
   // Целевая температура (байт 19) — значение в °C напрямую
   uint8_t raw_set = bytes[19];
-  if (raw_set >= 16 && raw_set <= 32) this->target_c_ = raw_set;
+  if (raw_set >= 16 && raw_set <= 30) this->target_c_ = raw_set;
   this->target_temperature = this->target_c_;
 
   // Текущая температура воздуха (байт 20)
