@@ -107,8 +107,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     uint8_t mode_hi = encode_mode_hi_nibble_(this->mode_);
     tx_bytes_[18] = power_bin + mode_hi;
 
-    tx_bytes_[19] = encode_temp_(this->target_c_);       // setpoint
-    tx_bytes_[16] = encode_fan_byte_(this->fan_);        // fan
+    tx_bytes_[19] = encode_temp_(this->target_c_);          // setpoint
+    tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
     tx_bytes_[17] = encode_sleep_byte_(this->sleep_stage_); // sleep
 
     bool v_swing = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
@@ -206,7 +206,7 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
 void ACHIClimate::send_query_status_() {
   // Короткий запрос — отправляем как есть (CRC уже в шаблоне), логируем
   this->log_hex_frame_("TX", this->query_, "query(0x66)");
-  this->write_array(this->query_);
+  for (auto b : this->query_) this->write_byte(b);  // совместимо с UARTDevice
   this->flush();
 }
 
@@ -234,30 +234,38 @@ void ACHIClimate::send_write_changes_() {
   auto frame = this->tx_bytes_;
   this->calc_and_patch_crc_(frame);
   this->log_hex_frame_("TX", frame, "write");
-  this->write_array(frame);
+  for (auto b : frame) this->write_byte(b);  // по-байтовая отправка
   this->flush();
 }
 
 void ACHIClimate::log_hex_frame_(const char *dir, const std::vector<uint8_t> &data, const char *note) const {
-  // Печатаем покадрово (по 16 байт), чтобы не раздувать одну строку
-  char line[3 * 16 + 64];
+  // Печатаем заголовок с длиной и суммой; без Arduino String
   size_t n = data.size();
   uint16_t crc = 0;
-  // Если это потенциальный кадр, попробуем посчитать сумму для информации
   for (size_t i = 2; i < (n >= 4 ? n - 4 : 0); i++) crc = static_cast<uint16_t>(crc + data[i]);
 
+  char decl_buf[8];
+  const char *decl_str = "-";
+  if (n > 5) {
+    std::snprintf(decl_buf, sizeof(decl_buf), "0x%02X", static_cast<unsigned>(data[4]));
+    decl_str = decl_buf;
+  }
+
   ESP_LOGD(TAG, "%s frame (%s): len=%u, decl_len=%s, crc_sum=0x%04X",
-           dir, (note ? note : "-"), static_cast<unsigned>(n),
-           (n > 5 ? (String("0x") + String(data[4], 16)).c_str() : "-"),
+           dir, (note ? note : "-"),
+           static_cast<unsigned>(n),
+           decl_str,
            crc);
 
+  // Печатаем покадрово (по 16 байт), чтобы не раздувать одну строку
+  char line[3 * 16 + 64];
   for (size_t i = 0; i < n; i += 16) {
     size_t chunk = std::min(static_cast<size_t>(16), n - i);
     int pos = 0;
-    pos += snprintf(line + pos, sizeof(line) - pos, "%s [%03u..%03u]: ",
-                    dir, static_cast<unsigned>(i), static_cast<unsigned>(i + chunk - 1));
+    pos += std::snprintf(line + pos, sizeof(line) - pos, "%s [%03u..%03u]: ",
+                         dir, static_cast<unsigned>(i), static_cast<unsigned>(i + chunk - 1));
     for (size_t j = 0; j < chunk && pos < static_cast<int>(sizeof(line) - 4); j++) {
-      pos += snprintf(line + pos, sizeof(line) - pos, "%02X ", data[i + j]);
+      pos += std::snprintf(line + pos, sizeof(line) - pos, "%02X ", static_cast<unsigned>(data[i + j]));
     }
     ESP_LOGV(TAG, "%s", line);
   }
@@ -282,8 +290,6 @@ void ACHIClimate::try_parse_frames_from_buffer_() {
     // Небольшая диагностика по длине
     if (frame.size() > 5) {
       uint8_t decl = frame[4];
-      // Жёстко не отбрасываем по длине (разные ревизии прошивок),
-      // но пишем в лог для осмотра
       ESP_LOGV(TAG, "<< Declared len=0x%02X, actual bytes=%u", decl, static_cast<unsigned>(frame.size()));
     }
     // Передаём на разбор
