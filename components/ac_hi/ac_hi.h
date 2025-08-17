@@ -92,8 +92,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x00, // [35] quiet/swing report
       0x00, // [36] LED
       0x00, // [37]
-      0x00,0x00, // [38..39] reserved
-      0x00,0x00, // [40..41] checksum (patched)
+      0x00, // [38] checksum (1 byte)
       0xF4,0xFB
   };
 
@@ -113,8 +112,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t last_tx_ms_{0};         // last write timestamp
   uint32_t ack_deadline_ms_{0};    // ACK timeout deadline
   uint32_t last_status_ms_{0};     // last time we received a status (implicit ACK)
+  uint32_t force_poll_at_ms_{0};   // when to force a status poll after write
+
   static constexpr uint32_t kMinGapMs     = 120;  // min gap between writes
   static constexpr uint32_t kAckTimeoutMs = 800;  // ACK timeout
+  static constexpr uint32_t kForcePollDelayMs = 150; // after write, force one status poll
 
   // ---- Helpers ----
   void send_query_status_();
@@ -127,9 +129,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_ack_101_();
   void parse_status_102_(const std::vector<uint8_t> &frame);
 
-  // Encoding helpers (keep device's expected scheme; tolerant decode is in parse)
+  // Encoding helpers
   static uint8_t clamp16_30_(int v) { return v < 16 ? 16 : (v > 30 ? 30 : (uint8_t) v); }
-  static uint8_t encode_power_lo_(bool on) { return on ? 0x0C : 0x04; } // LO nibble: 0x0C on, 0x04 off
   static uint8_t encode_mode_hi_direct_(climate::ClimateMode m) {
     // hi-nibble: 0..3 -> <<4
     uint8_t code = 2;
@@ -142,26 +143,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     }
     return (uint8_t)(code << 4);
   }
+  // ВАЖНО: устройство, судя по логам, ожидает LO-nibble=0x00 в статусе → не ставим биты питания в write
+  static uint8_t encode_power_lo_neutral_() { return 0x00; }
+
   static uint8_t encode_target_temp_direct_(uint8_t c) { return clamp16_30_(c); }
-  static uint8_t encode_target_temp_legacy_(uint8_t c) { c = clamp16_30_(c); return (uint8_t)((c << 1) | 0x01); }
 
   static uint8_t encode_fan_byte_(climate::ClimateFanMode f);
   static uint8_t encode_sleep_byte_(uint8_t stage);
   static uint8_t encode_swing_ud_(bool on);
   static uint8_t encode_swing_lr_(bool on);
-
-  // Allow switching encoding at compile-time if needed
-  static constexpr bool kUseLegacyTempEncoding = false; // true => (2*C+1), false => C
-
-  // Robust power decode: return pair<has_confident, power_on>
-  static inline std::pair<bool, bool> robust_decode_power_(uint8_t lo, uint8_t hi) {
-    // If device reports classic 0x0C/0x04 → confident.
-    if ((lo & 0x0F) == 0x0C) return {true, true};
-    if ((lo & 0x0F) == 0x04) return {true, false};
-    // Some firmwares return 0x00 in LO nibble while HI carries mode 0..3.
-    if (hi <= 0x03) return {false, true};  // assume ON if mode present
-    return {false, false};                 // unknown → assume OFF, but not confident
-  }
 };
 
 } // namespace ac_hi

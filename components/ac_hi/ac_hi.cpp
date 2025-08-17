@@ -77,7 +77,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   return t;
 }
 
-// ---------- Control (coalesce + wait ACK/STATUS) ----------
+// ---------- Control (coalesce + wait STATUS as ACK) ----------
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
 
@@ -136,7 +136,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   this->dirty_ = true;
 
   if (this->writing_lock_) {
-    ESP_LOGV(TAG, "control(): write in-flight, mark dirty and wait for ACK/STATUS");
+    ESP_LOGV(TAG, "control(): write in-flight, mark dirty and wait for STATUS");
     return;
   }
 
@@ -151,23 +151,21 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
 // ---------- Transport helpers ----------
 void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) const {
-  // 16-bit additive checksum over bytes [3 .. size-5]
+  // В этой прошивке статус-кадры используют 1-байтовую контрольную сумму перед хвостом.
+  // Делаем тот же 8-битный сумматор (bytes[3 .. size-4]).
   if (buf.size() < 8) return;
-  uint16_t sum = 0;
-  for (size_t i = 3; i + 5 <= buf.size(); i++) sum = (uint16_t)(sum + buf[i]);
-  size_t n = buf.size();
-  buf[n - 4] = (uint8_t)((sum >> 8) & 0xFF);
-  buf[n - 3] = (uint8_t)(sum & 0xFF);
+  uint8_t sum = 0;
+  for (size_t i = 3; i + 4 <= buf.size(); i++) sum = static_cast<uint8_t>(sum + buf[i]);
+  buf[buf.size() - 3] = sum; // один байт CRC перед хвостом
 }
 
 void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &frame) {
   for (uint8_t b : frame) this->write_byte(b);
-  this->flush();
+  // flush() убираем, чтобы не блокировать цикл
 }
 
 void ACHIClimate::send_query_status_() {
   for (uint8_t b : this->query_) this->write_byte(b);
-  this->flush();
   ESP_LOGV(TAG, "poll: status query sent");
 }
 
@@ -175,14 +173,13 @@ void ACHIClimate::send_query_status_() {
 void ACHIClimate::send_now_() {
   std::vector<uint8_t> frame = this->tx_bytes_;
 
-  // Byte 18: mode|power (mode hi-nibble direct 0..3, power lo-nibble 0x0C/0x04)
+  // Byte 18: mode|power (mode hi-nibble direct 0..3, power lo-nibble = 0x00 !!!)
   uint8_t mode_hi = encode_mode_hi_direct_(this->mode_);
-  uint8_t power_lo = encode_power_lo_(this->power_on_);
-  frame[IDX_MODE_POWER] = (uint8_t)(mode_hi | power_lo);
+  uint8_t power_lo = encode_power_lo_neutral_();
+  frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);
 
-  // Byte 19: target temp (choose encoding; default direct C)
-  frame[IDX_TARGET_TEMP] = kUseLegacyTempEncoding ? encode_target_temp_legacy_(this->target_c_)
-                                                  : encode_target_temp_direct_(this->target_c_);
+  // Byte 19: target temp (device reports plain C in your logs)
+  frame[IDX_TARGET_TEMP] = encode_target_temp_direct_(this->target_c_);
 
   // Fan / Sleep
   frame[IDX_FAN]   = encode_fan_byte_(this->fan_);
@@ -191,7 +188,7 @@ void ACHIClimate::send_now_() {
   // Swing combine
   bool v = (this->swing_ == climate::CLIMATE_SWING_VERTICAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
   bool h = (this->swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (this->swing_ == climate::CLIMATE_SWING_BOTH);
-  frame[IDX_SWING] = (uint8_t)(encode_swing_ud_(v) | encode_swing_lr_(h));
+  frame[IDX_SWING] = static_cast<uint8_t>(encode_swing_ud_(v) | encode_swing_lr_(h));
 
   // Flags: Turbo/Eco (mutually exclusive)
   if (this->turbo_)      frame[IDX_FLAGS] = 0b00000010;
@@ -205,26 +202,30 @@ void ACHIClimate::send_now_() {
   // LED
   frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
 
+  // Patch LEN field (byte[4]) = total_len - 9
+  uint8_t total = static_cast<uint8_t>(frame.size());
+  frame[4] = static_cast<uint8_t>(total - 9);
+
   // CRC and send
   this->calc_and_patch_crc_(frame);
   this->send_write_frame_(frame);
 
+  // Log full frame (hex)
+  char hexbuf[1024];
+  size_t n = std::min(frame.size(), sizeof(hexbuf)/3);
+  size_t p = 0;
+  for (size_t i = 0; i < n; i++) {
+    p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
+    if (p >= sizeof(hexbuf)) break;
+  }
+  ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned)frame.size(), hexbuf);
+
   const uint32_t now = millis();
   this->last_tx_ms_ = now;
   this->ack_deadline_ms_ = now + kAckTimeoutMs;
+  this->force_poll_at_ms_ = now + kForcePollDelayMs;
   this->writing_lock_ = true;
   this->dirty_ = false;
-
-  ESP_LOGD(TAG, "TX write: b18=0x%02X (mode_hi=0x%X power_lo=0x%X) b19=0x%02X fan=%u sleep=%u swing=0x%02X flags=0x%02X led=0x%02X",
-           frame[IDX_MODE_POWER],
-           (frame[IDX_MODE_POWER] >> 4) & 0x0F,
-           frame[IDX_MODE_POWER] & 0x0F,
-           frame[IDX_TARGET_TEMP],
-           (unsigned)frame[IDX_FAN],
-           (unsigned)frame[IDX_SLEEP],
-           (unsigned)frame[IDX_SWING],
-           (unsigned)frame[IDX_FLAGS],
-           (unsigned)frame[IDX_LED]);
 }
 
 // ---------- RX / parsing ----------
@@ -269,14 +270,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   uint8_t lo = (uint8_t)(b18 & 0x0F);
   uint8_t hi = (uint8_t)((b18 >> 4) & 0x0F);
 
-  // Robust power decode
-  auto [confident, power] = robust_decode_power_(lo, hi);
-  if (confident) {
-    this->power_on_ = power;
-  } else {
-    // Не уверены в LO-ниббле: если HI содержит реальный режим 0..3 — считаем, что питание включено
-    this->power_on_ = (hi <= 0x03);
-  }
+  // Power: в вашей прошивке lo==0x0; считаем «включено», если hi сообщает режим 0..3
+  bool power = (hi <= 0x03);
+  this->power_on_ = power;
 
   // Mode decode (direct 0..3)
   climate::ClimateMode m;
@@ -288,7 +284,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   this->mode_ = m;
 
-  // Target temp: accept both encodings
+  // Target temp: device reports plain C (ваш лог: set=25)
   uint8_t raw_set = b[IDX_TARGET_TEMP];
   uint8_t set_c = (raw_set >= 16 && raw_set <= 30) ? raw_set : (uint8_t)(raw_set >> 1);
   this->target_c_ = clamp16_30_(set_c);
@@ -339,7 +335,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (swing_h)       swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
   this->swing_ = swing_mode;
 
-  // Publish real state (NO optimistic)
+  // Publish real state
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->fan_mode = this->fan_;
   this->swing_mode = this->swing_;
@@ -357,11 +353,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            (unsigned)b[IDX_AIR_TEMP], (unsigned)b[IDX_PIPE_TEMP],
            (unsigned)rf, (unsigned)b[IDX_FLAGS], (unsigned)b[IDX_LED]);
 
-  // *** ВАЖНО: считать статус «молчаливым ACK» ***
+  // STATUS == implicit ACK
   if (this->writing_lock_) {
     ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
     this->writing_lock_ = false;
-    // Если накапали изменения за время ожидания — сразу отправим их (с паузой)
+    // если накопились изменения — сразу отправить (с паузой)
     const uint32_t now = millis();
     if (this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
       this->send_now_();
@@ -396,10 +392,10 @@ void ACHIClimate::loop() {
     rx_start_ = 0;
   }
 
-  // Parse frames with small time budget (5 ms, чтобы не «висеть» 100+ мс)
+  // Parse frames with small time budget (3 ms)
   uint32_t start = millis();
   std::vector<uint8_t> frame;
-  while (millis() - start < 5) {
+  while (millis() - start < 3) {
     if (!this->extract_next_frame_(frame)) break;
     this->handle_frame_(frame);
   }
@@ -408,18 +404,26 @@ void ACHIClimate::loop() {
 void ACHIClimate::update() {
   const uint32_t now = millis();
 
+  // Форсированный опрос после write, даже если ещё ждём ACK/STATUS
+  if (this->writing_lock_ && this->force_poll_at_ms_ != 0 && now >= this->force_poll_at_ms_) {
+    this->force_poll_at_ms_ = 0;
+    this->send_query_status_();
+  }
+
+  // Если долго не было ACK/STATUS — снимем лок
   if (this->writing_lock_ && now > this->ack_deadline_ms_) {
     ESP_LOGW(TAG, "ACK timeout after %ums; clearing lock", (unsigned)kAckTimeoutMs);
     this->writing_lock_ = false;
   }
 
+  // Если есть несообщённые изменения и можно слать — отправляем
   if (!this->writing_lock_ && this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
     ESP_LOGV(TAG, "update(): pending dirty state, sending now");
     this->send_now_();
     return;
   }
 
-  // Если недавно приходил STATUS (сам по себе), дополнительно не спамим опросами
+  // Опрос статуса (не чаще ~1с, и не спамим если недавно был STATUS)
   if (!this->writing_lock_) {
     if (now - this->last_status_ms_ > 900) {
       this->send_query_status_();
