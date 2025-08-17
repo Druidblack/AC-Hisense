@@ -21,13 +21,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
  public:
   ACHIClimate() = default;
 
-  // Component lifecycle
   void setup() override {}
   void loop() override;
   void update() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  // Climate API
   climate::ClimateTraits traits() override;
   void control(const climate::ClimateCall &call) override;
 
@@ -37,7 +35,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_enable_presets(bool v) { this->enable_presets_ = v; }
 
  protected:
-  // ---- Protocol constants ----
+  // Protocol constants
   static constexpr uint8_t HI_HDR0  = 0xF4;
   static constexpr uint8_t HI_HDR1  = 0xF5;
   static constexpr uint8_t HI_TAIL0 = 0xF4;
@@ -46,7 +44,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr uint8_t CMD_WRITE  = 0x65;  // 101
   static constexpr uint8_t CMD_STATUS = 0x66;  // 102
 
-  // Known field indices (based on device frames)
+  // Field indices in long write/status frames
   static constexpr int IDX_FAN          = 16;
   static constexpr int IDX_SLEEP        = 17;
   static constexpr int IDX_MODE_POWER   = 18;
@@ -58,7 +56,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr int IDX_FLAGS2       = 35;
   static constexpr int IDX_LED          = 36;
 
-  // ---- State (desired + reported) ----
+  // Desired/Reported state
   bool power_on_{false};
   climate::ClimateMode mode_{climate::CLIMATE_MODE_COOL};
   uint8_t target_c_{24};
@@ -75,57 +73,57 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *pipe_sensor_{nullptr};
 #endif
 
-  // ---- TX template (41 bytes total; length byte [4] must be 0x29) ----
+  // Long write template, total 41 bytes; byte[4] (length) = total-9 = 0x20
   std::vector<uint8_t> tx_bytes_ = {
-      0xF4,0xF5,0x00,0x40,0x29, // [0..4] header + length (fixed 0x29 for this write frame)
+      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder (fixed 0x20 for 41 bytes)
       0x00,0x00,0x01,0x01,      // [5..8]
       0xFE,0x01,0x00,0x00,      // [9..12]
-      CMD_WRITE,0x00,0x00,      // [13..15] cmd=0x65
+      CMD_WRITE,0x00,0x00,      // [13..15]
       0x23,                      // [16] fan
       0x45,                      // [17] sleep
       0x00,                      // [18] mode|power
       0x00,                      // [19] target temp
-      0x00,                      // [20] air temp (read)
-      0x00,                      // [21] pipe temp (read)
+      0x00,                      // [20] air temp (readback)
+      0x00,                      // [21] pipe temp (readback)
       0x00,0x00,0x00,0x00,0x00,0x00, // [22..27]
       0x00,0x00,0x00,0x00,0x00, // [28..32]
-      0x00,                     // [33] flags (turbo/eco)
-      0x00,                     // [34]
-      0x00,                     // [35] quiet/swing report
-      0x00,                     // [36] LED
-      0x00,                     // [37]
-      0x00,                     // [38] checksum (1 byte)
-      0xF4,0xFB                 // [39..40] tail
+      0x00,                      // [33] flags (turbo/eco)
+      0x00,                      // [34]
+      0x00,                      // [35] quiet/swing report
+      0x00,                      // [36] LED
+      0x00,                      // [37]
+      0x00,                      // [38] 1-byte checksum
+      0xF4,0xFB                  // [39..40] tail
   };
 
-  // Short query (status)
+  // Short status query (known-good from your logs)
   const std::vector<uint8_t> query_ = {
       0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,
       0xFE,0x01,0x00,0x00, CMD_STATUS, 0x00,0x00,0x00,0x01,
       0xB3, 0xF4,0xFB
   };
 
-  // ---- RX buffering ----
+  // RX buffering
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
 
-  // ---- Write scheduling / reliability ----
-  bool writing_lock_{false};       // waiting for ACK/STATUS after last write
-  bool dirty_{false};              // new changes pending send
-  uint32_t last_tx_ms_{0};         // last write timestamp
-  uint32_t ack_deadline_ms_{0};    // time to give up waiting
-  uint32_t last_status_ms_{0};     // last status time
-  uint32_t force_poll_at_ms_{0};   // force a status poll after write
+  // Write scheduling / reliability
+  bool writing_lock_{false};
+  bool dirty_{false};
+  uint32_t last_tx_ms_{0};
+  uint32_t ack_deadline_ms_{0};
+  uint32_t last_status_ms_{0};
+  uint32_t force_poll_at_ms_{0};
 
-  static constexpr uint32_t kMinGapMs     = 120;   // min gap between writes
-  static constexpr uint32_t kAckTimeoutMs = 1000;  // timeout for implicit ACK via STATUS
+  static constexpr uint32_t kMinGapMs         = 120;
+  static constexpr uint32_t kAckTimeoutMs     = 1000;
   static constexpr uint32_t kForcePollDelayMs = 150;
 
-  // ---- Helpers ----
+  // Helpers
   void send_query_status_();
-  void send_now_();                       // build & send snapshot (sets lock/timers)
+  void send_now_();
   void send_write_frame_(const std::vector<uint8_t> &frame);
-  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const; // 1-byte sum like STATUS frames
+  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const; // 1-byte sum like STATUS
 
   bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
@@ -135,7 +133,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Encoding helpers
   static uint8_t clamp16_30_(int v) { return v < 16 ? 16 : (v > 30 ? 30 : (uint8_t) v); }
   static uint8_t encode_mode_hi_direct_(climate::ClimateMode m) {
-    // hi-nibble: 0..3 -> <<4
     uint8_t code = 2;
     switch (m) {
       case climate::CLIMATE_MODE_FAN_ONLY: code = 0; break;
@@ -146,7 +143,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     }
     return (uint8_t)(code << 4);
   }
-  static uint8_t encode_power_lo_write_(bool on) { return on ? 0x0C : 0x04; } // write expects 0x0C/0x04
+  static uint8_t encode_power_lo_write_(bool on) { return on ? 0x0C : 0x04; } // write lo-nibble
   static uint8_t encode_target_temp_direct_(uint8_t c) { return clamp16_30_(c); }
 
   static uint8_t encode_fan_byte_(climate::ClimateFanMode f);

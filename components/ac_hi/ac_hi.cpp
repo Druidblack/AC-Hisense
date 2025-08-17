@@ -77,7 +77,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   return t;
 }
 
-// ---------- Control (coalesce + wait STATUS as ACK) ----------
+// ---------- Control ----------
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
 
@@ -151,7 +151,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
 // ---------- Transport helpers ----------
 void ACHIClimate::calc_and_patch_crc1_(std::vector<uint8_t> &buf) const {
-  // Однобайтная сумма, как в статус-кадрах: суммируем [3 .. size-4], пишем в [size-3]
+  // 1-byte sum over bytes [3 .. size-4], store at [size-3]
   if (buf.size() < 8) return;
   uint8_t sum = 0;
   for (size_t i = 3; i + 4 <= buf.size(); i++) sum = static_cast<uint8_t>(sum + buf[i]);
@@ -160,7 +160,6 @@ void ACHIClimate::calc_and_patch_crc1_(std::vector<uint8_t> &buf) const {
 
 void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &frame) {
   for (uint8_t b : frame) this->write_byte(b);
-  // flush() не используем, чтобы не блокировать цикл
 }
 
 void ACHIClimate::send_query_status_() {
@@ -172,15 +171,15 @@ void ACHIClimate::send_query_status_() {
 void ACHIClimate::send_now_() {
   std::vector<uint8_t> frame = this->tx_bytes_;
 
-  // [4] — длина кадра: для этого write всегда 0x29 (41 байт)
-  frame[4] = 0x29;
+  // [4] length must be total-9 (for 41 bytes -> 0x20)
+  frame[4] = static_cast<uint8_t>(frame.size() - 9);
 
-  // [18]: mode|power — hi (0..3)<<4, lo = 0x0C (ON) / 0x04 (OFF)
+  // [18]: mode|power
   uint8_t mode_hi = encode_mode_hi_direct_(this->mode_);
   uint8_t power_lo = encode_power_lo_write_(this->power_on_);
   frame[IDX_MODE_POWER] = static_cast<uint8_t>(mode_hi | power_lo);
 
-  // [19]: target temp — plain C (ваши статусы так и показывают)
+  // [19]: target temp (plain C)
   frame[IDX_TARGET_TEMP] = encode_target_temp_direct_(this->target_c_);
 
   // [16],[17]: fan / sleep
@@ -197,23 +196,21 @@ void ACHIClimate::send_now_() {
   else if (this->eco_)   frame[IDX_FLAGS] = 0b00000100;
   else                   frame[IDX_FLAGS] = 0;
 
-  // [35]: Quiet (от зеркала fan quiet)
+  // [35]: Quiet (зеркало fan quiet)
   this->quiet_ = (this->fan_ == climate::CLIMATE_FAN_QUIET);
   frame[IDX_FLAGS2] = this->quiet_ ? 0b00110000 : 0x00;
 
   // [36]: LED
   frame[IDX_LED] = this->led_ ? 0b11000000 : 0b01000000;
 
-  // CRC (1 байт, как у STATUS), пишем в [38]
+  // CRC (1 byte, like STATUS)
   this->calc_and_patch_crc1_(frame);
 
-  // Лог: контроль длины и CRC
-  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X (expected 0x29), crc[38]=0x%02X", frame[4], frame[38]);
+  // Лог: длина и CRC
+  ESP_LOGD(TAG, "build: len_byte[4]=0x%02X (expected 0x%02X), crc[38]=0x%02X",
+           frame[4], (uint8_t)(frame.size() - 9), frame[38]);
 
-  // Отправка
-  this->send_write_frame_(frame);
-
-  // Дамп кадра (hex)
+  // Дамп
   char hexbuf[1024];
   size_t n = std::min(frame.size(), sizeof(hexbuf)/3);
   size_t p = 0;
@@ -221,7 +218,10 @@ void ACHIClimate::send_now_() {
     p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
     if (p >= sizeof(hexbuf)) break;
   }
-  ESP_LOGD(TAG, "TX write (41 bytes): %s", hexbuf);
+  ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned)frame.size(), hexbuf);
+
+  // Отправка
+  this->send_write_frame_(frame);
 
   const uint32_t now = millis();
   this->last_tx_ms_ = now;
@@ -236,11 +236,9 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
   size_t i = rx_start_;
   const size_t N = rx_.size();
 
-  // find header
   while (i + 1 < N && !(rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1)) ++i;
   if (i + 1 >= N) { rx_start_ = i; return false; }
 
-  // find tail
   size_t j = i + 2;
   while (j + 1 < N && !(rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1)) ++j;
   if (j + 1 >= N) { rx_start_ = i; return false; }
@@ -273,27 +271,27 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   uint8_t lo = (uint8_t)(b18 & 0x0F);
   uint8_t hi = (uint8_t)((b18 >> 4) & 0x0F);
 
-  // Power: по статусу у вас lo==0x0 → считаем OFF
+  // Питание: по статусу у вас lo==0x0 → OFF
   bool power = (lo & 0x08) != 0;
   this->power_on_ = power;
 
-  // Mode decode (direct 0..3)
+  // Mode decode (0..3)
   climate::ClimateMode m;
   if      (hi == 0x00) m = climate::CLIMATE_MODE_FAN_ONLY;
   else if (hi == 0x01) m = climate::CLIMATE_MODE_HEAT;
   else if (hi == 0x02) m = climate::CLIMATE_MODE_COOL;
   else if (hi == 0x03) m = climate::CLIMATE_MODE_DRY;
-  else                 m = this->mode_; // keep last known
+  else                 m = this->mode_;
 
   this->mode_ = m;
 
-  // Target temp
+  // Target temp (plain C or legacy)
   uint8_t raw_set = b[IDX_TARGET_TEMP];
   uint8_t set_c = (raw_set >= 16 && raw_set <= 30) ? raw_set : (uint8_t)(raw_set >> 1);
   this->target_c_ = clamp16_30_(set_c);
   this->target_temperature = this->target_c_;
 
-  // Current temperatures
+  // Current temps
   this->current_temperature = b[IDX_AIR_TEMP];
 #ifdef USE_SENSOR
   if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
@@ -360,7 +358,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (this->writing_lock_) {
     ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
     this->writing_lock_ = false;
-    // если накопились изменения — сразу отправить (с паузой)
     const uint32_t now = millis();
     if (this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
       this->send_now_();
@@ -383,19 +380,14 @@ void ACHIClimate::handle_ack_101_() {
 
 // ---------- Loop/Update ----------
 void ACHIClimate::loop() {
-  // Read UART into rx buffer
   uint8_t c;
-  while (this->read_byte(&c)) {
-    rx_.push_back(c);
-  }
+  while (this->read_byte(&c)) rx_.push_back(c);
 
-  // Compact buffer if needed
   if (rx_start_ > 4096) {
     rx_.erase(rx_.begin(), rx_.begin() + (std::ptrdiff_t)rx_start_);
     rx_start_ = 0;
   }
 
-  // Parse frames with small time budget (3 ms)
   uint32_t start = millis();
   std::vector<uint8_t> frame;
   while (millis() - start < 3) {
@@ -407,26 +399,22 @@ void ACHIClimate::loop() {
 void ACHIClimate::update() {
   const uint32_t now = millis();
 
-  // форс-опрос после write (ускоряет implicit ACK)
   if (this->writing_lock_ && this->force_poll_at_ms_ != 0 && now >= this->force_poll_at_ms_) {
     this->force_poll_at_ms_ = 0;
     this->send_query_status_();
   }
 
-  // таймаут ожидания STATUS
   if (this->writing_lock_ && now > this->ack_deadline_ms_) {
     ESP_LOGW(TAG, "ACK/STATUS timeout after %ums; clearing lock", (unsigned)kAckTimeoutMs);
     this->writing_lock_ = false;
   }
 
-  // если есть несообщённые изменения — отправим
   if (!this->writing_lock_ && this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
     ESP_LOGV(TAG, "update(): pending dirty state, sending now");
     this->send_now_();
     return;
   }
 
-  // опрос статуса (не чаще ~1с)
   if (!this->writing_lock_) {
     if (now - this->last_status_ms_ > 900) {
       this->send_query_status_();
