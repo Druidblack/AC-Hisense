@@ -19,10 +19,9 @@
 namespace esphome {
 namespace ac_hi {
 
-// Hisense/BECO legacy protocol (Ballu-like) over UART/RS485.
-// Frames use header 0xF4 0xF5 and tail 0xF4 0xFB.
-// WRITE frame is 50 bytes in legacy templates (CRC16-SUM placed at [46]=HI,[47]=LO, tail [48],[49]).
-// STATUS query short frame uses SUM8 checksum (single byte) before tail.
+// Hisense/BECO legacy protocol over UART/RS485.
+// Header: F4 F5, Tail: F4 FB
+// Короткий запрос STATUS — 21 байт с SUM8, длинные ответы STATUS у некоторых плат приходят с cmd=0x65.
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -48,23 +47,23 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr uint8_t HI_TAIL0 = 0xF4;
   static constexpr uint8_t HI_TAIL1 = 0xFB;
 
-  static constexpr uint8_t CMD_WRITE  = 0x65;  // 101
-  static constexpr uint8_t CMD_STATUS = 0x66;  // 102
-  static constexpr uint8_t CMD_NAK    = 0xFD;  // negative ack on some boards
+  static constexpr uint8_t CMD_WRITE  = 0x65;  // write / ack / иногда длинный status
+  static constexpr uint8_t CMD_STATUS = 0x66;  // короткий/длинный status на некоторых моделях
+  static constexpr uint8_t CMD_NAK    = 0xFD;
 
-  // Field indices in long write/status frames (0-based)
+  // Полезные индексы в длинных кадрах (совпадают с логами: b18, b19, ...)
   static constexpr int IDX_FAN          = 16;
   static constexpr int IDX_SLEEP        = 17;
   static constexpr int IDX_MODE_POWER   = 18;
   static constexpr int IDX_TARGET_TEMP  = 19;
   static constexpr int IDX_AIR_TEMP     = 20;
   static constexpr int IDX_PIPE_TEMP    = 21;
-  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE тут 0x50
+  static constexpr int IDX_SWING        = 32;  // 0x50 = UD swing ON
   static constexpr int IDX_FLAGS        = 33;  // turbo/eco
-  static constexpr int IDX_FLAGS2       = 35;  // quiet + H swing in STATUS
-  static constexpr int IDX_LED          = 36;  // LED bit in MSB
+  static constexpr int IDX_FLAGS2       = 35;  // quiet + LR swing bit
+  static constexpr int IDX_LED          = 36;  // бит 0x40
 
-  // Desired state
+  // Текущее желаемое состояние
   bool power_on_{false};
   climate::ClimateMode mode_{climate::CLIMATE_MODE_COOL};
   uint8_t target_c_{24};
@@ -94,7 +93,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t last_status_ms_{0};
   uint32_t force_poll_at_ms_{0};
 
-  // Pending desired snapshot captured at send to allow implicit-ACK via STATUS comparison
+  // Pending snapshot для implicit-ACK через сравнение со STATUS
   bool have_pending_{false};
   bool pending_power_{false};
   climate::ClimateMode pending_mode_{climate::CLIMATE_MODE_COOL};
@@ -113,8 +112,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   bool extract_next_frame_(std::vector<uint8_t> &out);
   void handle_frame_(const std::vector<uint8_t> &frame);
-  void parse_status_102_(const std::vector<uint8_t> &b);
-  void handle_ack_101_();
+  void parse_status_legacy_(const std::vector<uint8_t> &b);
+  void handle_ack_short_();
   void handle_nak_fd_();
 
   // Legacy builders
@@ -122,8 +121,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void build_legacy_query_status_(std::vector<uint8_t> &frame);
 
   // Checksums
-  static void crc16_sum_legacy_patch(std::vector<uint8_t> &buf); // for WRITE (HI then LO)
-  static void crc8_sum_legacy_patch(std::vector<uint8_t> &buf);  // for short STATUS (single byte)
+  static void crc16_sum_legacy_patch(std::vector<uint8_t> &buf); // WRITE (HI, LO) в [46],[47]
+  static void crc8_sum_legacy_patch(std::vector<uint8_t> &buf);  // короткий STATUS: байт в [18]
 
   static uint8_t clamp16_30_(uint8_t c) { if (c < 16) return 16; if (c > 30) return 30; return c; }
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
@@ -140,7 +139,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     return static_cast<uint8_t>((c << 1) | 0x01);
   }
 
-  // В WRITE используем те же коды, что видим в STATUS (AUTO=0x02, QUIET=0x0B, LOW=0x0D, MED=0x0F, HIGH=0x11)
   static uint8_t encode_fan_byte_(climate::ClimateFanMode f);
   static uint8_t encode_sleep_byte_(uint8_t stage);
   static uint8_t encode_swing_ud_(bool on);

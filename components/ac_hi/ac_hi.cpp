@@ -50,16 +50,16 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 }
 
 void ACHIClimate::update() {
-  // Regular poll every 2s; if we're in write lock poll faster to get STATUS
+  // Poll раз в ~0.9s, чтобы не спамить шину
   const uint32_t now = millis();
   if (this->writing_lock_ && now < this->force_poll_at_ms_) {
-    // allow previous poll to elapse
+    // ждём ближайшее окно опроса
   }
   this->send_query_status_();
 }
 
 void ACHIClimate::loop() {
-  // RX accumulation (non-blocking)
+  // RX accumulation (неблокирующий)
   uint8_t byte;
   while (this->available()) {
     if (this->read_byte(&byte)) {
@@ -69,80 +69,74 @@ void ACHIClimate::loop() {
     }
   }
 
-  // Extract and handle complete frames
+  // Извлечь и обработать все полные фреймы
   std::vector<uint8_t> frame;
   while (this->extract_next_frame_(frame)) {
     this->handle_frame_(frame);
     frame.clear();
   }
 
-  // Handle pending write/ack
+  // Отправка ожидающих изменений
   const uint32_t now = millis();
   if (this->dirty_ && !this->writing_lock_) {
     this->send_now_();
   }
 
+  // Таймаут ожидания ACK/STATUS
   if (this->writing_lock_ && now > this->ack_deadline_ms_) {
     ESP_LOGW(TAG, "ACK timeout: polling status / allowing resend");
-    this->writing_lock_ = false;  // allow resend on next control()
+    this->writing_lock_ = false;  // разрешить повтор
   }
 }
 
 // ---------- Builders & IO ----------
 
 void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
-  // 50-byte frame template, indexes match legacy YAML (CRC16 SUM at [46]=HI,[47]=LO, tail [48],[49])
+  // 50-байтный шаблон (CRC16 SUM в [46]=HI, [47]=LO, хвост [48],[49])
   b.assign(50, 0x00);
   b[0]  = HI_HDR0; b[1] = HI_HDR1;
   b[2]  = 0x00;    b[3] = 0x40;
-  b[4]  = 0x29;    // length (legacy template uses 0x29)
+  b[4]  = 0x29;    // length, как в legacy
   b[5]  = 0x00;    b[6]  = 0x00; b[7]  = 0x01; b[8]  = 0x01;
   b[9]  = 0xFE;    b[10] = 0x01; b[11] = 0x00; b[12] = 0x00;
   b[13] = CMD_WRITE; // 0x65
   b[14] = 0x00; b[15] = 0x00;
 
-  // Fill dynamic controls
-  b[IDX_FAN]         = encode_fan_byte_(this->fan_);      // same codes as STATUS
+  // Управляющие поля
+  b[IDX_FAN]         = encode_fan_byte_(this->fan_);
   b[IDX_SLEEP]       = encode_sleep_byte_(this->sleep_stage_);
   b[IDX_MODE_POWER]  = encode_mode_hi_write_legacy_(this->mode_) | (this->power_on_ ? 0x0C : 0x00);
   b[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_);
 
-  // Reserved fields 20..31 left zero
-  // Byte 32 - UD swing (0x50 on legacy for on)
-  b[IDX_SWING] = encode_swing_ud_(this->swing_ != climate::CLIMATE_SWING_OFF);
-  // Byte 33 - turbo/eco flags; on legacy Turbo overrides Eco
-  b[IDX_FLAGS] = (this->turbo_ ? 0x0C : 0x00) | (this->eco_ ? 0x10 : 0x00);
-  // Byte 35 - quiet (bit4) + horizontal swing in STATUS; here only quiet
+  // Swing / флаги
+  b[IDX_SWING]  = encode_swing_ud_(this->swing_ != climate::CLIMATE_SWING_OFF);
+  b[IDX_FLAGS]  = (this->turbo_ ? 0x0C : 0x00) | (this->eco_ ? 0x10 : 0x00);
   b[IDX_FLAGS2] = (this->quiet_ ? 0x10 : 0x00);
-  // Byte 36 MSB - LED
-  b[IDX_LED] = (this->led_ ? 0x40 : 0x00);
+  b[IDX_LED]    = (this->led_ ? 0x40 : 0x00);
 
-  // Trailer & checksums
-  // Place CRC16-SUM (hi,lo) at [46],[47]
+  // CRC + tail
   crc16_sum_legacy_patch(b);
   b[48] = HI_TAIL0;
   b[49] = HI_TAIL1;
 
-  // Debug
   ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[46]=0x%02X crc_lo[47]=0x%02X",
            b[4], b[46], b[47]);
-
   ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
            b[IDX_MODE_POWER], (b[IDX_MODE_POWER] & 0xF0), (b[IDX_MODE_POWER] & 0x0F), b[IDX_TARGET_TEMP]);
 }
 
 void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &b) {
-  // Short 21-byte STATUS query used by legacy config with SUM8 checksum
+  // Короткий 21-байтный STATUS-запрос с SUM8
   b.assign(21, 0x00);
   b[0]=HI_HDR0; b[1]=HI_HDR1;
   b[2]=0x00; b[3]=0x40;
-  b[4]=0x0C;             // legacy short len
+  b[4]=0x0C;             // длина короткого запроса
   b[5]=0x00; b[6]=0x00; b[7]=0x01; b[8]=0x01;
   b[9]=0xFE; b[10]=0x01; b[11]=0x00; b[12]=0x00;
   b[13]=CMD_STATUS;      // 0x66
   b[14]=0x00; b[15]=0x00; b[16]=0x00;
-  b[17]=0x01;            // ?
-  // [18] checksum (SUM8), [19] tail0, [20] tail1
+  b[17]=0x01;
+  // [18] — SUM8, [19],[20] — хвост
   crc8_sum_legacy_patch(b);
   b[19] = HI_TAIL0;
   b[20] = HI_TAIL1;
@@ -151,21 +145,17 @@ void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &b) {
            (int) b.size(), b[0], b[1], b[4], b[18]);
 }
 
-// Compute legacy CRC16-SUM (sum of bytes [2..len-4], store [46]=HI,[47]=LO)
 void ACHIClimate::crc16_sum_legacy_patch(std::vector<uint8_t> &buf) {
   uint16_t sum = 0;
-  // stop before last 4 bytes (crc+tail)
-  const int stop = (int) buf.size() - 4;
+  const int stop = (int) buf.size() - 4; // до CRC+tail
   for (int i = 2; i < stop; i++) sum += buf[i];
-  buf[46] = (sum >> 8) & 0xFF;
-  buf[47] = sum & 0xFF;
+  buf[46] = (sum >> 8) & 0xFF;  // HI
+  buf[47] = sum & 0xFF;         // LO
 }
 
-// Compute legacy SUM8 for short STATUS, store at [18]
 void ACHIClimate::crc8_sum_legacy_patch(std::vector<uint8_t> &buf) {
   uint8_t sum = 0;
-  // stop before last 3 bytes (crc8+tail)
-  const int stop = (int) buf.size() - 3;
+  const int stop = (int) buf.size() - 3; // до CRC8+tail
   for (int i = 2; i < stop; i++) sum = (uint8_t)(sum + buf[i]);
   buf[18] = sum;
 }
@@ -194,7 +184,7 @@ void ACHIClimate::send_now_() {
   std::vector<uint8_t> frame;
   this->build_legacy_write_(frame);
 
-  // snapshot desired to allow implicit-ACK
+  // snapshot желаемого
   this->pending_power_ = this->power_on_;
   this->pending_mode_  = this->mode_;
   this->pending_target_c_ = this->target_c_;
@@ -212,25 +202,22 @@ void ACHIClimate::send_now_() {
 void ACHIClimate::send_write_frame_(const std::vector<uint8_t> &b) {
   if (b.size() < 10) return;
 
-  // Transmit
   this->write_array(b.data(), b.size());
-  this->flush();                 // ensure TX FIFO emptied
-  delayMicroseconds(2000);       // give RS485 driver time to release bus
+  this->flush();                 // опустошить FIFO
+  delayMicroseconds(2000);       // отпустить RS485 DE/RE
 
   this->last_tx_ms_ = millis();
-  this->ack_deadline_ms_ = this->last_tx_ms_ + 1200; // wait ~1.2s for ACK/STATUS
+  this->ack_deadline_ms_ = this->last_tx_ms_ + 1200; // ждём ~1.2s
   this->writing_lock_ = true;
 
-  // dump hex
+  // dump
   char dump[512]; size_t pos = 0;
-  for (size_t i = 0; i < b.size() && pos + 3 < sizeof(dump); i++) {
+  for (size_t i = 0; i < b.size() && pos + 3 < sizeof(dump); i++)
     pos += snprintf(dump + pos, sizeof(dump) - pos, "%02X%s", b[i], (i + 1 < b.size() ? " " : ""));
-  }
   ESP_LOGD(TAG, "TX write (%u bytes): %s", (unsigned) b.size(), dump);
 }
 
 void ACHIClimate::send_query_status_() {
-  // do not spam queries; 900ms gap
   const uint32_t now = millis();
   if (now - this->last_status_ms_ < 900) return;
   this->last_status_ms_ = now;
@@ -247,14 +234,13 @@ void ACHIClimate::send_query_status_() {
 // ---------- RX parsing ----------
 
 bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
-  // find header
+  // найти заголовок
   while (this->rx_start_ + 2 <= this->rx_.size()) {
     if (this->rx_[this->rx_start_] == HI_HDR0 && this->rx_[this->rx_start_ + 1] == HI_HDR1)
       break;
     this->rx_start_++;
   }
   if (this->rx_start_ + 2 > this->rx_.size()) {
-    // drop old garbage
     if (this->rx_start_ > 0) {
       this->rx_.erase(this->rx_.begin(), this->rx_.begin() + this->rx_start_);
       this->rx_start_ = 0;
@@ -262,7 +248,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
     return false;
   }
 
-  // look for tail
+  // искать хвост
   size_t i = this->rx_start_ + 2;
   for (; i + 1 < this->rx_.size(); i++) {
     if (this->rx_[i] == HI_TAIL0 && this->rx_[i + 1] == HI_TAIL1) {
@@ -274,7 +260,6 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &out) {
     }
   }
 
-  // not complete yet, keep buffer trimmed
   if (this->rx_start_ > 64) {
     this->rx_.erase(this->rx_.begin(), this->rx_.begin() + this->rx_start_);
     this->rx_start_ = 0;
@@ -287,19 +272,30 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 
   const uint8_t cmd = b[13];
 
+  // 1) Нормальный STATUS (0x66)
   if (cmd == CMD_STATUS) {
     ESP_LOGV(TAG, "RX frame: STATUS (0x66), len=%u", (unsigned) b.size());
-    this->parse_status_102_(b);
+    this->parse_status_legacy_(b);
     this->force_poll_at_ms_ = millis() + 1200;
     return;
   }
 
-  if (cmd == CMD_WRITE && b.size() == 18) {
+  // 2) Короткий ACK (0x65) — обычно ~18 байт
+  if (cmd == CMD_WRITE && b.size() <= 20) {
     ESP_LOGV(TAG, "RX frame: ACK (0x65)");
-    this->handle_ack_101_();
+    this->handle_ack_short_();
     return;
   }
 
+  // 3) Длинный «STATUS-как-0x65» — встречается на части плат (ваш текущий случай)
+  if (cmd == CMD_WRITE && b.size() > 40) {
+    ESP_LOGV(TAG, "RX frame: cmd=0x65 len=%u → treating as STATUS", (unsigned) b.size());
+    this->parse_status_legacy_(b);
+    this->force_poll_at_ms_ = millis() + 1200;
+    return;
+  }
+
+  // 4) NAK
   if (cmd == CMD_NAK) {
     ESP_LOGW(TAG, "RX frame: NAK (0xFD)");
     this->handle_nak_fd_();
@@ -309,7 +305,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   ESP_LOGV(TAG, "RX frame: cmd=0x%02X len=%u (ignored)", cmd, (unsigned) b.size());
 }
 
-void ACHIClimate::handle_ack_101_() {
+void ACHIClimate::handle_ack_short_() {
   if (this->writing_lock_) {
     this->writing_lock_ = false;
     this->dirty_ = false;
@@ -317,10 +313,10 @@ void ACHIClimate::handle_ack_101_() {
 }
 
 void ACHIClimate::handle_nak_fd_() {
-  // Allow resend
   this->writing_lock_ = false;
 }
 
+// Сопоставление полученного статуса с ожидаемым (для implicit-ACK)
 bool ACHIClimate::reported_matches_pending_(bool rep_power,
                                             climate::ClimateMode rep_mode,
                                             uint8_t rep_set_c,
@@ -342,8 +338,8 @@ bool ACHIClimate::reported_matches_pending_(bool rep_power,
       && rep_led   == this->pending_led_;
 }
 
-void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
-  if (b.size() < 40) return;
+void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
+  if ((int)b.size() <= IDX_LED) return;  // на всякий
 
   const uint8_t mode_lo = b[IDX_MODE_POWER] & 0x0F;
   const uint8_t mode_hi = b[IDX_MODE_POWER] & 0xF0;
@@ -364,7 +360,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   climate::ClimateFanMode fan = climate::CLIMATE_FAN_AUTO;
   switch (b[IDX_FAN]) {
     case 0x02: fan = climate::CLIMATE_FAN_AUTO;   break;
-    case 0x0B: fan = climate::CLIMATE_FAN_AUTO;   break; // alias sometimes seen
+    case 0x0B: fan = climate::CLIMATE_FAN_AUTO;   break; // alias встречается
     case 0x0D: fan = climate::CLIMATE_FAN_LOW;    break;
     case 0x0F: fan = climate::CLIMATE_FAN_MEDIUM; break;
     case 0x11: fan = climate::CLIMATE_FAN_HIGH;   break;
@@ -375,7 +371,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (b[IDX_SWING] == 0x50 && (b[IDX_FLAGS2] & 0x20))
     swing = climate::CLIMATE_SWING_BOTH;
   else if (b[IDX_SWING] == 0x50 || (b[IDX_FLAGS2] & 0x20))
-    swing = climate::CLIMATE_SWING_BOTH;  // treat any as ON
+    swing = climate::CLIMATE_SWING_BOTH;
 
   bool turbo = (b[IDX_FLAGS] & 0x0C) == 0x0C;
   bool eco   = (b[IDX_FLAGS] & 0x10) == 0x10;
@@ -390,14 +386,14 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     this->pipe_sensor_->publish_state(pipe);
 #endif
 
-  // Implicit ACK from status if values match what we sent
+  // implicit-ACK по совпадению статуса с тем, что отправляли
   if (this->writing_lock_ && this->reported_matches_pending_(power, mode, set_c, fan, swing, turbo, eco, quiet, led)) {
     ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
     this->writing_lock_ = false;
     this->dirty_ = false;
   }
 
-  // publish actual state
+  // публикация фактического состояния
   this->mode_ = power ? mode : climate::CLIMATE_MODE_OFF;
   this->power_on_ = power;
   this->target_c_ = set_c;
@@ -408,7 +404,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   this->quiet_ = quiet;
   this->led_ = led;
 
-  climate::Climate::publish_state();
+  this->publish_state();
 }
 
 } // namespace ac_hi
