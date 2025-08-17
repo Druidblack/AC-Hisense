@@ -1,11 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import climate, uart, sensor
-from esphome.const import (
-    CONF_ID,
-    CONF_UART_ID,
-    CONF_UPDATE_INTERVAL,
-)
+from esphome.const import CONF_ID, CONF_UART_ID
 
 AUTO_LOAD = ["climate", "uart", "sensor"]
 
@@ -28,6 +24,6 @@ async def to_code(config):
     uart_comp = await cg.get_variable(config[CONF_UART_ID])
     cg.add(var.set_uart_parent(uart_comp))
     cg.add(var.set_enable_presets(config[CONF_ENABLE_PRESETS]))
-    if (pipe := config.get(CONF_PIPE_TEMPERATURE)) is not None:
+    if pipe := config.get(CONF_PIPE_TEMPERATURE):
         sens = await sensor.new_sensor(pipe)
         cg.add(var.set_pipe_sensor(sens))
