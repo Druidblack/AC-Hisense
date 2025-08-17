@@ -17,7 +17,6 @@
 namespace esphome {
 namespace ac_hi {
 
-// Robust HiSense-like AC over UART (HI protocol) with queued writes and ACK handling.
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
   ACHIClimate() = default;
@@ -113,6 +112,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool dirty_{false};              // new changes pending send
   uint32_t last_tx_ms_{0};         // last write timestamp
   uint32_t ack_deadline_ms_{0};    // ACK timeout deadline
+  uint32_t last_status_ms_{0};     // last time we received a status (implicit ACK)
   static constexpr uint32_t kMinGapMs     = 120;  // min gap between writes
   static constexpr uint32_t kAckTimeoutMs = 800;  // ACK timeout
 
@@ -152,6 +152,16 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Allow switching encoding at compile-time if needed
   static constexpr bool kUseLegacyTempEncoding = false; // true => (2*C+1), false => C
+
+  // Robust power decode: return pair<has_confident, power_on>
+  static inline std::pair<bool, bool> robust_decode_power_(uint8_t lo, uint8_t hi) {
+    // If device reports classic 0x0C/0x04 → confident.
+    if ((lo & 0x0F) == 0x0C) return {true, true};
+    if ((lo & 0x0F) == 0x04) return {true, false};
+    // Some firmwares return 0x00 in LO nibble while HI carries mode 0..3.
+    if (hi <= 0x03) return {false, true};  // assume ON if mode present
+    return {false, false};                 // unknown → assume OFF, but not confident
+  }
 };
 
 } // namespace ac_hi

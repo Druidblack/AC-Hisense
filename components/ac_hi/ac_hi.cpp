@@ -77,7 +77,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   return t;
 }
 
-// ---------- Control (coalesce + wait ACK) ----------
+// ---------- Control (coalesce + wait ACK/STATUS) ----------
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
 
@@ -136,7 +136,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   this->dirty_ = true;
 
   if (this->writing_lock_) {
-    ESP_LOGV(TAG, "control(): write in-flight, mark dirty and wait for ACK");
+    ESP_LOGV(TAG, "control(): write in-flight, mark dirty and wait for ACK/STATUS");
     return;
   }
 
@@ -263,30 +263,44 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &frame) {
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (b.size() <= (size_t)IDX_LED) return;
 
+  this->last_status_ms_ = millis();
+
   uint8_t b18 = b[IDX_MODE_POWER];
-  bool power = (b18 & 0x08) != 0;
+  uint8_t lo = (uint8_t)(b18 & 0x0F);
   uint8_t hi = (uint8_t)((b18 >> 4) & 0x0F);
 
-  // tolerant decode: direct 0..3 or legacy odd codes 1,3,5,7,9
+  // Robust power decode
+  auto [confident, power] = robust_decode_power_(lo, hi);
+  if (confident) {
+    this->power_on_ = power;
+  } else {
+    // Не уверены в LO-ниббле: если HI содержит реальный режим 0..3 — считаем, что питание включено
+    this->power_on_ = (hi <= 0x03);
+  }
+
+  // Mode decode (direct 0..3)
   climate::ClimateMode m;
   if      (hi == 0x00) m = climate::CLIMATE_MODE_FAN_ONLY;
   else if (hi == 0x01) m = climate::CLIMATE_MODE_HEAT;
   else if (hi == 0x02) m = climate::CLIMATE_MODE_COOL;
   else if (hi == 0x03) m = climate::CLIMATE_MODE_DRY;
-  else {
-    uint8_t code = (uint8_t)(hi >> 1);
-    switch (code) {
-      case 0: m = climate::CLIMATE_MODE_FAN_ONLY; break;
-      case 1: m = climate::CLIMATE_MODE_HEAT;     break;
-      case 2: m = climate::CLIMATE_MODE_COOL;     break;
-      case 3: m = climate::CLIMATE_MODE_DRY;      break;
-      default: m = climate::CLIMATE_MODE_COOL;    break;
-    }
-  }
+  else                 m = this->mode_; // leave last known
 
+  this->mode_ = m;
+
+  // Target temp: accept both encodings
   uint8_t raw_set = b[IDX_TARGET_TEMP];
   uint8_t set_c = (raw_set >= 16 && raw_set <= 30) ? raw_set : (uint8_t)(raw_set >> 1);
+  this->target_c_ = clamp16_30_(set_c);
+  this->target_temperature = this->target_c_;
 
+  // Current temperatures
+  this->current_temperature = b[IDX_AIR_TEMP];
+#ifdef USE_SENSOR
+  if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
+#endif
+
+  // Fan
   uint8_t rf = b[IDX_FAN];
   climate::ClimateFanMode fan = climate::CLIMATE_FAN_AUTO;
   if      (rf ==  1 || rf ==  2) fan = climate::CLIMATE_FAN_AUTO;
@@ -294,7 +308,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (rf == 13)             fan = climate::CLIMATE_FAN_LOW;
   else if (rf == 15)             fan = climate::CLIMATE_FAN_MEDIUM;
   else if (rf == 17)             fan = climate::CLIMATE_FAN_HIGH;
+  this->fan_ = fan;
 
+  // Sleep
   uint8_t rs = b[IDX_SLEEP];
   uint8_t sc = (uint8_t)(rs >> 1);
   uint8_t sleep_stage = 0;
@@ -303,11 +319,17 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (sc == 2) sleep_stage = 2;
   else if (sc == 4) sleep_stage = 3;
   else if (sc == 8) sleep_stage = 4;
+  this->sleep_stage_ = sleep_stage;
 
+  // Flags/LED/Swing
   bool turbo = (b[IDX_FLAGS]  & 0b00000010) != 0;
   bool eco   = (b[IDX_FLAGS]  & 0b00000100) != 0;
   bool quiet = (b[IDX_FLAGS2] & 0b00110000) == 0b00110000;
   bool led   = (b[IDX_LED]    & 0b10000000) != 0;
+  this->turbo_ = turbo;
+  this->eco_   = eco;
+  this->quiet_ = quiet;
+  this->led_   = led;
 
   bool swing_v = (b[IDX_FLAGS2] & 0b10000000) != 0;
   bool swing_h = (b[IDX_FLAGS2] & 0b01000000) != 0;
@@ -315,24 +337,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (swing_v && swing_h) swing_mode = climate::CLIMATE_SWING_BOTH;
   else if (swing_v)       swing_mode = climate::CLIMATE_SWING_VERTICAL;
   else if (swing_h)       swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
-
-  // Apply
-  this->power_on_ = power;
-  this->mode_ = m;
-  this->target_c_ = clamp16_30_(set_c);
-  this->target_temperature = this->target_c_;
-  this->current_temperature = b[IDX_AIR_TEMP];
-#ifdef USE_SENSOR
-  if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
-#endif
-  this->fan_ = fan;
-  this->sleep_stage_ = sleep_stage;
-  this->turbo_ = turbo;
-  this->eco_ = eco;
-  this->quiet_ = quiet;
-  this->led_ = led;
   this->swing_ = swing_mode;
 
+  // Publish real state (NO optimistic)
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->fan_mode = this->fan_;
   this->swing_mode = this->swing_;
@@ -346,9 +353,20 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   this->publish_state();
 
   ESP_LOGD(TAG, "RX status: b18=0x%02X (hi=0x%X lo=0x%X) set=%u air=%u pipe=%u fan=%u flags=0x%02X led=0x%02X",
-           b18, hi, (b18 & 0x0F), (unsigned)this->target_c_,
+           b18, hi, lo, (unsigned)this->target_c_,
            (unsigned)b[IDX_AIR_TEMP], (unsigned)b[IDX_PIPE_TEMP],
            (unsigned)rf, (unsigned)b[IDX_FLAGS], (unsigned)b[IDX_LED]);
+
+  // *** ВАЖНО: считать статус «молчаливым ACK» ***
+  if (this->writing_lock_) {
+    ESP_LOGV(TAG, "STATUS received while waiting ACK → clearing lock");
+    this->writing_lock_ = false;
+    // Если накапали изменения за время ожидания — сразу отправим их (с паузой)
+    const uint32_t now = millis();
+    if (this->dirty_ && (now - this->last_tx_ms_ >= kMinGapMs)) {
+      this->send_now_();
+    }
+  }
 }
 
 void ACHIClimate::handle_ack_101_() {
@@ -378,10 +396,10 @@ void ACHIClimate::loop() {
     rx_start_ = 0;
   }
 
-  // Parse frames with small time budget
+  // Parse frames with small time budget (5 ms, чтобы не «висеть» 100+ мс)
   uint32_t start = millis();
   std::vector<uint8_t> frame;
-  while (millis() - start < 20) {
+  while (millis() - start < 5) {
     if (!this->extract_next_frame_(frame)) break;
     this->handle_frame_(frame);
   }
@@ -401,8 +419,13 @@ void ACHIClimate::update() {
     return;
   }
 
+  // Если недавно приходил STATUS (сам по себе), дополнительно не спамим опросами
   if (!this->writing_lock_) {
-    this->send_query_status_();
+    if (now - this->last_status_ms_ > 900) {
+      this->send_query_status_();
+    } else {
+      ESP_LOGV(TAG, "poll: skipped (fresh status %ums ago)", (unsigned)(now - this->last_status_ms_));
+    }
   }
 }
 
