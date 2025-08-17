@@ -196,7 +196,7 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &frame) {
   // [20..29] zeros on write (legacy ignores)
   for (int i = 20; i <= 29; i++) frame[i] = 0x00;
 
-  // Reserved area EXACTLY as в первом твоём TX:
+  // Reserved area EXACTLY как в первом твоём TX:
   frame[30] = 0x00;
   frame[31] = 0x00;
   frame[32] = 0x50; // НЕ пишем сюда swing — в legacy WRITE тут "магическая" 0x50
@@ -221,16 +221,24 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &frame) {
 
 // ---------- Build STATUS query (legacy short) ----------
 void ACHIClimate::build_legacy_query_status_(std::vector<uint8_t> &frame) {
-  // Типовая короткая форма, которую устройство принимало ранее (len=0x11)
+  // Короткая форма, которая отвечала в старых логах (len=0x11),
+  // критичный байт [17] = 0x01 (seq/маркер)
   frame.assign(22, 0x00); // 22 bytes total
   frame[0] = HI_HDR0; frame[1] = HI_HDR1;
   frame[2] = 0x00;
   frame[3] = 0x40;
-  frame[4] = 0x11; // как в твоих ранних логах
+  frame[4] = 0x11; // длина короткого кадра
   frame[5] = 0x00; frame[6] = 0x00; frame[7] = 0x01; frame[8] = 0x01;
   frame[9] = 0xFE; frame[10]= 0x01; frame[11]= 0x00; frame[12]= 0x00;
   frame[13] = CMD_STATUS;
-  // [14..17] нули
+  // [14..16] нули
+  frame[14] = 0x00;
+  frame[15] = 0x00;
+  frame[16] = 0x00;
+  // [17] ДОЛЖЕН быть 0x01 — иначе некоторые платы молчат
+  frame[17] = 0x01;
+
+  // CRC placeholders + tail
   frame[18] = 0x00; // CRC HI placeholder
   frame[19] = 0x00; // CRC LO placeholder
   frame[20] = HI_TAIL0;
@@ -248,7 +256,12 @@ void ACHIClimate::send_query_status_() {
   std::vector<uint8_t> frame;
   this->build_legacy_query_status_(frame);
   for (uint8_t b : frame) this->write_byte(b);
-  ESP_LOGV(TAG, "poll: status query sent");
+
+  // Отладочный дамп запроса статуса
+  char hexbuf[256]; size_t p = 0;
+  for (size_t i = 0; i < frame.size() && p + 4 < sizeof(hexbuf); i++)
+    p += snprintf(hexbuf + p, sizeof(hexbuf) - p, "%02X ", frame[i]);
+  ESP_LOGV(TAG, "poll: status query sent (len=%u): %s", (unsigned)frame.size(), hexbuf);
 }
 
 // Build snapshot and send
@@ -393,7 +406,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   this->quiet_ = quiet;
   this->led_   = led;
 
-  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;         // NB: в WRITE тут 0x50, но в STATUS поле валидное
+  bool swing_v = (b[IDX_SWING]  & 0b10000000) != 0;         // NB: в WRITE тут 0x50, а в STATUS поле валидное
   bool swing_h = (b[IDX_FLAGS2] & 0b01000000) != 0;
   climate::ClimateSwingMode swing_mode = climate::CLIMATE_SWING_OFF;
   if (swing_v && swing_h) swing_mode = climate::CLIMATE_SWING_BOTH;

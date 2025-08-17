@@ -54,7 +54,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr int IDX_TARGET_TEMP  = 19;
   static constexpr int IDX_AIR_TEMP     = 20;
   static constexpr int IDX_PIPE_TEMP    = 21;
-  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE оставляем 0x50 (см. build)
+  static constexpr int IDX_SWING        = 32;  // в legacy кадре WRITE тут магическое 0x50
   static constexpr int IDX_FLAGS        = 33;
   static constexpr int IDX_FLAGS2       = 35;
   static constexpr int IDX_LED          = 36;
