@@ -33,20 +33,20 @@ climate::ClimateTraits ACHIClimate::traits() {
 
 void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
-    this->mode_ = *call.get_mode();
-    this->power_on_ = (this->mode_ != climate::CLIMATE_MODE_OFF);
+    this->mode_desired_ = *call.get_mode();
+    this->power_on_ = (this->mode_desired_ != climate::CLIMATE_MODE_OFF);
   }
   if (call.get_target_temperature().has_value())
     this->target_c_ = static_cast<uint8_t>(std::round(*call.get_target_temperature()));
 
   if (call.get_fan_mode().has_value())
-    this->fan_ = *call.get_fan_mode();
+    this->fan_desired_ = *call.get_fan_mode();
 
   if (call.get_swing_mode().has_value())
-    this->swing_ = *call.get_swing_mode();
+    this->swing_desired_ = *call.get_swing_mode();
 
   this->dirty_ = true;
-  ESP_LOGD(TAG, "control(): mode=%d (power_on=%s)", (int) this->mode_, this->power_on_ ? "YES" : "NO");
+  ESP_LOGD(TAG, "control(): mode=%d (power_on=%s)", (int) this->mode_desired_, this->power_on_ ? "YES" : "NO");
 }
 
 void ACHIClimate::update() {
@@ -103,15 +103,15 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
   b[14] = 0x00; b[15] = 0x00;
 
   // Управляющие поля
-  b[IDX_FAN]         = encode_fan_byte_(this->fan_);
+  b[IDX_FAN]         = encode_fan_byte_(this->fan_desired_);
   b[IDX_SLEEP]       = encode_sleep_byte_(this->sleep_stage_);
-  b[IDX_MODE_POWER]  = encode_mode_hi_write_legacy_(this->mode_) | (this->power_on_ ? 0x0C : 0x00);
+  b[IDX_MODE_POWER]  = encode_mode_hi_write_legacy_(this->mode_desired_) | (this->power_on_ ? 0x0C : 0x00);
   b[IDX_TARGET_TEMP] = encode_target_temp_write_legacy_(this->target_c_);
 
   // Swing / флаги
-  b[IDX_SWING]  = encode_swing_ud_(this->swing_ != climate::CLIMATE_SWING_OFF);
+  b[IDX_SWING]  = encode_swing_ud_(this->swing_desired_ != climate::CLIMATE_SWING_OFF);
   b[IDX_FLAGS]  = (this->turbo_ ? 0x0C : 0x00) | (this->eco_ ? 0x10 : 0x00);
-  b[IDX_FLAGS2] = (this->quiet_ ? 0x10 : 0x00);
+  b[IDX_FLAGS2] = (this->quiet_ ? 0x10 : 0x00) | (this->swing_desired_ == climate::CLIMATE_SWING_BOTH ? 0x20 : 0x00);
   b[IDX_LED]    = (this->led_ ? 0x40 : 0x00);
 
   // CRC + tail
@@ -186,10 +186,10 @@ void ACHIClimate::send_now_() {
 
   // snapshot желаемого
   this->pending_power_ = this->power_on_;
-  this->pending_mode_  = this->mode_;
+  this->pending_mode_  = this->mode_desired_;
   this->pending_target_c_ = this->target_c_;
-  this->pending_fan_   = this->fan_;
-  this->pending_swing_ = this->swing_;
+  this->pending_fan_   = this->fan_desired_;
+  this->pending_swing_ = this->swing_desired_;
   this->pending_turbo_ = this->turbo_;
   this->pending_eco_   = this->eco_;
   this->pending_quiet_ = this->quiet_;
@@ -228,7 +228,7 @@ void ACHIClimate::send_query_status_() {
   this->flush();
   delayMicroseconds(1200);
 
-  ESP_LOGV(TAG, "poll: status query sent");
+  // подробный лог уже выведен в build_legacy_query_status_()
 }
 
 // ---------- RX parsing ----------
@@ -341,8 +341,21 @@ bool ACHIClimate::reported_matches_pending_(bool rep_power,
 void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
   if ((int)b.size() <= IDX_LED) return;  // на всякий
 
-  const uint8_t mode_lo = b[IDX_MODE_POWER] & 0x0F;
-  const uint8_t mode_hi = b[IDX_MODE_POWER] & 0xF0;
+  // Вытащим «опорные» байты для быстрой диагностики
+  const uint8_t b18 = b[IDX_MODE_POWER];
+  const uint8_t b19 = b[IDX_TARGET_TEMP];
+  const uint8_t b20 = b[IDX_AIR_TEMP];
+  const uint8_t b21 = b[IDX_PIPE_TEMP];
+  const uint8_t b32 = b[IDX_SWING];
+  const uint8_t b33 = b[IDX_FLAGS];
+  const uint8_t b35 = b[IDX_FLAGS2];
+  const uint8_t b36 = b[IDX_LED];
+
+  ESP_LOGV(TAG, "STATUS raw: b18=0x%02X b19=0x%02X b20=0x%02X b21=0x%02X b32=0x%02X b33=0x%02X b35=0x%02X b36=0x%02X",
+           b18, b19, b20, b21, b32, b33, b35, b36);
+
+  const uint8_t mode_lo = b18 & 0x0F;
+  const uint8_t mode_hi = b18 & 0xF0;
 
   bool power = (mode_lo == 0x0C);
   climate::ClimateMode mode = climate::CLIMATE_MODE_COOL;
@@ -354,7 +367,7 @@ void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
     default:   mode = climate::CLIMATE_MODE_COOL;     break;
   }
 
-  uint8_t set_c = (b[IDX_TARGET_TEMP] >> 1) & 0x3F;
+  uint8_t set_c = (b19 >> 1) & 0x3F;
   set_c = clamp16_30_(set_c);
 
   climate::ClimateFanMode fan = climate::CLIMATE_FAN_AUTO;
@@ -368,18 +381,18 @@ void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
   }
 
   climate::ClimateSwingMode swing = climate::CLIMATE_SWING_OFF;
-  if (b[IDX_SWING] == 0x50 && (b[IDX_FLAGS2] & 0x20))
+  if (b32 == 0x50 && (b35 & 0x20))
     swing = climate::CLIMATE_SWING_BOTH;
-  else if (b[IDX_SWING] == 0x50 || (b[IDX_FLAGS2] & 0x20))
+  else if (b32 == 0x50 || (b35 & 0x20))
     swing = climate::CLIMATE_SWING_BOTH;
 
-  bool turbo = (b[IDX_FLAGS] & 0x0C) == 0x0C;
-  bool eco   = (b[IDX_FLAGS] & 0x10) == 0x10;
-  bool quiet = (b[IDX_FLAGS2] & 0x10) == 0x10;
-  bool led   = (b[IDX_LED] & 0x40) == 0x40;
+  bool turbo = (b33 & 0x0C) == 0x0C;
+  bool eco   = (b33 & 0x10) == 0x10;
+  bool quiet = (b35 & 0x10) == 0x10;
+  bool led   = (b36 & 0x40) == 0x40;
 
-  const int8_t air   = (int8_t) b[IDX_AIR_TEMP];
-  const int8_t pipe  = (int8_t) b[IDX_PIPE_TEMP];
+  const int8_t air   = (int8_t) b20;
+  const int8_t pipe  = (int8_t) b21;
 
 #ifdef USE_SENSOR
   if (this->pipe_sensor_ != nullptr)
@@ -393,16 +406,23 @@ void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
     this->dirty_ = false;
   }
 
-  // публикация фактического состояния
-  this->mode_ = power ? mode : climate::CLIMATE_MODE_OFF;
-  this->power_on_ = power;
-  this->target_c_ = set_c;
-  this->fan_ = fan;
-  this->swing_ = swing;
-  this->turbo_ = turbo;
-  this->eco_ = eco;
-  this->quiet_ = quiet;
-  this->led_ = led;
+  // 1) Обновляем внутренние «желательные» (на случай если читаем реальное состояние)
+  this->mode_desired_ = power ? mode : climate::CLIMATE_MODE_OFF;
+  this->power_on_     = power;
+  this->target_c_     = set_c;
+  this->fan_desired_  = fan;
+  this->swing_desired_= swing;
+  this->turbo_        = turbo;
+  this->eco_          = eco;
+  this->quiet_        = quiet;
+  this->led_          = led;
+
+  // 2) Прокидываем в базовые поля Climate → корректный вывод и публикация
+  this->mode                = this->mode_desired_;
+  this->fan_mode            = this->fan_desired_;
+  this->swing_mode          = this->swing_desired_;
+  this->target_temperature  = (float) this->target_c_;
+  this->current_temperature = (float) air;
 
   this->publish_state();
 }

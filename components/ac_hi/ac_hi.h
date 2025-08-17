@@ -51,24 +51,24 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr uint8_t CMD_STATUS = 0x66;  // короткий/длинный status на некоторых моделях
   static constexpr uint8_t CMD_NAK    = 0xFD;
 
-  // Полезные индексы в длинных кадрах (совпадают с логами: b18, b19, ...)
+  // Полезные индексы в длинных кадрах (совпадают с ранними логами: b18, b19, ...)
   static constexpr int IDX_FAN          = 16;
   static constexpr int IDX_SLEEP        = 17;
-  static constexpr int IDX_MODE_POWER   = 18;
-  static constexpr int IDX_TARGET_TEMP  = 19;
-  static constexpr int IDX_AIR_TEMP     = 20;
-  static constexpr int IDX_PIPE_TEMP    = 21;
+  static constexpr int IDX_MODE_POWER   = 18;  // hi: режим, lo: питание (0x0C=ON)
+  static constexpr int IDX_TARGET_TEMP  = 19;  // 2*C+1
+  static constexpr int IDX_AIR_TEMP     = 20;  // int8
+  static constexpr int IDX_PIPE_TEMP    = 21;  // int8
   static constexpr int IDX_SWING        = 32;  // 0x50 = UD swing ON
   static constexpr int IDX_FLAGS        = 33;  // turbo/eco
-  static constexpr int IDX_FLAGS2       = 35;  // quiet + LR swing bit
+  static constexpr int IDX_FLAGS2       = 35;  // quiet + LR swing bit (0x20)
   static constexpr int IDX_LED          = 36;  // бит 0x40
 
-  // Текущее желаемое состояние
+  // Желаемое состояние (для построения WRITE)
   bool power_on_{false};
-  climate::ClimateMode mode_{climate::CLIMATE_MODE_COOL};
+  climate::ClimateMode mode_desired_{climate::CLIMATE_MODE_COOL};
   uint8_t target_c_{24};
-  climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
-  climate::ClimateSwingMode swing_{climate::CLIMATE_SWING_OFF};
+  climate::ClimateFanMode fan_desired_{climate::CLIMATE_FAN_AUTO};
+  climate::ClimateSwingMode swing_desired_{climate::CLIMATE_SWING_OFF};
   uint8_t sleep_stage_{0};
   bool turbo_{false};
   bool eco_{false};
