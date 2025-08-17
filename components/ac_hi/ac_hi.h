@@ -73,9 +73,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *pipe_sensor_{nullptr};
 #endif
 
-  // Long write template, total 41 bytes; byte[4] (length) = total-9 = 0x20
+  // Long WRITE template, total 41 bytes; byte[4] (length) = total-9 = 0x20
   std::vector<uint8_t> tx_bytes_ = {
-      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length placeholder (0x20 for 41 bytes)
+      0xF4,0xF5,0x00,0x40,0x20, // [0..4] header + length (0x20 for 41 bytes)
       0x00,0x00,0x01,0x01,      // [5..8]
       0xFE,0x01,0x00,0x00,      // [9..12]
       CMD_WRITE,0x00,0x00,      // [13..15]
@@ -91,12 +91,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x00,                      // [34]
       0x00,                      // [35] quiet/swing report
       0x00,                      // [36] LED
-      0x00,                      // [37]
-      0x00,                      // [38] 1-byte checksum
+      0x00,                      // [37] CRC_LO (for WRITE 16-bit)
+      0x00,                      // [38] CRC_HI (for WRITE 16-bit) / 1-byte CRC for short frames
       0xF4,0xFB                  // [39..40] tail
   };
 
-  // Short status query (из твоих логов)
+  // Short STATUS query (из логов — рабочий)
   const std::vector<uint8_t> query_ = {
       0xF4,0xF5,0x00,0x40,0x0C,0x00,0x00,0x01,0x01,
       0xFE,0x01,0x00,0x00, CMD_STATUS, 0x00,0x00,0x00,0x01,
@@ -123,7 +123,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void send_query_status_();
   void send_now_();
   void send_write_frame_(const std::vector<uint8_t> &frame);
-  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const; // 1-byte sum like STATUS
+  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const;   // 1-byte sum (короткие кадры)
+  void calc_and_patch_crc16_write_(std::vector<uint8_t> &buf) const; // 16-bit sum (WRITE)
 
   bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
