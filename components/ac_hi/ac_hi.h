@@ -14,7 +14,8 @@
 #include <cstdint>
 #include <cstddef>
 
-...
+namespace esphome {
+namespace ac_hi {
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
@@ -42,9 +43,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   static constexpr uint8_t CMD_WRITE  = 0x65;  // 101
   static constexpr uint8_t CMD_STATUS = 0x66;  // 102
-  static constexpr uint8_t CMD_NAK    = 0xFD;  // наблюдается в логах как "unknown", трактуем как NAK
+  static constexpr uint8_t CMD_NAK    = 0xFD;  // negative ack on some boards
 
-  // Field indices in long write/status frames
+  // Field indices in long write/status frames (0-based)
   static constexpr int IDX_FAN          = 16;
   static constexpr int IDX_SLEEP        = 17;
   static constexpr int IDX_MODE_POWER   = 18;
@@ -56,12 +57,13 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr int IDX_FLAGS2       = 35;
   static constexpr int IDX_LED          = 36;
 
-  // Desired/Reported state
+  // Desired state
   bool power_on_{false};
   climate::ClimateMode mode_{climate::CLIMATE_MODE_COOL};
   uint8_t target_c_{24};
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   climate::ClimateSwingMode swing_{climate::CLIMATE_SWING_OFF};
+  uint8_t sleep_stage_{0};
   bool turbo_{false};
   bool eco_{false};
   bool quiet_{false};
@@ -73,22 +75,38 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *pipe_sensor_{nullptr};
 #endif
 
-  // Transport state
+  // RX/TX state
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
-  std::vector<uint8_t> tx_bytes_{
-    0xF4,0xF5,0x00,0x40,0x20,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00, // header + cmd placeholder
-    0x65,0x00,0x00,0x00,0x00, // cmd and a few bytes (will be overwritten)
-    // ... остальной шаблон, будет заполнен в send_now_()
-    // места под CRC и хвост:
-    // [size-4],[size-3] — CRC (lo,hi); [size-2]=0xF4; [size-1]=0xFB
-  };
-  std::vector<uint8_t> query_{
-    0xF4,0xF5,0x00,0x40,0x11,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,
-    0x00,0x00,0x00,0x00, // ... поля запроса статуса (значения несущественны)
+
+  // Templates for TX frames (WRITE and STATUS query)
+  std::vector<uint8_t> write_template_{
+    // 0..12 header
+    0xF4,0xF5,0x00,0x40,0x20,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,
+    // 13 cmd
+    0x65,
+    // 14..16 misc (will be overwritten below as needed)
+    0x00,0x00,0x00,
+    // 17.. payload (we override the fields below)
+    0x00, // sleep
+    0x00, // mode|power
+    0x00, // target
+    0x00, // air temp (ignored on write)
+    0x00, // pipe temp (ignored on write)
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, // padding
+    0x50,0x00,0x00,0x00, // reserved as in logs
+    0x40, // placeholder near LED/flags area (we override indices below)
+    // CRC (2 bytes) + tail (2 bytes) — will be set dynamically by builder
     0x00,0x00,0xF4,0xFB
   };
 
+  std::vector<uint8_t> query_{
+    0xF4,0xF5,0x00,0x40,0x11,0x00,0x00,0x01,0x01,0xFE,0x01,0x00,0x00,0x66,
+    0x00,0x00,0x00,0x00, // padding
+    0x00,0x00,0xF4,0xFB
+  };
+
+  // Write control
   bool writing_lock_{false};
   bool dirty_{false};
   uint32_t last_tx_ms_{0};
@@ -96,7 +114,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t last_status_ms_{0};
   uint32_t force_poll_at_ms_{0};
 
-  // multi-variant write attempts
+  // Multi-variant write attempts
   uint8_t write_attempt_{0};       // 0..N-1
   static constexpr uint8_t kWriteAttemptsMax = 8;
 
@@ -104,7 +122,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   static constexpr uint32_t kAckTimeoutMs     = 1000;
   static constexpr uint32_t kForcePollDelayMs = 150;
 
-  // Prefer 'len=TOTAL' first (legacy expects len byte to equal full frame size like 0x29)
+  // Prefer 'len=TOTAL' first (legacy expects len byte equal to frame size, e.g. 0x29)
   static constexpr uint8_t kInitialAttempt = 4; // 4: len=total, CRC=SUM16
 
   // Pending desired snapshot captured at send to allow implicit-ACK via STATUS comparison
@@ -131,10 +149,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_nak_fd_();
 
   void build_variant_(uint8_t attempt, std::vector<uint8_t> &frame);
-  void calc_and_patch_crc1_(std::vector<uint8_t> &buf, bool len_is_total) const;
-  void calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf, bool len_is_total) const;
-  void calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf, bool len_is_total) const;
-  void calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf, bool len_is_total) const;
+  void calc_and_patch_crc1_(std::vector<uint8_t> &buf) const;
+  void calc_and_patch_crc16_sum_(std::vector<uint8_t> &buf) const;
+  void calc_and_patch_crc16_modbus_(std::vector<uint8_t> &buf) const;
+  void calc_and_patch_crc16_ccitt_(std::vector<uint8_t> &buf) const;
 
   static uint8_t clamp16_30_(uint8_t c) { if (c < 16) return 16; if (c > 30) return 30; return c; }
   static uint8_t encode_mode_hi_write_legacy_(climate::ClimateMode m) {
