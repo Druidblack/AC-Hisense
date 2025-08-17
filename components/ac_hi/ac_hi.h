@@ -4,13 +4,13 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/sensor/sensor.h"
+#include <vector>
 
 namespace esphome {
 namespace ac_hi {
 
 // ========================= Protocol constants (legacy) =========================
 
-// Frame envelope
 static const uint8_t PFX0 = 0xF4;
 static const uint8_t PFX1 = 0xF5;
 static const uint8_t PFX2 = 0x00;
@@ -19,68 +19,59 @@ static const uint8_t PFX3 = 0x40;
 static const uint8_t SUFFIX0 = 0xF4;
 static const uint8_t SUFFIX1 = 0xFB;
 
-// Common command codes
-static const uint8_t CMD_STATUS = 0x66;   // query and response tag context
-static const uint8_t CMD_WRITE  = 0x65;   // write/settings frame
+static const uint8_t CMD_STATUS = 0x66;
+static const uint8_t CMD_WRITE  = 0x65;
 
-// Indices used by our fixed-size legacy WRITE frame (50 bytes total)
 enum : uint8_t {
-  WR_IDX_HDR_0 = 0,             // F4
-  WR_IDX_HDR_1 = 1,             // F5
-  WR_IDX_HDR_2 = 2,             // 00
-  WR_IDX_HDR_3 = 3,             // 40
-  WR_IDX_LEN   = 4,             // 0x29
-  WR_IDX_TAG0  = 13,            // 0x65 (CMD_WRITE)
-  WR_IDX_TAG1  = 14,            // 0x00
-  WR_IDX_TAG2  = 15,            // 0x00
-  WR_IDX_FSET0 = 16,            // feature/mode set high
-  WR_IDX_FSET1 = 17,            // feature/mode set low
-  WR_IDX_MODEP = 18,            // b18: mode_hi | power_lo
-  WR_IDX_SETPT = 19,            // b19: setpoint encoding
+  WR_IDX_HDR_0 = 0,
+  WR_IDX_HDR_1 = 1,
+  WR_IDX_HDR_2 = 2,
+  WR_IDX_HDR_3 = 3,
+  WR_IDX_LEN   = 4,
+  WR_IDX_TAG0  = 13,
+  WR_IDX_TAG1  = 14,
+  WR_IDX_TAG2  = 15,
+  WR_IDX_FSET0 = 16,
+  WR_IDX_FSET1 = 17,
+  WR_IDX_MODEP = 18,
+  WR_IDX_SETPT = 19,
   WR_IDX_CRC_HI = 46,
   WR_IDX_CRC_LO = 47,
-  WR_IDX_TAIL_0 = 48,           // 0xF4
-  WR_IDX_TAIL_1 = 49            // 0xFB
+  WR_IDX_TAIL_0 = 48,
+  WR_IDX_TAIL_1 = 49
 };
 
-// Indices used by received STATUS frames (we rely only on a few)
 enum : uint8_t {
-  ST_IDX_HDR_0 = 0,             // F4
-  ST_IDX_HDR_1 = 1,             // F5
-  ST_IDX_HDR_2 = 2,             // 00
-  ST_IDX_HDR_3 = 3,             // 40
-  ST_IDX_LEN   = 4,             // variable (depends on model)
-  ST_IDX_TAG0  = 13,            // 0x66 или 0x65
-  ST_IDX_B18   = 18,            // b18: mode_hi|power_lo
-  ST_IDX_B19   = 19,            // b19: setpoint
+  ST_IDX_HDR_0 = 0,
+  ST_IDX_HDR_1 = 1,
+  ST_IDX_HDR_2 = 2,
+  ST_IDX_HDR_3 = 3,
+  ST_IDX_LEN   = 4,
+  ST_IDX_TAG0  = 13,
+  ST_IDX_B18   = 18,
+  ST_IDX_B19   = 19,
 };
 
-// Mode encoding high nibble in b18
-static const uint8_t B18_MODE_HI_MASK = 0xF0;
+static const uint8_t B18_MODE_HI_MASK  = 0xF0;
 static const uint8_t B18_POWER_LO_MASK = 0x0F;
 
-// Known power low-nibble spellings in the field
 static const uint8_t POWER_LO_OFF   = 0x00;
-static const uint8_t POWER_LO_ON_0C = 0x0C;  // «классический» вариант
-static const uint8_t POWER_LO_ON_08 = 0x08;  // встречается у ряда блоков (как у тебя)
+static const uint8_t POWER_LO_ON_0C = 0x0C;
+static const uint8_t POWER_LO_ON_08 = 0x08;
 
-// High nibble values for modes
 static const uint8_t MODE_HI_FAN  = 0x00;
 static const uint8_t MODE_HI_HEAT = 0x10;
 static const uint8_t MODE_HI_COOL = 0x20;
 static const uint8_t MODE_HI_DRY  = 0x30;
 
-// ========================= Class =========================
-
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
   ACHIClimate() : PollingComponent(1000) {}
 
-  // user config
   void set_pipe_sensor(sensor::Sensor *s) { this->pipe_sensor_ = s; }
 
   // совместимость с твоим main.cpp
-  void set_enable_presets(bool) {}  // no-op для компиляции с существующим кодом
+  void set_enable_presets(bool) {}  // no-op
 
   // Component
   void setup() override;
@@ -112,10 +103,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint16_t sum16_(const uint8_t *data, size_t len) const;
 
   // ========================= State =========================
-  uint8_t power_lo_hint_ {POWER_LO_ON_0C};  // что прислал блок в STATUS (0x08/0x0C)
-  bool status_temp_even_ {false};           // формат b19 в STATUS: чётный = прямые °C
+  uint8_t power_lo_hint_ {POWER_LO_ON_0C};  // 0x08/0x0C в статусе
+  bool status_temp_even_ {false};           // формат b19 в STATUS
 
-  // для implicit-ACK
+  // implicit-ACK ожидания
   uint8_t pending_b18_ {0};
   uint8_t pending_b19_ {0};
   bool waiting_ack_ {false};

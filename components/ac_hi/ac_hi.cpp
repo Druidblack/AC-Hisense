@@ -1,7 +1,7 @@
 #include "ac_hi.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
-#include <vector>
+#include <set>
 #include <cmath>
 
 namespace esphome {
@@ -19,29 +19,34 @@ climate::ClimateTraits ACHIClimate::traits() {
   climate::ClimateTraits t{};
   t.set_supports_current_temperature(true);
   t.set_supports_two_point_target_temperature(false);
-  t.set_supported_modes(std::vector<climate::ClimateMode>{
+
+  std::set<climate::ClimateMode> modes{
       climate::CLIMATE_MODE_OFF,
       climate::CLIMATE_MODE_COOL,
       climate::CLIMATE_MODE_HEAT,
       climate::CLIMATE_MODE_DRY,
       climate::CLIMATE_MODE_FAN_ONLY,
-  });
-  t.set_supported_swing_modes(std::vector<climate::ClimateSwingMode>{
+  };
+  t.set_supported_modes(std::move(modes));
+
+  std::set<climate::ClimateSwingMode> swings{
       climate::CLIMATE_SWING_OFF,
-  });
+  };
+  t.set_supported_swing_modes(std::move(swings));
+
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
   return t;
 }
 
 void ACHIClimate::update() {
-  // Периодический опрос статуса: короткий кадр CMD_STATUS
+  // Периодический опрос статуса
   std::vector<uint8_t> q;
   this->build_status_query_(q);
   ESP_LOGV(TAG, "poll: status query sent (len=%zu): %s", q.size(), format_hex_pretty(q).c_str());
   this->send_frame_(q);
 
-  // Пробуем принять что-то (обычно 0x65 или 0x66 длинный ~130 байт)
+  // Пробуем принять фрейм (обычно 0x65/0x66 ~130 байт)
   std::vector<uint8_t> rx;
   if (this->read_frame_(rx, 20)) {
     uint8_t cmd = 0;
@@ -76,7 +81,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   this->last_tx_ms_ = millis();
   this->waiting_ack_ = true;
 
-  // Подождём немного и попробуем сразу принять (иногда ACK+STATUS приходит быстро)
+  // Попытка принять быстрый ответ
   std::vector<uint8_t> rx;
   if (this->read_frame_(rx, 30)) {
     uint8_t cmd = 0;
@@ -111,9 +116,9 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
   b[WR_IDX_HDR_1] = PFX1;
   b[WR_IDX_HDR_2] = PFX2;
   b[WR_IDX_HDR_3] = PFX3;
-  b[WR_IDX_LEN]   = 0x29;        // как в логах
+  b[WR_IDX_LEN]   = 0x29;
 
-  // Фиксированная часть «шапки» как в логах
+  // Фиксированная шапка
   b[7]  = 0x01;
   b[8]  = 0x01;
   b[9]  = 0xFE;
@@ -126,15 +131,14 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
   b[WR_IDX_FSET0] = 0x02;
   b[WR_IDX_FSET1] = 0x00;
 
-  // b18: mode_hi | power_lo (берём из подсказки — 0x08 или 0x0C; OFF → 0x00)
+  // b18: mode_hi | power_lo
   const uint8_t mode_hi = this->encode_mode_hi_write_legacy_(this->mode);
   const bool power = (this->mode != climate::CLIMATE_MODE_OFF);
   const uint8_t power_lo =
       power ? ((this->power_lo_hint_ == POWER_LO_ON_08) ? POWER_LO_ON_08 : POWER_LO_ON_0C) : POWER_LO_OFF;
-
   b[WR_IDX_MODEP] = (uint8_t) (mode_hi | power_lo);
 
-  // b19: WRITE «классическая»: (2*C+1)
+  // b19: (2*C+1)
   float tgt_c = std::isnan(this->target_temperature) ? 24.0f : this->target_temperature;
   uint8_t set_c = this->clamp16_30_((int) std::round(tgt_c));
   b[WR_IDX_SETPT] = (uint8_t) ((set_c << 1) | 0x01);
@@ -143,7 +147,7 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
   this->pending_b18_ = b[WR_IDX_MODEP];
   this->pending_b19_ = b[WR_IDX_SETPT];
 
-  // CRC SUM16 по полезной части до CRC (с len-байта и до байта перед CRC)
+  // CRC SUM16 по полезной части до CRC
   uint16_t crc = this->sum16_(&b[WR_IDX_LEN], WR_IDX_CRC_HI - WR_IDX_LEN);
   b[WR_IDX_CRC_HI] = (uint8_t) (crc >> 8);
   b[WR_IDX_CRC_LO] = (uint8_t) (crc & 0xFF);
@@ -154,10 +158,8 @@ void ACHIClimate::build_legacy_write_(std::vector<uint8_t> &b) {
 
   ESP_LOGD(TAG, "build: len_byte[4]=0x%02X, crc_hi[%d]=0x%02X crc_lo[%d]=0x%02X",
            b[WR_IDX_LEN], WR_IDX_CRC_HI, b[WR_IDX_CRC_HI], WR_IDX_CRC_LO, b[WR_IDX_CRC_LO]);
-
   ESP_LOGD(TAG, "build(write-legacy): b18=0x%02X (mode_hi=0x%02X power_lo=0x%02X) b19=0x%02X (2*C+1)",
            b[WR_IDX_MODEP], mode_hi, power ? power_lo : 0x00, b[WR_IDX_SETPT]);
-
   ESP_LOGD(TAG, "TX write (50 bytes): %s", format_hex_pretty(b).c_str());
 }
 
@@ -190,10 +192,8 @@ void ACHIClimate::build_status_query_(std::vector<uint8_t> &q) {
   q.push_back(0x00);
   q.push_back(0x01);
 
-  // «CRC»: оставляем один байт как у тебя в логе (часто игнорится устройством)
-  uint16_t crc = this->sum16_(&q[4], q.size() - 4);
-  (void) crc;  // для тишины компилятора
-  q.push_back(0xB4);  // как в твоих трейсах
+  // «CRC» байт как в логах
+  q.push_back(0xB4);
 
   // Хвост
   q.push_back(SUFFIX0);
@@ -272,24 +272,22 @@ void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
   const uint8_t b18 = b[ST_IDX_B18];
   const uint8_t b19 = b[ST_IDX_B19];
 
-  // «сырометрика» как в логах
-  if (esp_log_level_get(TAG) <= ESPHOME_LOG_LEVEL_VERY_VERBOSE) {
-    uint8_t b20 = (b.size() > 20) ? b[20] : 0x00;
-    uint8_t b21 = (b.size() > 21) ? b[21] : 0x00;
-    uint8_t b32 = (b.size() > 32) ? b[32] : 0x00;
-    uint8_t b33 = (b.size() > 33) ? b[33] : 0x00;
-    uint8_t b35 = (b.size() > 35) ? b[35] : 0x00;
-    uint8_t b36 = (b.size() > 36) ? b[36] : 0x00;
-    ESP_LOGV(TAG, "STATUS raw: b18=0x%02X b19=0x%02X b20=0x%02X b21=0x%02X b32=0x%02X b33=0x%02X b35=0x%02X b36=0x%02X",
-             b18, b19, b20, b21, b32, b33, b35, b36);
-  }
+  // сырой дамп «как в логах»
+  uint8_t b20 = (b.size() > 20) ? b[20] : 0x00;
+  uint8_t b21 = (b.size() > 21) ? b[21] : 0x00;
+  uint8_t b32 = (b.size() > 32) ? b[32] : 0x00;
+  uint8_t b33 = (b.size() > 33) ? b[33] : 0x00;
+  uint8_t b35 = (b.size() > 35) ? b[35] : 0x00;
+  uint8_t b36 = (b.size() > 36) ? b[36] : 0x00;
+  ESP_LOGV(TAG, "STATUS raw: b18=0x%02X b19=0x%02X b20=0x%02X b21=0x%02X b32=0x%02X b33=0x%02X b35=0x%02X b36=0x%02X",
+           b18, b19, b20, b21, b32, b33, b35, b36);
 
   // b18: mode_hi | power_lo
   const uint8_t mode_hi = b18 & B18_MODE_HI_MASK;
   const uint8_t power_lo = b18 & B18_POWER_LO_MASK;
   this->power_lo_hint_ = power_lo;
 
-  // Power: ON, если low nibble == 0x0C ИЛИ 0x08
+  // Power ON, если low nibble == 0x0C или 0x08
   const bool power_on = (power_lo == POWER_LO_ON_0C) || (power_lo == POWER_LO_ON_08);
 
   // Mode
@@ -315,7 +313,6 @@ void ACHIClimate::parse_status_legacy_(const std::vector<uint8_t> &b) {
   }
   this->target_temperature = (float) set_c;
 
-  // Публикация и лог (в этой ветке поля — не optionals)
   ESP_LOGD(TAG, "'%s' - Sending state:", this->get_name().c_str());
   ESP_LOGD(TAG, "  Mode: %s", climate::climate_mode_to_string(this->mode));
   ESP_LOGD(TAG, "  Swing Mode: %s", climate::climate_swing_mode_to_string(this->swing_mode));
