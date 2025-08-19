@@ -106,6 +106,27 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
+  // === HA priority/enforce logic (no protocol mapping changes) ===
+  struct DesiredState {
+    bool power_on;
+    climate::ClimateMode mode;
+    uint8_t target_c;
+    climate::ClimateFanMode fan;
+    climate::ClimateSwingMode swing;
+    bool turbo;
+    bool eco;
+    bool quiet;
+    bool led;
+    uint8_t sleep_stage;
+  };
+
+  // Fingerprint helpers (hash only of control fields; no sensors)
+  uint32_t make_control_fingerprint_from_fields_(bool power, climate::ClimateMode m, uint8_t t,
+                                                 climate::ClimateFanMode f, climate::ClimateSwingMode s,
+                                                 bool turbo, bool eco, bool quiet, bool led, uint8_t sleep);
+  uint32_t actual_fingerprint_() const;
+  uint32_t desired_fingerprint_() const;
+
   // RX stream buffer
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
@@ -192,6 +213,21 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #endif
 
   bool enable_presets_{true};
+
+  // === HA priority/enforce state ===
+  bool enforce_from_ha_{false};     // мы дожимаем состояние до desired_
+  bool accept_ir_changes_{true};    // можно ли учитывать изменения из статусов (ИК-пульт)
+  DesiredState desired_{};          // целевое состояние из HA
+  bool desired_valid_{false};       // есть ли валидная цель
+
+  uint32_t desired_fp_{0};          // контрольные подписи (только управляющие поля)
+  uint32_t actual_fp_{0};
+  uint32_t last_applied_fp_{0};
+
+  uint32_t next_enforce_tx_at_{0};  // план на следующий повтор команды
+  uint32_t enforce_interval_ms_{700};
+  uint8_t enforce_backoff_steps_{0};
+  uint8_t enforce_retry_counter_{0};
 };
 
 }  // namespace ac_hi

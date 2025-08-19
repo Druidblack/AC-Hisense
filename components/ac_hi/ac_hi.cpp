@@ -28,6 +28,43 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   }
 }
 
+// ---- Fingerprint helpers (FNV-1a 32-bit) ----
+static inline uint32_t fnv1a32_step_(uint32_t h, uint8_t b) {
+  h ^= b;
+  h *= 16777619u;
+  return h;
+}
+
+uint32_t ACHIClimate::make_control_fingerprint_from_fields_(bool power, climate::ClimateMode m, uint8_t t,
+                                                            climate::ClimateFanMode f, climate::ClimateSwingMode s,
+                                                            bool turbo, bool eco, bool quiet, bool led, uint8_t sleep) {
+  uint32_t h = 2166136261u;
+  h = fnv1a32_step_(h, power ? 1 : 0);
+  h = fnv1a32_step_(h, static_cast<uint8_t>(m));
+  h = fnv1a32_step_(h, t);
+  h = fnv1a32_step_(h, static_cast<uint8_t>(f));
+  h = fnv1a32_step_(h, static_cast<uint8_t>(s));
+  h = fnv1a32_step_(h, turbo ? 1 : 0);
+  h = fnv1a32_step_(h, eco ? 1 : 0);
+  h = fnv1a32_step_(h, quiet ? 1 : 0);
+  h = fnv1a32_step_(h, led ? 1 : 0);
+  h = fnv1a32_step_(h, sleep);
+  return h;
+}
+
+uint32_t ACHIClimate::actual_fingerprint_() const {
+  return const_cast<ACHIClimate*>(this)->make_control_fingerprint_from_fields_(
+    this->power_on_, this->mode_, this->target_c_, this->fan_, this->swing_,
+    this->turbo_, this->eco_, this->quiet_, this->led_, this->sleep_stage_);
+}
+
+uint32_t ACHIClimate::desired_fingerprint_() const {
+  if (!desired_valid_) return 0;
+  return const_cast<ACHIClimate*>(this)->make_control_fingerprint_from_fields_(
+    desired_.power_on, desired_.mode, desired_.target_c, desired_.fan, desired_.swing,
+    desired_.turbo, desired_.eco, desired_.quiet, desired_.led, desired_.sleep_stage);
+}
+
 void ACHIClimate::setup() {
   this->mode = climate::CLIMATE_MODE_OFF;
   this->target_temperature = 24;
@@ -40,6 +77,19 @@ void ACHIClimate::update() {
   // Периодический опрос: короткий запрос статуса
   if (!this->writing_lock_) {
     this->send_query_status_();
+  }
+
+  // Дожим целевого состояния из HA (если активирован)
+  if (this->enforce_from_ha_ && !this->writing_lock_) {
+    uint32_t now = esphome::millis();
+    if (now >= this->next_enforce_tx_at_) {
+      // Повторяем ту же команду (tx_bytes_ уже сформирован в control())
+      this->send_write_changes_();
+      uint32_t add = this->enforce_interval_ms_ + static_cast<uint32_t>(this->enforce_backoff_steps_) * 200U;
+      this->next_enforce_tx_at_ = now + add;
+      if (this->enforce_backoff_steps_ < 10) this->enforce_backoff_steps_++;
+      if (this->enforce_retry_counter_ < 255) this->enforce_retry_counter_++;
+    }
   }
 }
 
@@ -173,12 +223,32 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       tx_bytes_[35] = 0;               // override quiet
     }
 
+    // === Включаем режим приоритета HA: фиксируем целевое состояние и начинаем дожим ===
+    desired_.power_on = this->power_on_;
+    desired_.mode = this->mode_;
+    desired_.target_c = this->target_c_;
+    desired_.fan = this->fan_;
+    desired_.swing = this->swing_;
+    desired_.turbo = this->turbo_;
+    desired_.eco = this->eco_;
+    desired_.quiet = this->quiet_;
+    desired_.led = this->led_;
+    desired_.sleep_stage = this->sleep_stage_;
+    desired_valid_ = true;
+    desired_fp_ = this->desired_fingerprint_();
+
+    enforce_from_ha_ = true;
+    accept_ir_changes_ = false;
+    next_enforce_tx_at_ = 0;
+    enforce_backoff_steps_ = 0;
+    enforce_retry_counter_ = 0;
+
     this->writing_lock_ = true;
     this->pending_write_ = true;
     this->send_write_changes_();
   }
 
-  // Оптимистично публикуем ожидаемое состояние
+  // Оптимистично публикуем ожидаемое состояние (оставляем как было)
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->target_temperature = this->target_c_;
   this->fan_mode = this->fan_;
@@ -458,7 +528,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 #endif
   // === конец добавленных публикаций ===
 
-  // Публикуем
+  // Публикуем (по умолчанию — фактическое)
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->fan_mode = this->fan_;
   this->swing_mode = this->swing_;
@@ -468,6 +538,59 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
     else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
+
+  // === Приоритет HA над ИК-пультом: контроль совпадения/дожим и допуск ИК ===
+  this->actual_fp_ = this->actual_fingerprint_();
+
+  if (this->enforce_from_ha_ && this->desired_valid_) {
+    uint32_t dfp = this->desired_fingerprint_();
+    if (this->actual_fp_ == dfp) {
+      // Цель достигнута — перестаём дожимать и начинаем принимать изменения с пульта
+      this->enforce_from_ha_ = false;
+      this->accept_ir_changes_ = true;
+      this->last_applied_fp_ = this->actual_fp_;
+      this->enforce_backoff_steps_ = 0;
+      this->enforce_retry_counter_ = 0;
+    } else {
+      // Пока не совпало — публикуем целевое состояние (чтобы HA отражал задачу),
+      // сенсорные значения при этом остаются фактическими (опубликованы выше по сенсорам).
+      this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
+      this->target_temperature = this->desired_.target_c;
+      this->fan_mode = this->desired_.fan;
+      this->swing_mode = this->desired_.swing;
+      if (enable_presets_) {
+        if (this->desired_.turbo) this->preset = climate::CLIMATE_PRESET_BOOST;
+        else if (this->desired_.eco) this->preset = climate::CLIMATE_PRESET_ECO;
+        else if (this->desired_.sleep_stage > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
+        else this->preset = climate::CLIMATE_PRESET_NONE;
+      }
+      // Дальнейшие повторы команды выполняются в update() по таймеру.
+    }
+  } else {
+    // Дожим не активен
+    if (this->accept_ir_changes_) {
+      if (this->actual_fp_ != this->last_applied_fp_) {
+        // Приняли изменение из статуса (ИК-пульт)
+        this->last_applied_fp_ = this->actual_fp_;
+      }
+    } else {
+      // Если временно запрещено принимать изменения с пульта, оставляем публикацию как есть
+      // (либо можно публиковать desired_, если он валиден).
+      if (this->desired_valid_) {
+        this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
+        this->target_temperature = this->desired_.target_c;
+        this->fan_mode = this->desired_.fan;
+        this->swing_mode = this->desired_.swing;
+        if (enable_presets_) {
+          if (this->desired_.turbo) this->preset = climate::CLIMATE_PRESET_BOOST;
+          else if (this->desired_.eco) this->preset = climate::CLIMATE_PRESET_ECO;
+          else if (this->desired_.sleep_stage > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
+          else this->preset = climate::CLIMATE_PRESET_NONE;
+        }
+      }
+    }
+  }
+
   this->publish_state();
 }
 
