@@ -129,6 +129,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Debug helpers
   void log_frame_hex_(const char *title, const std::vector<uint8_t> &buf, size_t max_len = 64) const;
+  void log_diff_desired_actual_() const;
 
   // RX stream buffer
   std::vector<uint8_t> rx_;
@@ -231,6 +232,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t enforce_interval_ms_{700};
   uint8_t enforce_backoff_steps_{0};
   uint8_t enforce_retry_counter_{0};
+
+  // === Additional debug timing/state ===
+  uint8_t  last_cmd_seen_{0};
+  uint32_t last_write_sent_at_{0};
+  uint32_t last_ack_at_{0};
+  uint32_t last_ack_warn_at_{0};
 };
 
 }  // namespace ac_hi

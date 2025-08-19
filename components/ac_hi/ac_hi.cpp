@@ -69,7 +69,7 @@ uint32_t ACHIClimate::desired_fingerprint_() const {
     desired_.turbo, desired_.eco, desired_.quiet, desired_.led, desired_.sleep_stage);
 }
 
-// ---- Debug: hex dump ----
+// ---- Debug: hex dump & diffs ----
 void ACHIClimate::log_frame_hex_(const char *title, const std::vector<uint8_t> &buf, size_t max_len) const {
   ESP_LOGV(TAG, "%s (len=%u, show<=%u)", title, (unsigned)buf.size(), (unsigned)max_len);
   char line[128];
@@ -84,6 +84,55 @@ void ACHIClimate::log_frame_hex_(const char *title, const std::vector<uint8_t> &
   if (buf.size() > shown) {
     ESP_LOGV(TAG, "  ... (%u bytes more)", (unsigned)(buf.size() - shown));
   }
+}
+
+void ACHIClimate::log_diff_desired_actual_() const {
+  if (!this->desired_valid_) {
+    ESP_LOGD(TAG, "No desired state captured; nothing to diff.");
+    return;
+  }
+  bool any = false;
+  if (this->power_on_ != this->desired_.power_on) {
+    ESP_LOGW(TAG, "DIFF power_on: actual=%d desired=%d", this->power_on_, this->desired_.power_on);
+    any = true;
+  }
+  if (this->mode_ != this->desired_.mode) {
+    ESP_LOGW(TAG, "DIFF mode: actual=%d desired=%d", (int)this->mode_, (int)this->desired_.mode);
+    any = true;
+  }
+  if (this->target_c_ != this->desired_.target_c) {
+    ESP_LOGW(TAG, "DIFF setpoint: actual=%u desired=%u", (unsigned)this->target_c_, (unsigned)this->desired_.target_c);
+    any = true;
+  }
+  if (this->fan_ != this->desired_.fan) {
+    ESP_LOGW(TAG, "DIFF fan: actual=%d desired=%d", (int)this->fan_, (int)this->desired_.fan);
+    any = true;
+  }
+  if (this->swing_ != this->desired_.swing) {
+    ESP_LOGW(TAG, "DIFF swing: actual=%d desired=%d", (int)this->swing_, (int)this->desired_.swing);
+    any = true;
+  }
+  if (this->turbo_ != this->desired_.turbo) {
+    ESP_LOGW(TAG, "DIFF turbo: actual=%d desired=%d", this->turbo_, this->desired_.turbo);
+    any = true;
+  }
+  if (this->eco_ != this->desired_.eco) {
+    ESP_LOGW(TAG, "DIFF eco: actual=%d desired=%d", this->eco_, this->desired_.eco);
+    any = true;
+  }
+  if (this->quiet_ != this->desired_.quiet) {
+    ESP_LOGW(TAG, "DIFF quiet: actual=%d desired=%d", this->quiet_, this->desired_.quiet);
+    any = true;
+  }
+  if (this->led_ != this->desired_.led) {
+    ESP_LOGW(TAG, "DIFF led: actual=%d desired=%d", this->led_, this->desired_.led);
+    any = true;
+  }
+  if (this->sleep_stage_ != this->desired_.sleep_stage) {
+    ESP_LOGW(TAG, "DIFF sleep_stage: actual=%u desired=%u", (unsigned)this->sleep_stage_, (unsigned)this->desired_.sleep_stage);
+    any = true;
+  }
+  if (!any) ESP_LOGD(TAG, "No differences between actual and desired control fields.");
 }
 
 void ACHIClimate::setup() {
@@ -103,6 +152,17 @@ void ACHIClimate::update() {
     this->send_query_status_();
   } else {
     ESP_LOGV(TAG, "Skip query: writing_lock_=true");
+    // Диагностика «зависшего» ожидания ACK
+    uint32_t now = esphome::millis();
+    uint32_t elapsed = now - this->last_write_sent_at_;
+    if (this->last_write_sent_at_ != 0 && elapsed > 900) {
+      if (now - this->last_ack_warn_at_ > 1000) {  // не спамить каждую итерацию
+        ESP_LOGW(TAG, "Still waiting for ACK(0x65): %u ms elapsed since write. last_cmd_seen=0x%02X, last_ack_at=%u ms ago",
+                 (unsigned)elapsed, this->last_cmd_seen_,
+                 (unsigned)((this->last_ack_at_ == 0) ? 0 : (now - this->last_ack_at_)));
+        this->last_ack_warn_at_ = now;
+      }
+    }
   }
 
   // Дожим целевого состояния из HA (если активирован)
@@ -384,7 +444,9 @@ void ACHIClimate::send_write_changes_() {
   this->log_frame_hex_("TX WRITE hex (0x65)", frame, 64);
   for (auto b : frame) this->write_byte(b);
   this->flush();
-  ESP_LOGD(TAG, "WRITE sent, writing_lock_=%d pending_write_=%d", this->writing_lock_, this->pending_write_);
+  this->last_write_sent_at_ = esphome::millis();
+  ESP_LOGD(TAG, "WRITE sent, writing_lock_=%d pending_write_=%d (t=%u ms)",
+           this->writing_lock_, this->pending_write_, (unsigned)this->last_write_sent_at_);
 }
 
 // ---- RX сканер/парсер ----
@@ -400,10 +462,11 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
 
     uint16_t sum = 0;
     bool crc_ok = this->validate_crc_(frame, &sum);
+    uint8_t cmd = (frame.size() > 13 ? frame[13] : 0xFF);
+    this->last_cmd_seen_ = cmd;
+
     ESP_LOGV(TAG, "RX frame: len=%u cmd=0x%02X crc_ok=%d sum=0x%04X",
-             (unsigned)frame.size(),
-             (frame.size() > 13 ? frame[13] : 0xFF),
-             crc_ok, (unsigned)sum);
+             (unsigned)frame.size(), cmd, crc_ok, (unsigned)sum);
     this->log_frame_hex_("RX hex", frame, 64);
 
     // Разбор
@@ -491,6 +554,12 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
+  // Печать «сырых» критичных байтов для быстрой сверки
+  if (bytes.size() > 38) {
+    ESP_LOGV(TAG, "STATUS RAW: b16=0x%02X b17=0x%02X b18=0x%02X b19=0x%02X b35=0x%02X b36=0x%02X b37=0x%02X",
+             bytes[16], bytes[17], bytes[18], bytes[19], bytes[35], bytes[36], bytes[37]);
+  }
+
   // Питание (байт 18, бит 3)
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
@@ -604,6 +673,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
     } else {
       ESP_LOGW(TAG, "ENFORCE pending: actual!=desired (0x%08X != 0x%08X). Will retry at %u ms",
                (unsigned)this->actual_fp_, (unsigned)dfp, (unsigned)this->next_enforce_tx_at_);
+      this->log_diff_desired_actual_();
       // Публикуем в UI целевые поля, чтобы было видно задачу
       this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
       this->target_temperature = this->desired_.target_c;
@@ -644,8 +714,10 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 }
 
 void ACHIClimate::handle_ack_101_() {
-  ESP_LOGD(TAG, "ACK (0x65) received. writing_lock_=%d -> false, pending_write_=%d -> false",
-           this->writing_lock_, this->pending_write_);
+  uint32_t now = esphome::millis();
+  this->last_ack_at_ = now;
+  ESP_LOGD(TAG, "ACK (0x65) received at %u ms. writing_lock_=%d -> false, pending_write_=%d -> false",
+           (unsigned)now, this->writing_lock_, this->pending_write_);
   this->writing_lock_ = false;
   this->pending_write_ = false;
 }
