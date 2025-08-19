@@ -127,6 +127,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t actual_fingerprint_() const;
   uint32_t desired_fingerprint_() const;
 
+  // Debug helpers
+  void log_frame_hex_(const char *title, const std::vector<uint8_t> &buf, size_t max_len = 64) const;
+
   // RX stream buffer
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};

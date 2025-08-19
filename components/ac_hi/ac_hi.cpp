@@ -1,9 +1,13 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 
 namespace esphome {
 namespace ac_hi {
+
+static const char *const TAG = "ac_hi.climate";
 
 // ---- Локальные хелперы для (де)кодирования режима ----
 // Целевая раскладка nibble (byte[18] >> 4):
@@ -65,24 +69,49 @@ uint32_t ACHIClimate::desired_fingerprint_() const {
     desired_.turbo, desired_.eco, desired_.quiet, desired_.led, desired_.sleep_stage);
 }
 
+// ---- Debug: hex dump ----
+void ACHIClimate::log_frame_hex_(const char *title, const std::vector<uint8_t> &buf, size_t max_len) const {
+  ESP_LOGV(TAG, "%s (len=%u, show<=%u)", title, (unsigned)buf.size(), (unsigned)max_len);
+  char line[128];
+  size_t shown = std::min(max_len, buf.size());
+  for (size_t i = 0; i < shown; i += 16) {
+    int n = snprintf(line, sizeof(line), "  %03u: ", (unsigned)i);
+    for (size_t j = 0; j < 16 && (i + j) < shown; j++) {
+      n += snprintf(line + n, sizeof(line) - n, "%02X ", buf[i + j]);
+    }
+    ESP_LOGV(TAG, "%s", line);
+  }
+  if (buf.size() > shown) {
+    ESP_LOGV(TAG, "  ... (%u bytes more)", (unsigned)(buf.size() - shown));
+  }
+}
+
 void ACHIClimate::setup() {
   this->mode = climate::CLIMATE_MODE_OFF;
   this->target_temperature = 24;
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
   this->publish_state();
+  ESP_LOGI(TAG, "Setup done. Presets=%s, initial target=%u°C",
+           this->enable_presets_ ? "on" : "off", (unsigned)this->target_c_);
 }
 
 void ACHIClimate::update() {
   // Периодический опрос: короткий запрос статуса
   if (!this->writing_lock_) {
+    ESP_LOGV(TAG, "TX status query (0x66)");
     this->send_query_status_();
+  } else {
+    ESP_LOGV(TAG, "Skip query: writing_lock_=true");
   }
 
   // Дожим целевого состояния из HA (если активирован)
   if (this->enforce_from_ha_ && !this->writing_lock_) {
     uint32_t now = esphome::millis();
     if (now >= this->next_enforce_tx_at_) {
+      ESP_LOGD(TAG, "ENFORCE tick: retry=%u backoff_step=%u next_at=%u ms, desired_fp=0x%08X",
+               (unsigned)this->enforce_retry_counter_, (unsigned)this->enforce_backoff_steps_,
+               (unsigned)this->next_enforce_tx_at_, (unsigned)this->desired_fp_);
       // Повторяем ту же команду (tx_bytes_ уже сформирован в control())
       this->send_write_changes_();
       uint32_t add = this->enforce_interval_ms_ + static_cast<uint32_t>(this->enforce_backoff_steps_) * 200U;
@@ -151,6 +180,12 @@ climate::ClimateTraits ACHIClimate::traits() {
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool need_write = false;
 
+  // Логируем приходящие поля
+  ESP_LOGD(TAG, "HA control() called: has_mode=%d, has_target=%d, has_fan=%d, has_swing=%d, has_preset=%d",
+           call.get_mode().has_value(), call.get_target_temperature().has_value(),
+           call.get_fan_mode().has_value(), call.get_swing_mode().has_value(),
+           call.get_preset().has_value());
+
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
@@ -190,6 +225,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     need_write = true;
   }
 
+  ESP_LOGD(TAG, "Control resolved: power_on=%d mode=%d target_c=%u fan=%d swing=%d turbo=%d eco=%d quiet=%d led=%d sleep=%u need_write=%d",
+           this->power_on_, (int)this->mode_, (unsigned)this->target_c_, (int)this->fan_, (int)this->swing_,
+           this->turbo_, this->eco_, this->quiet_, this->led_, (unsigned)this->sleep_stage_, need_write);
+
   if (need_write) {
     // Сборка TX-кадра
     uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
@@ -223,6 +262,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       tx_bytes_[35] = 0;               // override quiet
     }
 
+    ESP_LOGD(TAG, "TX fields: [18]=0x%02X(pwr+mode) [19]=0x%02X(set) [16]=0x%02X(fan) [17]=0x%02X(sleep) [32]=0x%02X(swing) [33]=0x%02X(turbo/eco) [35]=0x%02X(quiet) [36]=0x%02X(LED)",
+             tx_bytes_[18], tx_bytes_[19], tx_bytes_[16], tx_bytes_[17], tx_bytes_[32], tx_bytes_[33], tx_bytes_[35], tx_bytes_[36]);
+
     // === Включаем режим приоритета HA: фиксируем целевое состояние и начинаем дожим ===
     desired_.power_on = this->power_on_;
     desired_.mode = this->mode_;
@@ -242,6 +284,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     next_enforce_tx_at_ = 0;
     enforce_backoff_steps_ = 0;
     enforce_retry_counter_ = 0;
+
+    ESP_LOGI(TAG, "ENFORCE start: desired_fp=0x%08X power=%d mode=%d set=%u fan=%d swing=%d turbo=%d eco=%d quiet=%d led=%d sleep=%u",
+             (unsigned)desired_fp_, desired_.power_on, (int)desired_.mode, (unsigned)desired_.target_c,
+             (int)desired_.fan, (int)desired_.swing, desired_.turbo, desired_.eco, desired_.quiet, desired_.led, (unsigned)desired_.sleep_stage);
 
     this->writing_lock_ = true;
     this->pending_write_ = true;
@@ -308,6 +354,8 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
 void ACHIClimate::send_query_status_() {
   for (auto b : this->query_) this->write_byte(b);
   this->flush();
+  ESP_LOGV(TAG, "Sent status query (0x66)");
+  this->log_frame_hex_("QUERY hex", this->query_, 32);
 }
 
 void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) {
@@ -333,8 +381,10 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
 void ACHIClimate::send_write_changes_() {
   auto frame = this->tx_bytes_;
   this->calc_and_patch_crc_(frame);
+  this->log_frame_hex_("TX WRITE hex (0x65)", frame, 64);
   for (auto b : frame) this->write_byte(b);
   this->flush();
+  ESP_LOGD(TAG, "WRITE sent, writing_lock_=%d pending_write_=%d", this->writing_lock_, this->pending_write_);
 }
 
 // ---- RX сканер/парсер ----
@@ -348,15 +398,19 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
          (esphome::millis() - start) < budget_ms &&
          this->extract_next_frame_(frame)) {
 
-    // На входе используем сумму как «детектор изменений», а не жёсткий CRC-drop
     uint16_t sum = 0;
-    for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
+    bool crc_ok = this->validate_crc_(frame, &sum);
+    ESP_LOGV(TAG, "RX frame: len=%u cmd=0x%02X crc_ok=%d sum=0x%04X",
+             (unsigned)frame.size(),
+             (frame.size() > 13 ? frame[13] : 0xFF),
+             crc_ok, (unsigned)sum);
+    this->log_frame_hex_("RX hex", frame, 64);
 
     // Разбор
     this->handle_frame_(frame);
     handled++;
 
-    // Сохраняем последнюю сумму, чтобы подавлять повторы
+    // Сохраняем последнюю сумму, чтобы подавлять повторы (как было)
     last_status_crc_ = sum;
   }
 }
@@ -432,7 +486,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   } else if (cmd == 101 /*0x65 ack*/) {
     this->handle_ack_101_();
   } else {
-    // неизвестные кадры игнорируем
+    ESP_LOGW(TAG, "Unknown frame cmd=0x%02X len=%u", cmd, (unsigned)b.size());
   }
 }
 
@@ -479,29 +533,13 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(bytes[21]);
 #endif
 
-  // === Публикация всех доп. сенсоров из Legacy ===
-#ifdef USE_SENSOR
-  // Уставка / комнатная / скорость вентилятора / сон / числовой код режима
-  if (this->set_temp_sensor_ != nullptr) this->set_temp_sensor_->publish_state(this->target_c_);
-  if (this->room_temp_sensor_ != nullptr) this->room_temp_sensor_->publish_state(tair);
-  if (this->wind_sensor_ != nullptr) this->wind_sensor_->publish_state(raw_wind);
-  if (this->sleep_sensor_ != nullptr) this->sleep_sensor_->publish_state(this->sleep_stage_);
-  if (this->mode_sensor_ != nullptr) this->mode_sensor_->publish_state(nib & 0x0F);
-#endif
-
-#ifdef USE_TEXT_SENSOR
-  // Текстовый статус питания
-  if (this->power_status_text_sensor_ != nullptr) this->power_status_text_sensor_->publish_state(this->power_on_ ? "ON" : "OFF");
-#endif
-
-  // Turbo/Eco/Quiet/LED
+  // Turbo/Eco/Quiet/LED + качание
   uint8_t b35 = bytes[35];
   this->turbo_ = (b35 & 0b00000010) != 0;       // turbo_mask = 0b00000010
   this->eco_   = (b35 & 0b00000100) != 0;       // eco_mask   = 0b00000100
   this->quiet_ = (bytes[36] & 0b00000100) != 0; // quiet      в 36-м
   this->led_   = (bytes[37] & 0b10000000) != 0; // LED        в 37-м
 
-  // Swing (байт 35: updown bit7, leftright bit6)
   bool updown = (bytes[35] & 0b10000000) != 0;
   bool leftright = (bytes[35] & 0b01000000) != 0;
   if (updown && leftright) this->swing_ = climate::CLIMATE_SWING_BOTH;
@@ -509,24 +547,33 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (leftright) this->swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else this->swing_ = climate::CLIMATE_SWING_OFF;
 
+  // === Публикация всех доп. сенсоров из Legacy ===
 #ifdef USE_SENSOR
-  // Флаги и качание как бинарные числовые сенсоры (0/1)
+  if (this->set_temp_sensor_ != nullptr) this->set_temp_sensor_->publish_state(this->target_c_);
+  if (this->room_temp_sensor_ != nullptr) this->room_temp_sensor_->publish_state(tair);
+  if (this->wind_sensor_ != nullptr) this->wind_sensor_->publish_state(raw_wind);
+  if (this->sleep_sensor_ != nullptr) this->sleep_sensor_->publish_state(this->sleep_stage_);
+  if (this->mode_sensor_ != nullptr) this->mode_sensor_->publish_state(nib & 0x0F);
   if (this->quiet_sensor_ != nullptr) this->quiet_sensor_->publish_state(this->quiet_ ? 1 : 0);
   if (this->turbo_sensor_ != nullptr) this->turbo_sensor_->publish_state(this->turbo_ ? 1 : 0);
   if (this->led_sensor_ != nullptr)   this->led_sensor_->publish_state(this->led_ ? 1 : 0);
   if (this->eco_sensor_ != nullptr)   this->eco_sensor_->publish_state(this->eco_ ? 1 : 0);
   if (this->swing_updown_sensor_ != nullptr)    this->swing_updown_sensor_->publish_state(updown ? 1 : 0);
   if (this->swing_leftright_sensor_ != nullptr) this->swing_leftright_sensor_->publish_state(leftright ? 1 : 0);
-#endif
-
-#ifdef USE_SENSOR
-  // Наружные температуры и частоты компрессора (байты 42..45)
   if (this->compr_freq_set_sensor_ != nullptr) this->compr_freq_set_sensor_->publish_state(bytes[42]);
   if (this->compr_freq_sensor_ != nullptr)     this->compr_freq_sensor_->publish_state(bytes[43]);
   if (this->outdoor_temp_sensor_ != nullptr)   this->outdoor_temp_sensor_->publish_state(bytes[44]);
   if (this->outdoor_cond_temp_sensor_ != nullptr) this->outdoor_cond_temp_sensor_->publish_state(bytes[45]);
 #endif
-  // === конец добавленных публикаций ===
+
+#ifdef USE_TEXT_SENSOR
+  if (this->power_status_text_sensor_ != nullptr) this->power_status_text_sensor_->publish_state(this->power_on_ ? "ON" : "OFF");
+#endif
+
+  // Печать разобранных ключевых полей
+  ESP_LOGD(TAG, "STATUS: power=%d mode=%d fan=%d sleep=%u set=%u room=%u turbo=%d eco=%d quiet=%d led=%d swingUD=%d swingLR=%d",
+           this->power_on_, (int)this->mode_, (int)this->fan_, (unsigned)this->sleep_stage_,
+           (unsigned)this->target_c_, (unsigned)tair, this->turbo_, this->eco_, this->quiet_, this->led_, updown, leftright);
 
   // Публикуем (по умолчанию — фактическое)
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
@@ -541,19 +588,23 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 
   // === Приоритет HA над ИК-пультом: контроль совпадения/дожим и допуск ИК ===
   this->actual_fp_ = this->actual_fingerprint_();
+  ESP_LOGD(TAG, "FP: actual=0x%08X desired=0x%08X last_applied=0x%08X enforce=%d accept_ir=%d",
+           (unsigned)this->actual_fp_, (unsigned)this->desired_fp_, (unsigned)this->last_applied_fp_,
+           this->enforce_from_ha_, this->accept_ir_changes_);
 
   if (this->enforce_from_ha_ && this->desired_valid_) {
     uint32_t dfp = this->desired_fingerprint_();
     if (this->actual_fp_ == dfp) {
-      // Цель достигнута — перестаём дожимать и начинаем принимать изменения с пульта
       this->enforce_from_ha_ = false;
       this->accept_ir_changes_ = true;
       this->last_applied_fp_ = this->actual_fp_;
       this->enforce_backoff_steps_ = 0;
       this->enforce_retry_counter_ = 0;
+      ESP_LOGI(TAG, "ENFORCE matched. IR changes accepted again.");
     } else {
-      // Пока не совпало — публикуем целевое состояние (чтобы HA отражал задачу),
-      // сенсорные значения при этом остаются фактическими (опубликованы выше по сенсорам).
+      ESP_LOGW(TAG, "ENFORCE pending: actual!=desired (0x%08X != 0x%08X). Will retry at %u ms",
+               (unsigned)this->actual_fp_, (unsigned)dfp, (unsigned)this->next_enforce_tx_at_);
+      // Публикуем в UI целевые поля, чтобы было видно задачу
       this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
       this->target_temperature = this->desired_.target_c;
       this->fan_mode = this->desired_.fan;
@@ -564,19 +615,17 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
         else if (this->desired_.sleep_stage > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
         else this->preset = climate::CLIMATE_PRESET_NONE;
       }
-      // Дальнейшие повторы команды выполняются в update() по таймеру.
     }
   } else {
-    // Дожим не активен
     if (this->accept_ir_changes_) {
       if (this->actual_fp_ != this->last_applied_fp_) {
-        // Приняли изменение из статуса (ИК-пульт)
+        ESP_LOGI(TAG, "IR/state change accepted: last_applied 0x%08X -> 0x%08X",
+                 (unsigned)this->last_applied_fp_, (unsigned)this->actual_fp_);
         this->last_applied_fp_ = this->actual_fp_;
       }
     } else {
-      // Если временно запрещено принимать изменения с пульта, оставляем публикацию как есть
-      // (либо можно публиковать desired_, если он валиден).
       if (this->desired_valid_) {
+        ESP_LOGW(TAG, "IR changes blocked temporarily; publishing desired to HA.");
         this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
         this->target_temperature = this->desired_.target_c;
         this->fan_mode = this->desired_.fan;
@@ -595,6 +644,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 }
 
 void ACHIClimate::handle_ack_101_() {
+  ESP_LOGD(TAG, "ACK (0x65) received. writing_lock_=%d -> false, pending_write_=%d -> false",
+           this->writing_lock_, this->pending_write_);
   this->writing_lock_ = false;
   this->pending_write_ = false;
 }
