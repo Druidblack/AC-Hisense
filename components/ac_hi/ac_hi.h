@@ -238,6 +238,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t last_write_sent_at_{0};
   uint32_t last_ack_at_{0};
   uint32_t last_ack_warn_at_{0};
+
+  // === ACK handling tweaks ===
+  uint32_t ack_timeout_ms_{1000};           // сколько ждём ACK прежде чем отпустить лок
+  uint32_t ack_implicit_window_ms_{1500};   // окно, в котором STATUS трактуем как имплицитный ACK
 };
 
 }  // namespace ac_hi

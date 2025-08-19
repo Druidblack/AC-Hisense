@@ -10,9 +10,6 @@ namespace ac_hi {
 static const char *const TAG = "ac_hi.climate";
 
 // ---- Локальные хелперы для (де)кодирования режима ----
-// Целевая раскладка nibble (byte[18] >> 4):
-// 0x00 = FAN_ONLY, 0x01 = HEAT, 0x02 = COOL, 0x03 = DRY.
-// Иного здесь нет — AUTO не поддерживается и в HA не объявляется.
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
     case 0x00: return climate::CLIMATE_MODE_FAN_ONLY;
@@ -152,9 +149,9 @@ void ACHIClimate::update() {
     this->send_query_status_();
   } else {
     ESP_LOGV(TAG, "Skip query: writing_lock_=true");
-    // Диагностика «зависшего» ожидания ACK
+    // Диагностика/автовыход из зависшего ожидания ACK
     uint32_t now = esphome::millis();
-    uint32_t elapsed = now - this->last_write_sent_at_;
+    uint32_t elapsed = (this->last_write_sent_at_ == 0) ? 0 : (now - this->last_write_sent_at_);
     if (this->last_write_sent_at_ != 0 && elapsed > 900) {
       if (now - this->last_ack_warn_at_ > 1000) {  // не спамить каждую итерацию
         ESP_LOGW(TAG, "Still waiting for ACK(0x65): %u ms elapsed since write. last_cmd_seen=0x%02X, last_ack_at=%u ms ago",
@@ -162,6 +159,16 @@ void ACHIClimate::update() {
                  (unsigned)((this->last_ack_at_ == 0) ? 0 : (now - this->last_ack_at_)));
         this->last_ack_warn_at_ = now;
       }
+    }
+    // Жёсткий таймаут ACK — снимаем лок и планируем повтор
+    if (this->last_write_sent_at_ != 0 && elapsed > this->ack_timeout_ms_) {
+      ESP_LOGW(TAG, "ACK timeout (%u ms). Releasing lock and scheduling enforce retry.",
+               (unsigned)this->ack_timeout_ms_);
+      this->writing_lock_ = false;
+      this->pending_write_ = false;
+      // ускорим следующий дожим
+      this->next_enforce_tx_at_ = now;
+      if (this->enforce_backoff_steps_ < 10) this->enforce_backoff_steps_++;
     }
   }
 
@@ -354,7 +361,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     this->send_write_changes_();
   }
 
-  // Оптимистично публикуем ожидаемое состояние (оставляем как было)
+  // Оптимистично публикуем ожидаемое состояние
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->target_temperature = this->target_c_;
   this->fan_mode = this->fan_;
@@ -371,12 +378,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 // ---- Кодирование полей ----
 
 uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
-  // Сформировать «старший полубайт»: nibble {0..3} << 4
   return static_cast<uint8_t>(encode_nibble_from_mode(m) << 4);
 }
 
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // Соответствие: AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16; при записи +1
+  // AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16; при записи +1
   uint8_t code = 1;
   switch (f) {
     case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
@@ -546,6 +552,16 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 
   if (cmd == 102 /*0x66 status resp*/ ) {
     this->parse_status_102_(b);
+    // Если статус пришёл вскоре после записи, считаем это имплицитным ACK
+    if (this->writing_lock_ && this->last_write_sent_at_ != 0) {
+      uint32_t now = esphome::millis();
+      uint32_t elapsed = now - this->last_write_sent_at_;
+      if (elapsed <= this->ack_implicit_window_ms_) {
+        ESP_LOGW(TAG, "Implicit ACK via STATUS (0x66) after %u ms. Releasing lock.", (unsigned)elapsed);
+        this->writing_lock_ = false;
+        this->pending_write_ = false;
+      }
+    }
   } else if (cmd == 101 /*0x65 ack*/) {
     this->handle_ack_101_();
   } else {
@@ -560,15 +576,13 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
              bytes[16], bytes[17], bytes[18], bytes[19], bytes[35], bytes[36], bytes[37]);
   }
 
-  // Питание (байт 18, бит 3)
+  // Питание/режим/ветер/сон/уставка/темпы
   bool power = (bytes[18] & 0b00001000) != 0;
   this->power_on_ = power;
 
-  // Режим — верхний полубайт по таблице FAN/HEAT/COOL/DRY
   uint8_t nib = static_cast<uint8_t>((bytes[18] >> 4) & 0x0F);
   this->mode_ = decode_mode_from_nibble(nib);
 
-  // Скорость вентилятора (байт 16)
   uint8_t raw_wind = bytes[16];
   climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
   if (raw_wind == 1 || raw_wind == 2) new_fan = climate::CLIMATE_FAN_AUTO;
@@ -578,7 +592,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (raw_wind == 17) new_fan = climate::CLIMATE_FAN_HIGH;
   this->fan_ = new_fan;
 
-  // Sleep (байт 17)
   uint8_t raw_sleep = bytes[17];
   uint8_t code = (raw_sleep >> 1);
   if (code == 0) this->sleep_stage_ = 0;
@@ -588,26 +601,23 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (code == 8) this->sleep_stage_ = 4;
   else this->sleep_stage_ = 0;
 
-  // Целевая температура (байт 19) — значение в °C напрямую
   uint8_t raw_set = bytes[19];
   if (raw_set >= 16 && raw_set <= 30) this->target_c_ = raw_set;
   this->target_temperature = this->target_c_;
 
-  // Текущая температура воздуха (байт 20)
   uint8_t tair = bytes[20];
   this->current_temperature = tair;
 
-  // Температура трубки (байт 21)
 #ifdef USE_SENSOR
   if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(bytes[21]);
 #endif
 
   // Turbo/Eco/Quiet/LED + качание
   uint8_t b35 = bytes[35];
-  this->turbo_ = (b35 & 0b00000010) != 0;       // turbo_mask = 0b00000010
-  this->eco_   = (b35 & 0b00000100) != 0;       // eco_mask   = 0b00000100
-  this->quiet_ = (bytes[36] & 0b00000100) != 0; // quiet      в 36-м
-  this->led_   = (bytes[37] & 0b10000000) != 0; // LED        в 37-м
+  this->turbo_ = (b35 & 0b00000010) != 0;
+  this->eco_   = (b35 & 0b00000100) != 0;
+  this->quiet_ = (bytes[36] & 0b00000100) != 0;
+  this->led_   = (bytes[37] & 0b10000000) != 0;
 
   bool updown = (bytes[35] & 0b10000000) != 0;
   bool leftright = (bytes[35] & 0b01000000) != 0;
@@ -616,8 +626,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (leftright) this->swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else this->swing_ = climate::CLIMATE_SWING_OFF;
 
-  // === Публикация всех доп. сенсоров из Legacy ===
 #ifdef USE_SENSOR
+  // Доп. сенсоры
   if (this->set_temp_sensor_ != nullptr) this->set_temp_sensor_->publish_state(this->target_c_);
   if (this->room_temp_sensor_ != nullptr) this->room_temp_sensor_->publish_state(tair);
   if (this->wind_sensor_ != nullptr) this->wind_sensor_->publish_state(raw_wind);
@@ -644,7 +654,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
            this->power_on_, (int)this->mode_, (int)this->fan_, (unsigned)this->sleep_stage_,
            (unsigned)this->target_c_, (unsigned)tair, this->turbo_, this->eco_, this->quiet_, this->led_, updown, leftright);
 
-  // Публикуем (по умолчанию — фактическое)
+  // Публикуем фактическое
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
   this->fan_mode = this->fan_;
   this->swing_mode = this->swing_;
@@ -655,7 +665,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
 
-  // === Приоритет HA над ИК-пультом: контроль совпадения/дожим и допуск ИК ===
+  // === Приоритет HA/дожим ===
   this->actual_fp_ = this->actual_fingerprint_();
   ESP_LOGD(TAG, "FP: actual=0x%08X desired=0x%08X last_applied=0x%08X enforce=%d accept_ir=%d",
            (unsigned)this->actual_fp_, (unsigned)this->desired_fp_, (unsigned)this->last_applied_fp_,
@@ -674,7 +684,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
       ESP_LOGW(TAG, "ENFORCE pending: actual!=desired (0x%08X != 0x%08X). Will retry at %u ms",
                (unsigned)this->actual_fp_, (unsigned)dfp, (unsigned)this->next_enforce_tx_at_);
       this->log_diff_desired_actual_();
-      // Публикуем в UI целевые поля, чтобы было видно задачу
+      // Публикуем в UI целевые поля
       this->mode = this->desired_.power_on ? this->desired_.mode : climate::CLIMATE_MODE_OFF;
       this->target_temperature = this->desired_.target_c;
       this->fan_mode = this->desired_.fan;
