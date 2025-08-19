@@ -19,13 +19,17 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
     default:   return climate::CLIMATE_MODE_COOL;  // fallback
   }
 }
+
+// ВАЖНО: кодируем ровно по той же таблице 0x00..0x03, что и читаем из статуса.
+// Это не изменение маппинга полей, а исправление несоответствия локальной функции
+// собственному же комментарию и факту из логов (STATUS b18 >> 4 == 0..3).
 static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   switch (m) {
-    case climate::CLIMATE_MODE_FAN_ONLY: return 0x01;
-    case climate::CLIMATE_MODE_HEAT:     return 0x03;
-    case climate::CLIMATE_MODE_COOL:     return 0x05;
-    case climate::CLIMATE_MODE_DRY:      return 0x07;
-    default:                             return 0x05; // AUTO нет, используем COOL
+    case climate::CLIMATE_MODE_FAN_ONLY: return 0x00;
+    case climate::CLIMATE_MODE_HEAT:     return 0x01;
+    case climate::CLIMATE_MODE_COOL:     return 0x02;
+    case climate::CLIMATE_MODE_DRY:      return 0x03;
+    default:                             return 0x02; // AUTO нет, используем COOL
   }
 }
 
@@ -302,7 +306,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
 
-    // запись уставки напрямую
+    // запись уставки напрямую (протокол записи — 2*T+1; оставляем как было)
     tx_bytes_[19] = encode_temp_(this->target_c_);
 
     tx_bytes_[16] = encode_fan_byte_(this->fan_);           // fan
@@ -329,8 +333,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       tx_bytes_[35] = 0;               // override quiet
     }
 
+    // Доп. диагностический вывод по содержимому TX[18]
+    uint8_t tx18 = tx_bytes_[18];
     ESP_LOGD(TAG, "TX fields: [18]=0x%02X(pwr+mode) [19]=0x%02X(set) [16]=0x%02X(fan) [17]=0x%02X(sleep) [32]=0x%02X(swing) [33]=0x%02X(turbo/eco) [35]=0x%02X(quiet) [36]=0x%02X(LED)",
-             tx_bytes_[18], tx_bytes_[19], tx_bytes_[16], tx_bytes_[17], tx_bytes_[32], tx_bytes_[33], tx_bytes_[35], tx_bytes_[36]);
+             tx18, tx_bytes_[19], tx_bytes_[16], tx_bytes_[17], tx_bytes_[32], tx_bytes_[33], tx_bytes_[35], tx_bytes_[36]);
+    ESP_LOGD(TAG, "TX[18] decode check: mode_nibble=0x%X power_bit=%u (low_nibble=0x%X)",
+             (unsigned)(tx18 >> 4), (unsigned)((tx18 & 0x08) ? 1 : 0), (unsigned)(tx18 & 0x0F));
 
     // === Включаем режим приоритета HA: фиксируем целевое состояние и начинаем дожим ===
     desired_.power_on = this->power_on_;
