@@ -1,9 +1,46 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <algorithm>
+#include "esphome/core/helpers.h"  // for format_hex_pretty
+// NOTE: Logging is VERBOSE only and does not change behavior.
 
 namespace esphome {
 namespace ac_hi {
+
+static const char *const TAG = "ac_hi"; // Logger tag
+
+// ---- Local helpers (logging only) ----
+// Convert enums to readable strings for logs (no functional impact)
+static inline const char *mode_to_str(climate::ClimateMode m) {
+  switch (m) {
+    case climate::CLIMATE_MODE_OFF:       return "OFF";
+    case climate::CLIMATE_MODE_COOL:      return "COOL";
+    case climate::CLIMATE_MODE_HEAT:      return "HEAT";
+    case climate::CLIMATE_MODE_DRY:       return "DRY";
+    case climate::CLIMATE_MODE_FAN_ONLY:  return "FAN_ONLY";
+    case climate::CLIMATE_MODE_AUTO:      return "AUTO";
+    default:                              return "UNKNOWN";
+  }
+}
+static inline const char *fan_to_str(climate::ClimateFanMode f) {
+  switch (f) {
+    case climate::CLIMATE_FAN_AUTO:   return "AUTO";
+    case climate::CLIMATE_FAN_LOW:    return "LOW";
+    case climate::CLIMATE_FAN_MEDIUM: return "MED";
+    case climate::CLIMATE_FAN_HIGH:   return "HIGH";
+    case climate::CLIMATE_FAN_QUIET:  return "QUIET";
+    default:                          return "UNKNOWN";
+  }
+}
+static inline const char *swing_to_str(climate::ClimateSwingMode s) {
+  switch (s) {
+    case climate::CLIMATE_SWING_OFF:        return "OFF";
+    case climate::CLIMATE_SWING_VERTICAL:   return "VERT";
+    case climate::CLIMATE_SWING_HORIZONTAL: return "HORIZ";
+    case climate::CLIMATE_SWING_BOTH:       return "BOTH";
+    default:                                return "UNKNOWN";
+  }
+}
 
 // ---- Локальные хелперы для (де)кодирования режима ----
 // Целевая раскладка nibble (byte[18] >> 4):
@@ -34,12 +71,19 @@ void ACHIClimate::setup() {
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
   this->publish_state();
+
+  ESP_LOGV(TAG, "Setup complete. presets=%s, init target=%.1f, fan=%s, swing=%s",
+           this->enable_presets_ ? "enabled" : "disabled",
+           this->target_temperature, fan_to_str(this->fan_mode), swing_to_str(this->swing_mode));
 }
 
 void ACHIClimate::update() {
   // Периодический опрос: короткий запрос статуса
   if (!this->writing_lock_) {
+    ESP_LOGV(TAG, "Update tick: requesting status (no pending write).");
     this->send_query_status_();
+  } else {
+    ESP_LOGV(TAG, "Update tick: write in progress, skipping status query.");
   }
 }
 
@@ -54,9 +98,11 @@ void ACHIClimate::loop() {
   if (rx_start_ > RX_COMPACT_THRESHOLD) {
     rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_));
     rx_start_ = 0;
+    ESP_LOGV(TAG, "RX buffer compacted.");
   }
   if (rx_.size() - rx_start_ > 4096) {
     size_t remain = rx_.size() - rx_start_;
+    ESP_LOGV(TAG, "RX buffer large (%u), trimming. remain=%u", (unsigned) (rx_.size()), (unsigned) remain);
     if (remain >= 1 && rx_.back() == HI_HDR0) {
       uint8_t keep = rx_.back();
       rx_.clear();
@@ -103,6 +149,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
+    ESP_LOGV(TAG, "Control: requested mode=%s", mode_to_str(m));
     if (m == climate::CLIMATE_MODE_OFF) {
       this->power_on_ = false;
     } else {
@@ -114,6 +161,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_target_temperature().has_value()) {
     auto t = *call.get_target_temperature();
+    ESP_LOGV(TAG, "Control: requested target=%.1f", t);
     if (!std::isnan(t)) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
@@ -124,16 +172,22 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_fan_mode().has_value()) {
     this->fan_ = *call.get_fan_mode();
+    ESP_LOGV(TAG, "Control: requested fan=%s", fan_to_str(this->fan_));
     need_write = true;
   }
 
   if (call.get_swing_mode().has_value()) {
     this->swing_ = *call.get_swing_mode();
+    ESP_LOGV(TAG, "Control: requested swing=%s", swing_to_str(this->swing_));
     need_write = true;
   }
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
+    ESP_LOGV(TAG, "Control: requested preset=%s",
+             (p == climate::CLIMATE_PRESET_ECO ? "ECO" :
+              p == climate::CLIMATE_PRESET_BOOST ? "BOOST" :
+              p == climate::CLIMATE_PRESET_SLEEP ? "SLEEP" : "NONE"));
     this->eco_ = (p == climate::CLIMATE_PRESET_ECO);
     this->turbo_ = (p == climate::CLIMATE_PRESET_BOOST);
     this->sleep_stage_ = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
@@ -141,7 +195,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   if (need_write) {
-    // Сборка TX-кадра
+    // Сборка TX-кадра (no functional changes)
     uint8_t power_bin = this->power_on_ ? 0b00001100 : 0b00000100;  // low nibble
     uint8_t mode_hi   = static_cast<uint8_t>(encode_nibble_from_mode(this->mode_) << 4);
     tx_bytes_[18] = static_cast<uint8_t>(power_bin + mode_hi);
@@ -173,8 +227,16 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       tx_bytes_[35] = 0;               // override quiet
     }
 
+    ESP_LOGV(TAG,
+             "Control: assemble write -> power=%s mode=%s set=%u fan=%s sleep=%u swing=%s (ud=%s lr=%s) turbo=%d eco=%d quiet=%d led=%d",
+             this->power_on_ ? "ON" : "OFF",
+             mode_to_str(this->mode_), this->target_c_, fan_to_str(this->fan_), this->sleep_stage_,
+             swing_to_str(this->swing_), v_swing ? "on" : "off", h_swing ? "on" : "off",
+             this->turbo_, this->eco_, this->quiet_, this->led_);
+
     this->writing_lock_ = true;
     this->pending_write_ = true;
+    ESP_LOGV(TAG, "Write lock set. Pending write = true.");
     this->send_write_changes_();
   }
 
@@ -190,6 +252,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
+  ESP_LOGV(TAG, "State published (optimistic). mode=%s, target=%.1f, fan=%s, swing=%s",
+           mode_to_str(this->mode), this->target_temperature, fan_to_str(this->fan_mode), swing_to_str(this->swing_mode));
 }
 
 // ---- Кодирование полей ----
@@ -236,6 +300,7 @@ uint8_t ACHIClimate::encode_swing_lr_(bool on) {
 // ---- Транспорт/CRC ----
 
 void ACHIClimate::send_query_status_() {
+  ESP_LOGV(TAG, "TX Query [0x66]: %s", format_hex_pretty(this->query_).c_str());
   for (auto b : this->query_) this->write_byte(b);
   this->flush();
 }
@@ -247,6 +312,8 @@ void ACHIClimate::calc_and_patch_crc_(std::vector<uint8_t> &buf) {
   for (int i = 2; i < n - 4; i++) csum = static_cast<uint16_t>(csum + buf[i]);
   buf[n - 4] = static_cast<uint8_t>((csum & 0xFF00) >> 8);
   buf[n - 3] = static_cast<uint8_t>(csum & 0x00FF);
+  ESP_LOGV(TAG, "CRC patched: sum=0x%04X -> bytes[%d]=0x%02X, bytes[%d]=0x%02X",
+           csum, n - 4, buf[n - 4], n - 3, buf[n - 3]);
 }
 
 bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum) const {
@@ -263,6 +330,7 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
 void ACHIClimate::send_write_changes_() {
   auto frame = this->tx_bytes_;
   this->calc_and_patch_crc_(frame);
+  ESP_LOGV(TAG, "TX Write [0x65]: %s", format_hex_pretty(frame).c_str());
   for (auto b : frame) this->write_byte(b);
   this->flush();
 }
@@ -281,6 +349,13 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     // На входе используем сумму как «детектор изменений», а не жёсткий CRC-drop
     uint16_t sum = 0;
     for (size_t i = 2; i + 4 <= frame.size(); i++) sum = static_cast<uint16_t>(sum + frame[i]);
+
+    // Дополнительно — логируем валидность CRC (лог только, без влияния на логику)
+    uint16_t crc_calc = 0;
+    bool crc_ok = this->validate_crc_(frame, &crc_calc);
+    ESP_LOGV(TAG, "RX Frame (%u bytes, sum=0x%04X, crc=%s): %s",
+             (unsigned) frame.size(), sum, crc_ok ? "OK" : "MISMATCH",
+             format_hex_pretty(frame).c_str());
 
     // Разбор
     this->handle_frame_(frame);
@@ -330,6 +405,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
                    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
                    rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_ + expected_total));
       rx_start_ += expected_total;
+      // Do not log here to avoid double logging; we log after extraction in try_parse...
       return true;
     }
   }
@@ -353,9 +429,13 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
 }
 
 void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
-  if (b.size() < 20) return;
+  if (b.size() < 20) {
+    ESP_LOGV(TAG, "RX frame too short: %u bytes, ignored.", (unsigned) b.size());
+    return;
+  }
 
   const uint8_t cmd = b[13];
+  ESP_LOGV(TAG, "Handle frame: cmd=0x%02X", cmd);
 
   if (cmd == 102 /*0x66 status resp*/ ) {
     this->parse_status_102_(b);
@@ -363,6 +443,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
     this->handle_ack_101_();
   } else {
     // неизвестные кадры игнорируем
+    ESP_LOGV(TAG, "Unknown cmd=0x%02X, ignored.", cmd);
   }
 }
 
@@ -469,11 +550,21 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
+
+  // Log a concise status summary for diagnostics
+  ESP_LOGV(TAG,
+           "Parsed status: power=%s mode=%s fan=%s set=%u room=%u sleep=%u swing=%s (ud=%d lr=%d) flags: turbo=%d eco=%d quiet=%d led=%d",
+           this->power_on_ ? "ON" : "OFF",
+           mode_to_str(this->mode_), fan_to_str(this->fan_),
+           this->target_c_, tair, this->sleep_stage_, swing_to_str(this->swing_),
+           updown ? 1 : 0, leftright ? 1 : 0,
+           this->turbo_, this->eco_, this->quiet_, this->led_);
 }
 
 void ACHIClimate::handle_ack_101_() {
   this->writing_lock_ = false;
   this->pending_write_ = false;
+  ESP_LOGV(TAG, "ACK[0x65] received. Write lock cleared. Pending write = false.");
 }
 
 } // namespace ac_hi
