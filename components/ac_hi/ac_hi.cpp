@@ -235,7 +235,7 @@ uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
 }
 
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f) {
-  // Mapping: AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16; when writing +1
+  // Mapping (base codes on device side): AUTO->1, QUIET->10, LOW->12, MED->14, HIGH->16; when writing +1
   uint8_t code = 1;
   switch (f) {
     case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
@@ -431,7 +431,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   // Store the raw frame for diagnostics
   last_status_frame_ = bytes;
 
-  // ---- Parse actual device state (do not change mappings) ----
+  // ---- Parse actual device state (do not change mappings to indices) ----
 
   // Power (byte 18, bit 3)
   bool power = (bytes[18] & 0b00001000) != 0;
@@ -443,12 +443,14 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
 
   // Fan speed (byte 16)
   uint8_t raw_wind = bytes[16];
+  ESP_LOGV(TAG, "STATUS: raw_wind=0x%02X (%u)", raw_wind, (unsigned) raw_wind);
   climate::ClimateFanMode new_fan = climate::CLIMATE_FAN_AUTO;
+  // Device reports base codes, writes require +1. Recognize base codes here.
   if (raw_wind == 1 || raw_wind == 2) new_fan = climate::CLIMATE_FAN_AUTO;
-  else if (raw_wind == 11) new_fan = climate::CLIMATE_FAN_QUIET;
-  else if (raw_wind == 13) new_fan = climate::CLIMATE_FAN_LOW;
-  else if (raw_wind == 15) new_fan = climate::CLIMATE_FAN_MEDIUM;
-  else if (raw_wind == 17) new_fan = climate::CLIMATE_FAN_HIGH;
+  else if (raw_wind == 10) new_fan = climate::CLIMATE_FAN_QUIET;
+  else if (raw_wind == 12) new_fan = climate::CLIMATE_FAN_LOW;
+  else if (raw_wind == 14) new_fan = climate::CLIMATE_FAN_MEDIUM;
+  else if (raw_wind == 16) new_fan = climate::CLIMATE_FAN_HIGH;
   this->fan_ = new_fan;
 
   // Sleep (byte 17)
@@ -634,7 +636,9 @@ void ACHIClimate::maybe_force_to_target_() {
     return;
   }
 
-  // Not yet converged — send another write if possible
+  // Not yet converged — print diff and send another write if possible
+  log_sig_diff_();
+
   if (!writing_lock_) {
     ESP_LOGD(TAG, "Enforcing desired HA state (sig_actual=0x%08X != sig_desired=0x%08X) -> WRITE", (unsigned) actual_sig_, (unsigned) desired_sig_);
     build_tx_from_desired_();
@@ -644,6 +648,21 @@ void ACHIClimate::maybe_force_to_target_() {
   } else {
     ESP_LOGV(TAG, "Write lock active while enforcing target, will retry after ACK/status");
   }
+}
+
+void ACHIClimate::log_sig_diff_() const {
+  // Debug helper: log which control fields differ (actual vs desired)
+  auto b2s = [](bool v){ return v ? "true" : "false"; };
+  if (power_on_ != d_power_on_) ESP_LOGV(TAG, "DIFF power_on: actual=%s desired=%s", b2s(power_on_), b2s(d_power_on_));
+  if (mode_ != d_mode_) ESP_LOGV(TAG, "DIFF mode: actual=%s desired=%s", climate::climate_mode_to_string(mode_), climate::climate_mode_to_string(d_mode_));
+  if (fan_ != d_fan_) ESP_LOGV(TAG, "DIFF fan: actual=%s desired=%s", climate::climate_fan_mode_to_string(fan_), climate::climate_fan_mode_to_string(d_fan_));
+  if (swing_ != d_swing_) ESP_LOGV(TAG, "DIFF swing: actual=%s desired=%s", climate::climate_swing_mode_to_string(swing_), climate::climate_swing_mode_to_string(d_swing_));
+  if (eco_ != d_eco_) ESP_LOGV(TAG, "DIFF eco: actual=%s desired=%s", b2s(eco_), b2s(d_eco_));
+  if (turbo_ != d_turbo_) ESP_LOGV(TAG, "DIFF turbo: actual=%s desired=%s", b2s(turbo_), b2s(d_turbo_));
+  if (quiet_ != d_quiet_) ESP_LOGV(TAG, "DIFF quiet: actual=%s desired=%s", b2s(quiet_), b2s(d_quiet_));
+  if (led_ != d_led_) ESP_LOGV(TAG, "DIFF led: actual=%s desired=%s", b2s(led_), b2s(d_led_));
+  if (sleep_stage_ != d_sleep_stage_) ESP_LOGV(TAG, "DIFF sleep_stage: actual=%u desired=%u", (unsigned) sleep_stage_, (unsigned) d_sleep_stage_);
+  if (target_c_ != d_target_c_) ESP_LOGV(TAG, "DIFF target_c: actual=%u desired=%u", (unsigned) target_c_, (unsigned) d_target_c_);
 }
 
 // ---- Logging helpers ----

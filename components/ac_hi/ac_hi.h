@@ -82,6 +82,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
                                       uint8_t sleep_stage, uint8_t target_c) const;
   void recalc_desired_sig_();
   void recalc_actual_sig_();
+  void log_sig_diff_() const;      // verbose: which fields differ (for debugging only)
 
   // Incoming stream buffer (sliding window: rx_start_ — offset of data start)
   std::vector<uint8_t> rx_;
