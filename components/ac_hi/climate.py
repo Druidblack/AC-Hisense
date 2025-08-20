@@ -60,7 +60,7 @@ CONFIG_SCHEMA = climate.CLIMATE_SCHEMA.extend({
 
     # Text sensors
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
-}).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("1s"))
+}).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("3s"))
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
