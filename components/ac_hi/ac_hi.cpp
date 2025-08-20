@@ -409,21 +409,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   if (this->pipe_sensor_ != nullptr) this->pipe_sensor_->publish_state(bytes[21]);
 #endif
 
-  // === Публикация всех доп. сенсоров из Legacy ===
-#ifdef USE_SENSOR
-  // Уставка / комнатная / скорость вентилятора / сон / числовой код режима
-  if (this->set_temp_sensor_ != nullptr) this->set_temp_sensor_->publish_state(this->target_c_);
-  if (this->room_temp_sensor_ != nullptr) this->room_temp_sensor_->publish_state(tair);
-  if (this->wind_sensor_ != nullptr) this->wind_sensor_->publish_state(raw_wind);
-  if (this->sleep_sensor_ != nullptr) this->sleep_sensor_->publish_state(this->sleep_stage_);
-  if (this->mode_sensor_ != nullptr) this->mode_sensor_->publish_state(nib & 0x0F);
-#endif
-
-#ifdef USE_TEXT_SENSOR
-  // Текстовый статус питания
-  if (this->power_status_text_sensor_ != nullptr) this->power_status_text_sensor_->publish_state(this->power_on_ ? "ON" : "OFF");
-#endif
-
   // Turbo/Eco/Quiet/LED
   uint8_t b35 = bytes[35];
   this->turbo_ = (b35 & 0b00000010) != 0;       // turbo_mask = 0b00000010
@@ -438,25 +423,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   else if (updown) this->swing_ = climate::CLIMATE_SWING_VERTICAL;
   else if (leftright) this->swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else this->swing_ = climate::CLIMATE_SWING_OFF;
-
-#ifdef USE_SENSOR
-  // Флаги и качание как бинарные числовые сенсоры (0/1)
-  if (this->quiet_sensor_ != nullptr) this->quiet_sensor_->publish_state(this->quiet_ ? 1 : 0);
-  if (this->turbo_sensor_ != nullptr) this->turbo_sensor_->publish_state(this->turbo_ ? 1 : 0);
-  if (this->led_sensor_ != nullptr)   this->led_sensor_->publish_state(this->led_ ? 1 : 0);
-  if (this->eco_sensor_ != nullptr)   this->eco_sensor_->publish_state(this->eco_ ? 1 : 0);
-  if (this->swing_updown_sensor_ != nullptr)    this->swing_updown_sensor_->publish_state(updown ? 1 : 0);
-  if (this->swing_leftright_sensor_ != nullptr) this->swing_leftright_sensor_->publish_state(leftright ? 1 : 0);
-#endif
-
-#ifdef USE_SENSOR
-  // Наружные температуры и частоты компрессора (байты 42..45)
-  if (this->compr_freq_set_sensor_ != nullptr) this->compr_freq_set_sensor_->publish_state(bytes[42]);
-  if (this->compr_freq_sensor_ != nullptr)     this->compr_freq_sensor_->publish_state(bytes[43]);
-  if (this->outdoor_temp_sensor_ != nullptr)   this->outdoor_temp_sensor_->publish_state(bytes[44]);
-  if (this->outdoor_cond_temp_sensor_ != nullptr) this->outdoor_cond_temp_sensor_->publish_state(bytes[45]);
-#endif
-  // === конец добавленных публикаций ===
 
   // Публикуем
   this->mode = this->power_on_ ? this->mode_ : climate::CLIMATE_MODE_OFF;
