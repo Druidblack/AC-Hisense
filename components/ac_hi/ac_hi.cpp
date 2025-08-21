@@ -35,6 +35,15 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   }
 }
 
+// ---- ACHILEDTargetSwitch ----
+void ACHILEDTargetSwitch::write_state(bool state) {
+  // Forward the desired LED state to the climate parent and acknowledge
+  if (this->parent_ != nullptr) {
+    this->parent_->set_desired_led(state);
+  }
+  this->publish_state(state);
+}
+
 void ACHIClimate::setup() {
   // Initialize default HA visible state
   this->mode = climate::CLIMATE_MODE_OFF;
@@ -42,7 +51,7 @@ void ACHIClimate::setup() {
   this->fan_mode = climate::CLIMATE_FAN_AUTO;
   this->swing_mode = climate::CLIMATE_SWING_OFF;
 
-  // Initialize desired_* to match current defaults, so signatures start aligned
+  // Initialize desired_* to match defaults
   d_power_on_     = false;
   d_mode_         = climate::CLIMATE_MODE_OFF;
   d_target_c_     = 24;
@@ -51,15 +60,17 @@ void ACHIClimate::setup() {
   d_turbo_        = false;
   d_eco_          = false;
   d_quiet_        = false;
-  d_led_          = true;
+  d_led_          = true;   // default ON
   d_sleep_stage_  = 0;
 
-  // Ensure actual state default is consistent with class member defaults
   recalc_desired_sig_();
   recalc_actual_sig_();
 
+  // Publish initial states
   this->publish_state();
-  ESP_LOGV(TAG, "Setup completed: defaults published (mode=OFF, target=24°C, fan=AUTO, swing=OFF)");
+  update_led_switch_state_();
+
+  ESP_LOGV(TAG, "Setup completed: defaults published (mode=OFF, target=24°C, fan=AUTO, swing=OFF, desired_led=ON)");
 }
 
 void ACHIClimate::update() {
@@ -225,6 +236,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     else this->preset = climate::CLIMATE_PRESET_NONE;
   }
   this->publish_state();
+  update_led_switch_state_();
 }
 
 // ---- Field encoding (no mapping changes) ----
@@ -495,11 +507,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &bytes) {
   // Recalculate actual control signature after parsing
   recalc_actual_sig_();
 
-  // Publish HA-visible state with gating:
-  // - If accept_remote_changes_ == true -> publish ACTUAL (remote changes allowed)
-  //   and sync desired_* to actual_* (so future enforcement won't fight old HA target)
-  // - If accept_remote_changes_ == false -> publish DESIRED (but sensors updated)
+  // Publish HA-visible state with gating and keep LED switch in sync
   publish_gated_state_();
+  update_led_switch_state_();
 
   ESP_LOGV(TAG,
            "Parsed STATUS: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%u°C, sleep_stage=%u, flags{eco=%s,turbo=%s,quiet=%s,led=%s}",
@@ -577,7 +587,7 @@ void ACHIClimate::publish_gated_state_() {
       else if (this->sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
       else this->preset = climate::CLIMATE_PRESET_NONE;
     }
-    // IMPORTANT: when remote changes are accepted, mirror desired_* to actual_*
+    // When remote changes are accepted, mirror desired_* to actual_*
     d_power_on_    = power_on_;
     d_mode_        = mode_;
     d_target_c_    = target_c_;
@@ -586,7 +596,7 @@ void ACHIClimate::publish_gated_state_() {
     d_eco_         = eco_;
     d_turbo_       = turbo_;
     d_quiet_       = quiet_;
-    d_led_         = led_;          // keep desired LED equal to actual; LED is excluded from signature
+    d_led_         = led_;
     d_sleep_stage_ = sleep_stage_;
     recalc_desired_sig_();
   } else {
@@ -605,11 +615,18 @@ void ACHIClimate::publish_gated_state_() {
   this->publish_state();
 }
 
+void ACHIClimate::update_led_switch_state_() {
+  if (led_switch_ == nullptr) return;
+  // Show desired if enforcing, otherwise desired==actual (synced above)
+  bool to_publish = d_led_;
+  led_switch_->publish_state(to_publish);
+}
+
 uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMode mode,
                                                  climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
-                                                 bool eco, bool turbo, bool quiet,
+                                                 bool eco, bool turbo, bool quiet, bool led,
                                                  uint8_t sleep_stage, uint8_t target_c) const {
-  // FNV-1a over normalized control fields (exclude sensor bytes and LED)
+  // FNV-1a over normalized control fields (include LED; exclude sensor bytes)
   uint32_t h = 2166136261u;
   auto mix = [&h](uint32_t x) {
     h ^= x;
@@ -622,6 +639,7 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
   mix(eco ? 1u : 0u);
   mix(turbo ? 1u : 0u);
   mix(quiet ? 1u : 0u);
+  mix(led ? 1u : 0u);
   mix(static_cast<uint32_t>(sleep_stage & 0x0Fu));
   mix(static_cast<uint32_t>(std::max<uint8_t>(16, std::min<uint8_t>(30, target_c))));
   return h;
@@ -629,12 +647,12 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
 
 void ACHIClimate::recalc_desired_sig_() {
   desired_sig_ = compute_control_signature_(d_power_on_, d_mode_, d_fan_, d_swing_,
-                                            d_eco_, d_turbo_, d_quiet_, d_sleep_stage_, d_target_c_);
+                                            d_eco_, d_turbo_, d_quiet_, d_led_, d_sleep_stage_, d_target_c_);
 }
 
 void ACHIClimate::recalc_actual_sig_() {
   actual_sig_ = compute_control_signature_(power_on_, mode_, fan_, swing_,
-                                           eco_, turbo_, quiet_, sleep_stage_, target_c_);
+                                           eco_, turbo_, quiet_, led_, sleep_stage_, target_c_);
 }
 
 void ACHIClimate::maybe_force_to_target_() {
@@ -652,7 +670,8 @@ void ACHIClimate::maybe_force_to_target_() {
   log_sig_diff_();
 
   if (!writing_lock_) {
-    ESP_LOGD(TAG, "Enforcing desired HA state (sig_actual=0x%08X != sig_desired=0x%08X) -> WRITE", (unsigned) actual_sig_, (unsigned) desired_sig_);
+    ESP_LOGD(TAG, "Enforcing desired HA state (sig_actual=0x%08X != sig_desired=0x%08X) -> WRITE",
+             (unsigned) actual_sig_, (unsigned) desired_sig_);
     build_tx_from_desired_();
     writing_lock_ = true;
     pending_write_ = true;
@@ -672,10 +691,27 @@ void ACHIClimate::log_sig_diff_() const {
   if (eco_ != d_eco_) ESP_LOGV(TAG, "DIFF eco: actual=%s desired=%s", b2s(eco_), b2s(d_eco_));
   if (turbo_ != d_turbo_) ESP_LOGV(TAG, "DIFF turbo: actual=%s desired=%s", b2s(turbo_), b2s(d_turbo_));
   if (quiet_ != d_quiet_) ESP_LOGV(TAG, "DIFF quiet: actual=%s desired=%s", b2s(quiet_), b2s(d_quiet_));
-  // LED is intentionally excluded from signature and does not prevent convergence
-  if (led_ != d_led_) ESP_LOGV(TAG, "DIFF led (ignored for convergence): actual=%s desired=%s", b2s(led_), b2s(d_led_));
+  if (led_ != d_led_) ESP_LOGV(TAG, "DIFF led: actual=%s desired=%s", b2s(led_), b2s(d_led_));
   if (sleep_stage_ != d_sleep_stage_) ESP_LOGV(TAG, "DIFF sleep_stage: actual=%u desired=%u", (unsigned) sleep_stage_, (unsigned) d_sleep_stage_);
   if (target_c_ != d_target_c_) ESP_LOGV(TAG, "DIFF target_c: actual=%u desired=%u", (unsigned) target_c_, (unsigned) d_target_c_);
+}
+
+// ---- External control from LED switch ----
+void ACHIClimate::set_desired_led(bool on) {
+  d_led_ = on;
+
+  // HA takes priority now; enforce target LED along with other desired fields
+  accept_remote_changes_ = false;
+  ha_priority_active_ = true;
+
+  build_tx_from_desired_();
+  writing_lock_ = true;
+  pending_write_ = true;
+
+  recalc_desired_sig_();
+
+  ESP_LOGV(TAG, "LED switch: desired_led=%s -> WRITE", on ? "ON" : "OFF");
+  send_write_changes_();
 }
 
 // ---- Logging helpers ----

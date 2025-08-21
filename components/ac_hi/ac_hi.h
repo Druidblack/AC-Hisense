@@ -4,6 +4,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"  // esphome::millis()
+#include "esphome/components/switch/switch.h"  // LED target switch
 
 // Include sensor header only if the sensor platform is actually present in the build
 #ifdef USE_SENSOR
@@ -23,6 +24,21 @@ class Sensor;  // forward declaration if USE_SENSOR is not defined
 
 namespace esphome {
 namespace ac_hi {
+
+class ACHIClimate;  // forward
+
+// Simple switch entity that controls desired LED flag inside ACHIClimate
+class ACHILEDTargetSwitch : public switch_::Switch {
+ public:
+  void set_parent(ACHIClimate *p) { parent_ = p; }
+
+ protected:
+  // Called by HA when the user toggles the switch
+  void write_state(bool state) override;
+
+ private:
+  ACHIClimate *parent_{nullptr};
+};
 
 // Hisense frames:
 // Header: 0xF4 0xF5
@@ -50,6 +66,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_pipe_sensor(void *) {}
 #endif
 
+  // Link LED target switch
+  void set_led_switch(ACHILEDTargetSwitch *s) { led_switch_ = s; if (led_switch_) led_switch_->set_parent(this); }
+
   void setup() override;
   void loop() override;
   void update() override;
@@ -57,6 +76,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Climate API
   void control(const climate::ClimateCall &call) override;
   climate::ClimateTraits traits() override;
+
+  // Called by ACHILEDTargetSwitch to change desired LED
+  void set_desired_led(bool on);
 
  protected:
   // ---- Protocol/transport ----
@@ -75,12 +97,13 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // --- Priority/authority helpers ---
   void build_tx_from_desired_();   // build tx_bytes_ from desired_* fields (no mapping/proto change)
   void publish_gated_state_();     // publish either desired or actual into HA, sensors always actual
+  void update_led_switch_state_(); // publish LED switch state according to gating
   void maybe_force_to_target_();   // enforce desired state while HA priority is active
 
-  // Control signature ignores sensor bytes and LED (LED is non-critical and may not be echoed)
+  // Control signature includes LED and excludes sensor-only bytes
   uint32_t compute_control_signature_(bool power, climate::ClimateMode mode,
                                       climate::ClimateFanMode fan, climate::ClimateSwingMode swing,
-                                      bool eco, bool turbo, bool quiet,
+                                      bool eco, bool turbo, bool quiet, bool led,
                                       uint8_t sleep_stage, uint8_t target_c) const;
   void recalc_desired_sig_();
   void recalc_actual_sig_();
@@ -99,7 +122,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
       0x65, 0x00, 0x00, 0x00, // 0..16
       0x00, // [17] sleep
       0x00, // [18] power+mode
-      0x00, // [19] set temp (°C, direct when decoded on RX; TX uses encode_temp_)
+      0x00, // [19] set temp (°C, direct)
       0x00, // [20] current temp (RO)
       0x00, // [21] pipe temp (RO)
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 22..29
@@ -145,14 +168,14 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool d_turbo_{false};
   bool d_eco_{false};
   bool d_quiet_{false};
-  bool d_led_{true};
+  bool d_led_{true};  // default ON as requested
   uint8_t d_sleep_stage_{0};
 
   // Acceptance/priority flags
   bool accept_remote_changes_{true};  // when true: apply remote (status) mode changes to HA
   bool ha_priority_active_{false};    // when true: keep enforcing desired_* until matched
 
-  // Signatures (control-only hash; LED excluded)
+  // Signatures (control-only hash; LED included)
   uint32_t desired_sig_{0};
   uint32_t actual_sig_{0};
 
@@ -166,6 +189,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void *pipe_sensor_{nullptr};
 #endif
 
+  // Optional LED target switch
+  ACHILEDTargetSwitch *led_switch_{nullptr};
+
   // Flags
   bool enable_presets_{true};
 
@@ -175,7 +201,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // ---- Field encoders ----
   uint8_t encode_temp_(uint8_t c) {
-    // TX setpoint encoding (protocol specific): (value<<1) | 1
     return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
   }
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
