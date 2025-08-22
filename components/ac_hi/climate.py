@@ -13,7 +13,7 @@ CONF_ENABLE_PRESETS = "enable_presets"
 CONF_PIPE_TEMPERATURE = "pipe_temperature"
 CONF_LED_SWITCH = "led_switch"
 
-# New sensor keys
+# Existing optional sensor keys
 CONF_SET_TEMPERATURE = "set_temperature"
 CONF_ROOM_TEMPERATURE = "room_temperature"
 CONF_WIND = "wind"
@@ -30,11 +30,21 @@ CONF_COMP_FR = "compressor_frequency"
 CONF_OUTDOOR_TEMP = "outdoor_temperature"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
 
+# New memory diagnostics sensor keys
+CONF_HEAP_FREE = "heap_free"
+CONF_HEAP_TOTAL = "heap_total"
+CONF_HEAP_USED = "heap_used"
+CONF_HEAP_MIN_FREE = "heap_min_free"
+CONF_HEAP_MAX_ALLOC = "heap_max_alloc"
+CONF_HEAP_FRAGMENTATION = "heap_fragmentation"
+CONF_PSRAM_TOTAL = "psram_total"
+CONF_PSRAM_FREE = "psram_free"
+
 CONFIG_SCHEMA = climate.CLIMATE_SCHEMA.extend({
     cv.GenerateID(): cv.declare_id(ACHIClimate),
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
 
-    # Optional sensors you requested
+    # Optional sensors (existing)
     cv.Optional(CONF_SET_TEMPERATURE): sensor.sensor_schema(),
     cv.Optional(CONF_ROOM_TEMPERATURE): sensor.sensor_schema(),
     cv.Optional(CONF_WIND): sensor.sensor_schema(),
@@ -59,6 +69,17 @@ CONFIG_SCHEMA = climate.CLIMATE_SCHEMA.extend({
         icon=ICON_LIGHTBULB,
         entity_category=ENTITY_CATEGORY_CONFIG,
     ),
+
+    # New memory diagnostics sensors (all optional)
+    cv.Optional(CONF_HEAP_FREE): sensor.sensor_schema(),
+    cv.Optional(CONF_HEAP_TOTAL): sensor.sensor_schema(),
+    cv.Optional(CONF_HEAP_USED): sensor.sensor_schema(),
+    cv.Optional(CONF_HEAP_MIN_FREE): sensor.sensor_schema(),
+    cv.Optional(CONF_HEAP_MAX_ALLOC): sensor.sensor_schema(),
+    cv.Optional(CONF_HEAP_FRAGMENTATION): sensor.sensor_schema(),
+    cv.Optional(CONF_PSRAM_TOTAL): sensor.sensor_schema(),
+    cv.Optional(CONF_PSRAM_FREE): sensor.sensor_schema(),
+
 }).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("1s"))
 
 async def to_code(config):
@@ -71,7 +92,7 @@ async def to_code(config):
 
     cg.add(var.set_enable_presets(config[CONF_ENABLE_PRESETS]))
 
-    # Optional numeric sensors
+    # Optional numeric sensors (existing)
     if conf := config.get(CONF_SET_TEMPERATURE):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_set_temperature_sensor(sens))
@@ -142,3 +163,36 @@ async def to_code(config):
     if led_sw_conf := config.get(CONF_LED_SWITCH):
         led_sw = await switch.new_switch(led_sw_conf)
         cg.add(var.set_led_switch(led_sw))
+
+    # New memory diagnostics sensors (optional)
+    if conf := config.get(CONF_HEAP_FREE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_free_sensor(sens))
+
+    if conf := config.get(CONF_HEAP_TOTAL):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_total_sensor(sens))
+
+    if conf := config.get(CONF_HEAP_USED):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_used_sensor(sens))
+
+    if conf := config.get(CONF_HEAP_MIN_FREE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_min_free_sensor(sens))
+
+    if conf := config.get(CONF_HEAP_MAX_ALLOC):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_max_alloc_sensor(sens))
+
+    if conf := config.get(CONF_HEAP_FRAGMENTATION):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_heap_fragmentation_sensor(sens))
+
+    if conf := config.get(CONF_PSRAM_TOTAL):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_psram_total_sensor(sens))
+
+    if conf := config.get(CONF_PSRAM_FREE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_psram_free_sensor(sens))

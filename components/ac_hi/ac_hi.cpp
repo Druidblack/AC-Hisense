@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <string>
 #include <cstdio>   // snprintf
+#include <Arduino.h>  // ESP heap APIs
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -118,6 +119,9 @@ void ACHIClimate::loop() {
 
   // Try to extract frames within time/quantity budget
   this->try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
+
+  // Publish memory diagnostics at a low frequency (does not affect protocol)
+  this->publish_memory_diagnostics_();
 }
 
 climate::ClimateTraits ACHIClimate::traits() {
@@ -770,6 +774,59 @@ void ACHIClimate::log_frame_(const char *prefix, const std::vector<uint8_t> &b) 
     ESP_LOGV(TAG, "%s", line);
     i += chunk;
   }
+}
+
+// ---- Memory diagnostics (optional sensors) ----
+void ACHIClimate::publish_memory_diagnostics_() {
+#ifdef USE_SENSOR
+  static uint32_t last_ms = 0;
+  const uint32_t now = esphome::millis();
+  if (now - last_ms < MEM_PUBLISH_INTERVAL_MS) return;
+  last_ms = now;
+
+  // Gather metrics with best-effort portability (no impact on AC protocol)
+  size_t heap_free = 0, heap_total = 0, heap_used = 0, heap_min_free = 0, heap_max_alloc = 0;
+  int heap_frag_pct = -1;
+  size_t psram_total = 0, psram_free = 0;
+
+#if defined(ARDUINO_ARCH_ESP32)
+  heap_total     = ESP.getHeapSize();
+  heap_free      = ESP.getFreeHeap();
+  heap_min_free  = ESP.getMinFreeHeap();
+  heap_max_alloc = ESP.getMaxAllocHeap();
+  psram_total    = ESP.getPsramSize();
+  psram_free     = ESP.getFreePsram();
+  // Approximate fragmentation as (1 - largest_block / free) * 100
+  if (heap_free > 0 && heap_max_alloc > 0) {
+    double ratio = 1.0 - static_cast<double>(heap_max_alloc) / static_cast<double>(heap_free);
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    heap_frag_pct = static_cast<int>(std::lround(ratio * 100.0));
+  } else {
+    heap_frag_pct = 0;
+  }
+#elif defined(ARDUINO_ARCH_ESP8266)
+  heap_free      = ESP.getFreeHeap();
+  heap_max_alloc = ESP.getMaxFreeBlockSize();
+  heap_frag_pct  = ESP.getHeapFragmentation(); // 0..100
+  // No reliable total heap API on ESP8266; leave heap_total/used unknown.
+#endif
+
+  if (heap_total > 0 && heap_total >= heap_free) heap_used = heap_total - heap_free;
+
+  // Publish to sensors if configured; skip metrics that are not available on this arch.
+  if (heap_free_sensor_ != nullptr) heap_free_sensor_->publish_state(static_cast<float>(heap_free));
+  if (heap_total_sensor_ != nullptr && heap_total > 0) heap_total_sensor_->publish_state(static_cast<float>(heap_total));
+  if (heap_used_sensor_  != nullptr && heap_total > 0) heap_used_sensor_->publish_state(static_cast<float>(heap_used));
+  if (heap_min_free_sensor_ != nullptr && heap_min_free > 0) heap_min_free_sensor_->publish_state(static_cast<float>(heap_min_free));
+  if (heap_max_alloc_sensor_ != nullptr && heap_max_alloc > 0) heap_max_alloc_sensor_->publish_state(static_cast<float>(heap_max_alloc));
+  if (heap_fragmentation_sensor_ != nullptr && heap_frag_pct >= 0) heap_fragmentation_sensor_->publish_state(static_cast<float>(heap_frag_pct));
+  if (psram_total_sensor_ != nullptr && psram_total > 0) psram_total_sensor_->publish_state(static_cast<float>(psram_total));
+  if (psram_free_sensor_  != nullptr && psram_total > 0) psram_free_sensor_->publish_state(static_cast<float>(psram_free));
+
+#else
+  (void)0; // sensors not compiled-in; do nothing
+#endif
 }
 
 } // namespace ac_hi

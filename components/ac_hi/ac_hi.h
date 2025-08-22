@@ -68,6 +68,9 @@ static constexpr size_t RX_BUFFER_RESERVE  = 2048; // pre-reserved capacity for 
 static constexpr size_t MAX_FRAME_BYTES    = 96;   // generous upper bound (> typical ~50B)
 static constexpr size_t LOG_BYTES_PER_LINE = 24;   // chunk size for hex dump logging
 
+// Memory metrics publish interval (keep it low to reduce noise/overhead)
+static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000;
+
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
  public:
   ACHIClimate() = default;
@@ -99,6 +102,16 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_compr_freq_sensor(sensor::Sensor *s) { compressor_freq_sensor_ = s; }
   void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
+
+  // New: memory diagnostics sensors
+  void set_heap_free_sensor(sensor::Sensor *s) { heap_free_sensor_ = s; }
+  void set_heap_total_sensor(sensor::Sensor *s) { heap_total_sensor_ = s; }
+  void set_heap_used_sensor(sensor::Sensor *s) { heap_used_sensor_ = s; }
+  void set_heap_min_free_sensor(sensor::Sensor *s) { heap_min_free_sensor_ = s; }
+  void set_heap_max_alloc_sensor(sensor::Sensor *s) { heap_max_alloc_sensor_ = s; }
+  void set_heap_fragmentation_sensor(sensor::Sensor *s) { heap_fragmentation_sensor_ = s; }
+  void set_psram_total_sensor(sensor::Sensor *s) { psram_total_sensor_ = s; }
+  void set_psram_free_sensor(sensor::Sensor *s) { psram_free_sensor_ = s; }
 #endif
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
@@ -143,6 +156,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void recalc_desired_sig_();
   void recalc_actual_sig_();
   void log_sig_diff_() const;      // verbose: which control fields differ (for debugging only)
+
+  // Memory diagnostics publish helper (no protocol impact)
+  void publish_memory_diagnostics_();
 
   // Incoming stream buffer (sliding window: rx_start_ — offset of data start)
   std::vector<uint8_t> rx_;
@@ -243,6 +259,16 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *compressor_freq_sensor_{nullptr};
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
+
+  // New: memory diagnostics sensors
+  sensor::Sensor *heap_free_sensor_{nullptr};
+  sensor::Sensor *heap_total_sensor_{nullptr};
+  sensor::Sensor *heap_used_sensor_{nullptr};
+  sensor::Sensor *heap_min_free_sensor_{nullptr};
+  sensor::Sensor *heap_max_alloc_sensor_{nullptr};
+  sensor::Sensor *heap_fragmentation_sensor_{nullptr};
+  sensor::Sensor *psram_total_sensor_{nullptr};
+  sensor::Sensor *psram_free_sensor_{nullptr};
 #endif
 
   // Optional text sensor (power status ON/OFF)
