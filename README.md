@@ -45,8 +45,6 @@ external_components:
     components: [ ac_hi ]
 ```
 
-Replace the URL with the actual repository location.
-
 ## Example configuration
 
 A minimal configuration with all optional sensors and switches:
