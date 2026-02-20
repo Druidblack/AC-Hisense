@@ -1,5 +1,7 @@
 # ESPHome AC component for Hisense/Ballu (RS-485)
 
+<img width="1381" height="913" alt="Interface preview" src="https://github.com/user-attachments/assets/5b765094-464f-4cfc-8cbe-eecd8c11de7c" />
+
 This custom component provides full climate control for air conditioners manufactured by Hisense and its OEM brands (Ballu, etc.) that use the RS-485 protocol. It has been tested on **Ballu iGreen Pro (BSAGI-12HN8)** and should work with many other models.
 
 The component exposes a standard Home Assistant Climate entity, along with a set of optional sensors and switches to access all advanced features of the AC (turbo, eco, quiet, sleep, swing, LED, etc.).
@@ -209,6 +211,9 @@ climate:
 ```
 
 ## Entities provided
+
+<img width="1361" height="812" alt="Interface preview" src="https://github.com/user-attachments/assets/eb84a052-c4aa-41c9-9f14-46581e9eddc6" />
+
 
 ### Climate (`climate`)
 
