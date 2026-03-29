@@ -8,6 +8,7 @@ namespace esphome {
 namespace ac_hi {
 
 static const char *const TAG = "ac_hi";
+static const char *const CUSTOM_PRESET_QUIET = "Quiet";
 
 // ---- Local helpers for mode encoding/decoding ----
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
@@ -144,6 +145,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   if (enable_presets_) {
     t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
                              climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
+    t.set_supported_custom_presets({CUSTOM_PRESET_QUIET});
   }
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
@@ -155,6 +157,7 @@ climate::ClimateTraits ACHIClimate::traits() {
 // ---- Control from HA ----
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
+  bool was_power_on = d_power_on_;
 
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
@@ -164,6 +167,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     } else {
       d_power_on_ = true;
       d_mode_ = m;
+      if (!was_power_on) {
+        // Match remote behavior: powering on restores the front display LED.
+        d_led_ = true;
+      }
     }
     changed = true;
   }
@@ -191,10 +198,50 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
-    d_eco_ = (p == climate::CLIMATE_PRESET_ECO);
-    d_turbo_ = (p == climate::CLIMATE_PRESET_BOOST);
-    d_sleep_stage_ = (p == climate::CLIMATE_PRESET_SLEEP) ? 1 : 0;
+
+    d_eco_ = false;
+    d_turbo_ = false;
+    d_sleep_stage_ = 0;
+
+    if (p == climate::CLIMATE_PRESET_ECO) {
+      d_eco_ = true;
+      d_quiet_ = false;
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+    } else if (p == climate::CLIMATE_PRESET_BOOST) {
+      d_turbo_ = true;
+      d_quiet_ = false;
+      if (d_mode_ == climate::CLIMATE_MODE_HEAT) {
+        d_target_c_ = 30;
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+      } else {
+        d_target_c_ = 16;
+        d_fan_ = climate::CLIMATE_FAN_HIGH;
+      }
+    } else if (p == climate::CLIMATE_PRESET_SLEEP) {
+      d_sleep_stage_ = 1;
+      d_quiet_ = false;
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+    } else if (p == climate::CLIMATE_PRESET_NONE) {
+      d_quiet_ = false;
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+    }
+
     changed = true;
+  }
+
+  if (call.has_custom_preset()) {
+    auto custom = call.get_custom_preset();
+    if (custom == CUSTOM_PRESET_QUIET) {
+      d_quiet_ = true;
+      d_turbo_ = false;
+      d_eco_ = false;
+      d_sleep_stage_ = 0;
+      d_fan_ = climate::CLIMATE_FAN_QUIET;
+      changed = true;
+    }
   }
 
   if (!changed) return;
@@ -211,10 +258,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   this->fan_mode = d_fan_;
   this->swing_mode = d_swing_;
   if (enable_presets_) {
-    if (d_turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-    else if (d_eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-    else if (d_sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-    else this->preset = climate::CLIMATE_PRESET_NONE;
+    if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+    else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+    else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+    else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+    else this->set_preset_(climate::CLIMATE_PRESET_NONE);
   }
   publish_state();
   update_led_switch_state_();
@@ -419,6 +467,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     else if (raw_wind == 12) fan_ = climate::CLIMATE_FAN_LOW;
     else if (raw_wind == 14) fan_ = climate::CLIMATE_FAN_MEDIUM;
     else if (raw_wind == 16) fan_ = climate::CLIMATE_FAN_HIGH;
+    else if (raw_wind == 18) fan_ = climate::CLIMATE_FAN_AUTO;  // turbo-specific code, refined below after flags are parsed
     else fan_ = climate::CLIMATE_FAN_AUTO;
   } else {
     fan_ = climate::CLIMATE_FAN_AUTO;   // when off, fan mode is irrelevant
@@ -457,6 +506,12 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   eco_   = (features & ECO_MASK) != 0;
   quiet_ = (b[IDX_RX_QUIET] & QUIET_MASK) != 0;   // byte 36 in status frame
   led_   = (b[IDX_RX_LED] & LED_MASK) != 0;       // byte 37 in status frame
+
+  // Turbo uses a dedicated fan code on this platform.
+  if (turbo_ && raw_wind == 18) {
+    fan_ = (mode_ == climate::CLIMATE_MODE_HEAT) ? climate::CLIMATE_FAN_AUTO
+                                                 : climate::CLIMATE_FAN_HIGH;
+  }
 
   // Swing
   bool updown = (features & UPDOWN_MASK) != 0;
@@ -535,10 +590,11 @@ void ACHIClimate::publish_gated_state_() {
     this->fan_mode = fan_;
     this->swing_mode = swing_;
     if (enable_presets_) {
-      if (turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-      else if (eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-      else if (sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-      else this->preset = climate::CLIMATE_PRESET_NONE;
+      if (turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+      else if (eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+      else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+      else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
     // Sync desired with actual
     d_power_on_    = power_on_;
@@ -559,10 +615,11 @@ void ACHIClimate::publish_gated_state_() {
     this->fan_mode = d_fan_;
     this->swing_mode = d_swing_;
     if (enable_presets_) {
-      if (d_turbo_) this->preset = climate::CLIMATE_PRESET_BOOST;
-      else if (d_eco_) this->preset = climate::CLIMATE_PRESET_ECO;
-      else if (d_sleep_stage_ > 0) this->preset = climate::CLIMATE_PRESET_SLEEP;
-      else this->preset = climate::CLIMATE_PRESET_NONE;
+      if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+      else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+      else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+      else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
   }
   publish_state();
