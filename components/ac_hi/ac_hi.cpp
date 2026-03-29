@@ -232,8 +232,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     changed = true;
   }
 
-  if (call.has_custom_preset()) {
-    auto custom = call.get_custom_preset();
+  auto custom = call.get_custom_preset();
+  if (!custom.empty()) {
     if (custom == CUSTOM_PRESET_QUIET) {
       d_quiet_ = true;
       d_turbo_ = false;
