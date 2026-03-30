@@ -14,6 +14,11 @@ static const char *const CUSTOM_PRESET_QUIET = "Quiet";
 static uint8_t g_pre_turbo_target_c = 24;
 static bool g_has_pre_turbo_target = false;
 
+// Restore previous ECO state after ECO is turned off from HA.
+static uint8_t g_pre_eco_target_c = 24;
+static climate::ClimateFanMode g_pre_eco_fan = climate::CLIMATE_FAN_AUTO;
+static bool g_has_pre_eco_state = false;
+
 // ---- Local helpers for mode encoding/decoding ----
 static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
   switch (nib & 0x0F) {
@@ -66,6 +71,10 @@ void ACHIClimate::setup() {
   
   g_pre_turbo_target_c = d_target_c_;
   g_has_pre_turbo_target = false;
+
+  g_pre_eco_target_c = d_target_c_;
+  g_pre_eco_fan = d_fan_;
+  g_has_pre_eco_state = false;
 
   recalc_desired_sig_();
   recalc_actual_sig_();
@@ -206,6 +215,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
+    bool was_eco = d_eco_;
 
     d_eco_ = false;
     d_turbo_ = false;
@@ -217,16 +227,27 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     }
 
     if (p == climate::CLIMATE_PRESET_ECO) {
+      if (!was_eco) {
+        g_pre_eco_target_c = d_target_c_;
+        g_pre_eco_fan = d_fan_;
+        g_has_pre_eco_state = true;
+      }
+
       d_eco_ = true;
+      d_turbo_ = false;
+      d_sleep_stage_ = 0;
+
+      // Match the behavior observed when ECO is enabled from the remote:
+      // target temperature becomes 24°C and fan becomes QUIET.
+      d_target_c_ = 24;
+      d_fan_ = climate::CLIMATE_FAN_QUIET;
       d_quiet_ = false;
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
-        d_fan_ = climate::CLIMATE_FAN_AUTO;
     } else if (p == climate::CLIMATE_PRESET_BOOST) {
       if (!was_turbo) {
         g_pre_turbo_target_c = d_target_c_;
         g_has_pre_turbo_target = true;
       }
-		
+
       d_turbo_ = true;
       d_quiet_ = false;
       if (d_mode_ == climate::CLIMATE_MODE_HEAT) {
@@ -247,8 +268,14 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         g_has_pre_turbo_target = false;
       }
 
+      if (was_eco && g_has_pre_eco_state) {
+        d_target_c_ = g_pre_eco_target_c;
+        d_fan_ = g_pre_eco_fan;
+        g_has_pre_eco_state = false;
+      }
+
       d_quiet_ = false;
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET)
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco)
         d_fan_ = climate::CLIMATE_FAN_AUTO;
     }
 
