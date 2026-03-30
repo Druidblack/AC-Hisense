@@ -1,4 +1,4 @@
-# ESPHome AC component for Hisense/Ballu (RS-485)
+# ESPHome AC component for Hisense, AS-13UW4RYRCM04G/04W (CITY DC Inv) (RS-485)
 
 <img width="1381" height="913" alt="Interface preview" src="https://github.com/user-attachments/assets/5b765094-464f-4cfc-8cbe-eecd8c11de7c" />
 
