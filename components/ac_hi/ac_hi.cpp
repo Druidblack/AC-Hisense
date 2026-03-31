@@ -145,7 +145,6 @@ void ACHIClimate::loop() {
 // ---- Climate traits ----
 climate::ClimateTraits ACHIClimate::traits() {
   climate::ClimateTraits t{};
-  t.set_supports_action(false);
   t.set_supported_modes({
     climate::CLIMATE_MODE_OFF,
     climate::CLIMATE_MODE_COOL,
@@ -166,7 +165,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
   t.set_visual_temperature_step(1.0f);
-  t.set_supports_current_temperature(true);
+  t.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
   return t;
 }
 
@@ -283,8 +282,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   auto custom = call.get_custom_preset();
-  if (custom.has_value()) {
-    if (*custom == CUSTOM_PRESET_QUIET) {
+  if (!custom.empty()) {
+    if (custom == CUSTOM_PRESET_QUIET) {
       d_quiet_ = true;
       d_turbo_ = false;
       d_eco_ = false;
