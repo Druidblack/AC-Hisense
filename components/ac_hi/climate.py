@@ -9,6 +9,16 @@ ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 ACHIClimate = ac_hi_ns.class_("ACHIClimate", climate.Climate, cg.PollingComponent, uart.UARTDevice)
 ACHILEDTargetSwitch = ac_hi_ns.class_("ACHILEDTargetSwitch", switch.Switch)
 
+# ESPHome 2025.5+ uses climate.climate_schema(...), older versions still use CLIMATE_SCHEMA.
+if hasattr(climate, "climate_schema"):
+    BASE_CLIMATE_SCHEMA = climate.climate_schema(ACHIClimate)
+    BASE_CLIMATE_EXTRA = {}
+else:
+    BASE_CLIMATE_SCHEMA = climate.CLIMATE_SCHEMA
+    BASE_CLIMATE_EXTRA = {
+        cv.GenerateID(): cv.declare_id(ACHIClimate),
+    }
+
 CONF_ENABLE_PRESETS = "enable_presets"
 CONF_PIPE_TEMPERATURE = "pipe_temperature"
 CONF_LED_SWITCH = "led_switch"
@@ -40,8 +50,8 @@ CONF_HEAP_FRAGMENTATION = "heap_fragmentation"
 CONF_PSRAM_TOTAL = "psram_total"
 CONF_PSRAM_FREE = "psram_free"
 
-CONFIG_SCHEMA = climate.CLIMATE_SCHEMA.extend({
-    cv.GenerateID(): cv.declare_id(ACHIClimate),
+CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
+    **BASE_CLIMATE_EXTRA,
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
 
     # Optional sensors (existing)
