@@ -183,8 +183,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_power_on_ = true;
       d_mode_ = m;
       if (!was_power_on) {
-        // Match remote behavior: powering on restores the front display LED.
-        d_led_ = true;
+        // Match remote behavior: powering on restores the front display LED,
+        // but send the display command only when the display was actually off.
+        if (!d_led_) {
+          d_led_ = true;
+          led_command_pending_ = true;
+        }
       }
     }
     changed = true;
@@ -360,8 +364,15 @@ void ACHIClimate::build_tx_from_desired_() {
     tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
   }
 
-  // LED (byte 36)
-  tx_bytes_[IDX_TX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
+  // Display/LED command (byte 36).
+  // 0xC0/0x40 are explicit display ON/OFF actions. Sending 0xC0 with every
+  // normal climate command can suppress the indoor unit confirmation beep on
+  // some Hisense/Ballu units when the display is already on. Use 0x00 as a
+  // neutral value unless the LED switch/power-on logic explicitly requested
+  // a display change.
+  tx_bytes_[IDX_TX_LED] = led_command_pending_
+      ? (d_led_ ? TxValues::LED_ON : TxValues::LED_OFF)
+      : 0x00;
 }
 
 // ---- Send status query ----
@@ -382,6 +393,7 @@ void ACHIClimate::send_write_changes_() {
   flush();
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
+  led_command_pending_ = false;
 
   writing_lock_ = true;
   write_lock_time_ = millis();
@@ -771,6 +783,7 @@ void ACHIClimate::log_sig_diff_() const {
 // ---- External LED control ----
 void ACHIClimate::set_desired_led(bool on) {
   d_led_ = on;
+  led_command_pending_ = true;
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
   recalc_desired_sig_();

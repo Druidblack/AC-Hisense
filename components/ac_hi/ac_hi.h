@@ -212,6 +212,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool pending_control_{false};
   uint32_t last_control_ms_{0};
 
+  // Byte 36 in TX is an action-style display command, not a stable state field.
+  // Keep it neutral for normal climate writes so the front-panel buzzer is not suppressed
+  // when the display is already on. Set it only for explicit display/LED changes.
+  bool led_command_pending_{false};
+
   // Base write frame (template)
   std::vector<uint8_t> tx_bytes_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,
