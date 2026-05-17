@@ -51,9 +51,12 @@ void ACHILEDTargetSwitch::write_state(bool state) {
 // ---- ACHICommandSoundSwitch ----
 void ACHICommandSoundSwitch::write_state(bool state) {
   if (parent_ != nullptr) {
+    // Parent may reject OFF while the display is OFF, so let it publish
+    // the effective state instead of echoing the requested state here.
     parent_->set_command_sound_enabled(state);
+  } else {
+    publish_state(state);
   }
-  publish_state(state);
 }
 
 // ---- ACHIClimate implementation ----
@@ -781,6 +784,15 @@ void ACHIClimate::publish_gated_state_() {
 }
 
 void ACHIClimate::update_led_switch_state_() {
+  // Dependency: when the display switch is OFF, command sound must stay ON.
+  // With this indoor unit, keeping the display off during user climate commands
+  // requires sending LED_OFF, and that action can itself make the unit beep.
+  if (!d_led_ && !command_sound_enabled_) {
+    command_sound_enabled_ = true;
+    ESP_LOGD(TAG, "Command sound forced ON because display switch is OFF");
+    update_sound_switch_state_();
+  }
+
   if (led_switch_ == nullptr) return;
   led_switch_->publish_state(d_led_);
 }
@@ -916,6 +928,15 @@ void ACHIClimate::log_sig_diff_() const {
 // ---- External LED control ----
 void ACHIClimate::set_desired_led(bool on) {
   d_led_ = on;
+
+  // Dependency: turning the display OFF also turns command sound ON.
+  // This keeps HA from showing an unsupported combination for this protocol.
+  if (!on && !command_sound_enabled_) {
+    command_sound_enabled_ = true;
+    ESP_LOGD(TAG, "Command sound forced ON because display switch was turned OFF");
+    update_sound_switch_state_();
+  }
+
   led_command_pending_ = true;
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
@@ -933,6 +954,16 @@ void ACHIClimate::set_desired_led(bool on) {
 
 // ---- External command sound control ----
 void ACHIClimate::set_command_sound_enabled(bool on) {
+  if (!on && !d_led_) {
+    // The display is currently desired OFF. In this state user commands need
+    // LED_OFF to keep the panel dark, and LED_OFF is audible on this unit.
+    // Keep the sound switch ON so the UI reflects the real supported state.
+    command_sound_enabled_ = true;
+    update_sound_switch_state_();
+    ESP_LOGD(TAG, "Command sound stays ON while display switch is OFF");
+    return;
+  }
+
   command_sound_enabled_ = on;
   update_sound_switch_state_();
   ESP_LOGD(TAG, "Command sound: %s", on ? "ON" : "OFF");
