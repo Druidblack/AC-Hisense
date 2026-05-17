@@ -224,6 +224,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // re-send the display OFF command and make the indoor unit beep.
   bool led_command_pending_{false};
 
+  // Last raw fan/wind code from status frame. Some presets are acknowledged
+  // only indirectly via this code when the display is off.
+  uint8_t last_raw_wind_{0};
+
   // Base write frame (template)
   std::vector<uint8_t> tx_bytes_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,

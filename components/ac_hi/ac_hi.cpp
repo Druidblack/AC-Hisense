@@ -544,6 +544,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   // Fan speed
   uint8_t raw_wind = b[IDX_WIND];
+  last_raw_wind_ = raw_wind;
   if (power_on_) {
     if (raw_wind == 0 || raw_wind == 1 || raw_wind == 2) fan_ = climate::CLIMATE_FAN_AUTO;
     else if (raw_wind == 10) fan_ = climate::CLIMATE_FAN_QUIET;
@@ -676,29 +677,73 @@ void ACHIClimate::handle_ack_101_() {
 // ---- Gating and convergence ----
 void ACHIClimate::publish_gated_state_() {
   if (accept_remote_changes_) {
-    // Publish actual state (from AC)
+    // Publish actual state (from AC). Some Hisense units do not return explicit
+    // Turbo/ECO/Sleep/Quiet bits when the front display is off. They acknowledge
+    // those presets indirectly via target temperature and raw fan/wind code:
+    //   BOOST -> target 16/30 and raw wind 18
+    //   ECO   -> target 24 and raw wind 10
+    //   SLEEP -> previous target+1 and raw wind 10
+    // If the last HA-selected preset still matches that indirect state, keep it
+    // visible in HA instead of immediately publishing Preset=None on the next
+    // status frame.
+    bool out_turbo = turbo_;
+    bool out_eco = eco_;
+    bool out_quiet = quiet_;
+    uint8_t out_sleep_stage = sleep_stage_;
+    auto out_fan = fan_;
+
+    if (power_on_ && d_power_on_ && mode_ == d_mode_ && target_c_ == d_target_c_) {
+      if (d_turbo_ && last_raw_wind_ == 18) {
+        out_turbo = true;
+        out_eco = false;
+        out_quiet = false;
+        out_sleep_stage = 0;
+        out_fan = d_fan_;
+      } else if (d_eco_ && last_raw_wind_ == 10) {
+        out_turbo = false;
+        out_eco = true;
+        out_quiet = false;
+        out_sleep_stage = 0;
+        out_fan = d_fan_;
+      } else if (d_sleep_stage_ > 0 && last_raw_wind_ == 10) {
+        out_turbo = false;
+        out_eco = false;
+        out_quiet = false;
+        out_sleep_stage = d_sleep_stage_;
+        out_fan = d_fan_;
+      } else if (d_quiet_ && (quiet_ || fan_ == climate::CLIMATE_FAN_QUIET)) {
+        out_turbo = false;
+        out_eco = false;
+        out_quiet = true;
+        out_sleep_stage = 0;
+        out_fan = climate::CLIMATE_FAN_QUIET;
+      }
+    }
+
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = target_c_;
-    this->fan_mode = fan_;
+    this->fan_mode = out_fan;
     this->swing_mode = swing_;
     if (enable_presets_) {
-      if (turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
-      else if (eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-      else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
-      else if (quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+      if (out_turbo) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+      else if (out_eco) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+      else if (out_sleep_stage > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (out_quiet) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
-    // Sync desired with actual
+    // Sync desired with the effective published state, not only with raw flags.
+    // This keeps indirect display-off presets stable while still allowing real
+    // remote/HA changes to clear them when the indirect state no longer matches.
     d_power_on_    = power_on_;
     d_mode_        = mode_;
     d_target_c_    = target_c_;
-    d_fan_         = fan_;
+    d_fan_         = out_fan;
     d_swing_       = swing_;
-    d_eco_         = eco_;
-    d_turbo_       = turbo_;
-    d_quiet_       = quiet_;
+    d_eco_         = out_eco;
+    d_turbo_       = out_turbo;
+    d_quiet_       = out_quiet;
     d_led_         = led_;
-    d_sleep_stage_ = sleep_stage_;
+    d_sleep_stage_ = out_sleep_stage;
     recalc_desired_sig_();
   } else {
     // Publish desired state (while enforcing)
