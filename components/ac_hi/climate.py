@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import climate, uart, sensor, switch, text_sensor
-from esphome.const import CONF_ID, CONF_UART_ID, ENTITY_CATEGORY_CONFIG, ICON_LIGHTBULB
+from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, ENTITY_CATEGORY_CONFIG, ICON_LIGHTBULB
 
 AUTO_LOAD = ["climate", "uart", "sensor", "switch", "text_sensor"]
 
@@ -81,7 +81,9 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         icon=ICON_LIGHTBULB,
         entity_category=ENTITY_CATEGORY_CONFIG,
     ),
-    cv.Optional(CONF_SOUND_SWITCH): switch.switch_schema(
+    # Command sound switch is created by default. The user may still override its
+    # name/icon by specifying sound_switch: in YAML.
+    cv.Optional(CONF_SOUND_SWITCH, default={CONF_NAME: "AC Command Sound"}): switch.switch_schema(
         ACHICommandSoundSwitch,
         icon="mdi:volume-high",
         entity_category=ENTITY_CATEGORY_CONFIG,
