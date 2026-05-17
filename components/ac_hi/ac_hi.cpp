@@ -1,6 +1,7 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <Arduino.h>
 #include "esphome/core/log.h"
 
@@ -8,8 +9,50 @@ namespace esphome {
 namespace ac_hi {
 
 static const char *const TAG = "ac_hi";
-static const char *const CUSTOM_PRESET_QUIET = "Quiet";
-static const char *const CUSTOM_FAN_TURBO = "Turbo";
+static const char *const CUSTOM_PRESET_QUIET = "🔇 Тихий";
+
+// Fan modes are exposed as custom labels so Home Assistant can show a stable
+// Russian order and icon-like labels for Quiet/Turbo.
+static const char *const CUSTOM_FAN_QUIET = "🔇 Тихий";
+static const char *const CUSTOM_FAN_LOW = "Низкий";
+static const char *const CUSTOM_FAN_MEDIUM = "Средний";
+static const char *const CUSTOM_FAN_HIGH = "Высокий";
+static const char *const CUSTOM_FAN_TURBO = "🚀 Турбо";
+static const char *const CUSTOM_FAN_AUTO = "Авто";
+
+static bool decode_custom_fan_mode(const std::string &custom, climate::ClimateFanMode *fan, bool *turbo_fan) {
+  if (custom == CUSTOM_FAN_QUIET) {
+    *fan = climate::CLIMATE_FAN_QUIET;
+    *turbo_fan = false;
+    return true;
+  }
+  if (custom == CUSTOM_FAN_LOW) {
+    *fan = climate::CLIMATE_FAN_LOW;
+    *turbo_fan = false;
+    return true;
+  }
+  if (custom == CUSTOM_FAN_MEDIUM) {
+    *fan = climate::CLIMATE_FAN_MEDIUM;
+    *turbo_fan = false;
+    return true;
+  }
+  if (custom == CUSTOM_FAN_HIGH) {
+    *fan = climate::CLIMATE_FAN_HIGH;
+    *turbo_fan = false;
+    return true;
+  }
+  if (custom == CUSTOM_FAN_TURBO) {
+    *fan = climate::CLIMATE_FAN_HIGH;
+    *turbo_fan = true;
+    return true;
+  }
+  if (custom == CUSTOM_FAN_AUTO) {
+    *fan = climate::CLIMATE_FAN_AUTO;
+    *turbo_fan = false;
+    return true;
+  }
+  return false;
+}
 
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
@@ -68,14 +111,16 @@ void ACHIClimate::setup() {
   if (enable_presets_) {
     this->set_supported_custom_presets({CUSTOM_PRESET_QUIET});
   }
-  // Fan Turbo is exposed as a custom fan mode, not as a preset.
-  // It only sends raw Wind Mode Code 18 without changing target temperature.
-  this->set_supported_custom_fan_modes({CUSTOM_FAN_TURBO});
+  // Fan modes are exposed as custom fan modes so HA keeps this order:
+  // Quiet -> Low -> Medium -> High -> Turbo -> Auto.
+  // Turbo only sends raw Wind Mode Code 18 without changing target temperature.
+  this->set_supported_custom_fan_modes({CUSTOM_FAN_QUIET, CUSTOM_FAN_LOW, CUSTOM_FAN_MEDIUM,
+                                        CUSTOM_FAN_HIGH, CUSTOM_FAN_TURBO, CUSTOM_FAN_AUTO});
 
   // Initial HA‑visible state
   mode = climate::CLIMATE_MODE_OFF;
   target_temperature = 24;
-  fan_mode = climate::CLIMATE_FAN_AUTO;
+  this->set_custom_fan_mode_(CUSTOM_FAN_AUTO);
   swing_mode = climate::CLIMATE_SWING_OFF;
 
   // Desired state mirrors initial
@@ -175,9 +220,8 @@ climate::ClimateTraits ACHIClimate::traits() {
     climate::CLIMATE_MODE_DRY,
     climate::CLIMATE_MODE_FAN_ONLY
   });
-  t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
-                             climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
-                             climate::CLIMATE_FAN_QUIET});
+  // Fan modes are registered as custom fan modes in setup() to preserve
+  // localized labels and the requested increasing-speed order.
   t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
                                climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
   if (enable_presets_) {
@@ -340,15 +384,21 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
-    if (custom_fan == CUSTOM_FAN_TURBO) {
+    climate::ClimateFanMode decoded_fan = d_fan_;
+    bool decoded_turbo_fan = false;
+    if (decode_custom_fan_mode(custom_fan, &decoded_fan, &decoded_turbo_fan)) {
+      d_fan_turbo_ = decoded_turbo_fan;
+      d_fan_ = decoded_fan;
+      d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET) && !d_fan_turbo_;
+
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
-      d_fan_turbo_ = true;
-      d_fan_ = climate::CLIMATE_FAN_HIGH;
-      d_quiet_ = false;
-      d_turbo_ = false;
-      d_eco_ = false;
-      d_sleep_stage_ = 0;
+      if (d_fan_turbo_) {
+        d_quiet_ = false;
+        d_turbo_ = false;
+        d_eco_ = false;
+        d_sleep_stage_ = 0;
+      }
       changed = true;
     }
   }
@@ -735,8 +785,26 @@ void ACHIClimate::handle_ack_101_() {
 void ACHIClimate::publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan) {
   if (turbo_fan) {
     this->set_custom_fan_mode_(CUSTOM_FAN_TURBO);
-  } else {
-    this->set_fan_mode_(fan);
+    return;
+  }
+
+  switch (fan) {
+    case climate::CLIMATE_FAN_QUIET:
+      this->set_custom_fan_mode_(CUSTOM_FAN_QUIET);
+      break;
+    case climate::CLIMATE_FAN_LOW:
+      this->set_custom_fan_mode_(CUSTOM_FAN_LOW);
+      break;
+    case climate::CLIMATE_FAN_MEDIUM:
+      this->set_custom_fan_mode_(CUSTOM_FAN_MEDIUM);
+      break;
+    case climate::CLIMATE_FAN_HIGH:
+      this->set_custom_fan_mode_(CUSTOM_FAN_HIGH);
+      break;
+    case climate::CLIMATE_FAN_AUTO:
+    default:
+      this->set_custom_fan_mode_(CUSTOM_FAN_AUTO);
+      break;
   }
 }
 
