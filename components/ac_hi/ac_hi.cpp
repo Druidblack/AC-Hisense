@@ -51,6 +51,12 @@ void ACHILEDTargetSwitch::write_state(bool state) {
 // ---- ACHIClimate implementation ----
 
 void ACHIClimate::setup() {
+  // Register custom presets on the Climate entity, not on ClimateTraits.
+  // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
+  if (enable_presets_) {
+    this->set_supported_custom_presets({CUSTOM_PRESET_QUIET});
+  }
+
   // Initial HA‑visible state
   mode = climate::CLIMATE_MODE_OFF;
   target_temperature = 24;
@@ -160,7 +166,6 @@ climate::ClimateTraits ACHIClimate::traits() {
   if (enable_presets_) {
     t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
                              climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
-    t.set_supported_custom_presets({CUSTOM_PRESET_QUIET});
   }
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
