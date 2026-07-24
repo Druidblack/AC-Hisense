@@ -5,6 +5,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/select/select.h"
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/automation.h"
 #include "kelon168_protocol.h"
@@ -58,6 +59,17 @@ class ACHIMemorySwitch : public switch_::Switch {
   void set_parent(ACHIClimate *p) { parent_ = p; }
  protected:
   void write_state(bool state) override;
+ private:
+  ACHIClimate *parent_{nullptr};
+};
+
+// Dropdown that selects which Hisense Sleep program is used by the standard
+// Climate Sleep preset. Selecting an option does not enable Sleep by itself.
+class ACHISleepProgramSelect : public select::Select {
+ public:
+  void set_parent(ACHIClimate *p) { parent_ = p; }
+ protected:
+  void control(const std::string &value) override;
  private:
   ACHIClimate *parent_{nullptr};
 };
@@ -164,6 +176,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_led_switch(ACHILEDTargetSwitch *s) { led_switch_ = s; if (led_switch_) led_switch_->set_parent(this); }
   void set_sound_switch(ACHICommandSoundSwitch *s) { sound_switch_ = s; if (sound_switch_) sound_switch_->set_parent(this); }
   void set_memory_switch(ACHIMemorySwitch *s) { memory_switch_ = s; if (memory_switch_) memory_switch_->set_parent(this); }
+  void set_sleep_program_select(ACHISleepProgramSelect *s) {
+    sleep_program_select_ = s;
+    if (sleep_program_select_ != nullptr) sleep_program_select_->set_parent(this);
+  }
+  void set_sleep_program(const std::string &value);
   void set_ir_transmitter(remote_base::RemoteTransmitterBase *t) { ir_transmitter_ = t; }
   void set_ifeel_mqtt_topic(const std::string &topic) { ifeel_mqtt_topic_ = topic; }
   void set_ifeel_mqtt_payload_format(const std::string &format) {
@@ -255,6 +272,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void update_led_switch_state_();
   void update_sound_switch_state_();
   void update_memory_switch_state_();
+  void update_sleep_program_select_state_();
   void publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan);
 #ifdef USE_SENSOR
   void publish_sensor_if_changed_(sensor::Sensor *sensor, float value);
@@ -388,6 +406,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool led_{true};
   uint8_t sleep_stage_{0};              // 0..4
 
+  // Sleep program selected in the dropdown for the next standard Sleep preset.
+  // Default 2 preserves the behavior of the previous single Sleep preset.
+  uint8_t selected_sleep_stage_{2};
+
   // ----- Desired (from HA) state -----
   bool d_power_on_{false};
   uint8_t d_target_c_{24};
@@ -454,6 +476,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHILEDTargetSwitch *led_switch_{nullptr};
   ACHICommandSoundSwitch *sound_switch_{nullptr};
   ACHIMemorySwitch *memory_switch_{nullptr};
+  ACHISleepProgramSelect *sleep_program_select_{nullptr};
 
   bool enable_presets_{true};
 
