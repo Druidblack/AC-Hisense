@@ -341,6 +341,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool sleep_restore_fan_turbo_{false};
   bool sleep_restore_quiet_{false};
 
+  // True only after the user explicitly changes the fan while a confirmed
+  // Sleep program is active. Without this flag, Sleep's automatic QUIET fan is
+  // authoritative and must not be overwritten by stale desired HA fan state.
+  bool sleep_fan_override_pending_{false};
+
   // Boot guard: avoids querying the indoor AC controller while it is still starting.
   uint32_t boot_ms_{0};
 

@@ -400,6 +400,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   if (call.get_fan_mode().has_value()) {
+    // While Sleep is active, QUIET is controlled by the indoor unit itself.
+    // Remember that this fan change is explicit so the next status parser does
+    // not immediately replace the requested fan with Sleep's QUIET value.
+    sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
+
     // An explicit fan command supersedes any pending Sleep rollback snapshot.
     sleep_restore_fan_valid_ = false;
     d_fan_ = *call.get_fan_mode();
@@ -530,6 +535,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
     if (custom_fan == CUSTOM_FAN_TURBO) {
+      sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
       sleep_restore_fan_valid_ = false;
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
@@ -657,7 +663,12 @@ void ACHIClimate::queue_retry_fields_from_state_() {
   if (d_power_on_ && power_on_) {
     if (d_target_c_ != target_c_)
       pending_command_fields_ |= CMD_FIELD_TEMP;
-    if (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_)
+
+    // A confirmed Sleep program owns the fan and normally forces QUIET. Do not
+    // fight that automatic fan value unless the user explicitly selected a fan
+    // mode in Home Assistant while Sleep was active.
+    const bool sleep_owns_fan = sleep_stage_ > 0 && !sleep_fan_override_pending_;
+    if (!sleep_owns_fan && (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
       pending_command_fields_ |= CMD_FIELD_WIND;
     if (d_swing_ != swing_)
       pending_command_fields_ |= CMD_FIELD_SWING;
@@ -1299,6 +1310,43 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_ = climate::CLIMATE_FAN_HIGH;
   }
 
+  // During a confirmed Sleep program the indoor unit controls the fan and
+  // normally reports QUIET. Keep the desired/UI fan synchronized with that
+  // real value so unrelated HA commands (temperature, swing, display, etc.) do
+  // not trigger repeated AUTO writes that eventually cancel Sleep.
+  //
+  // An explicit fan command made while Sleep is active is the only exception:
+  // preserve the user's requested fan until the unit applies it (usually with
+  // Sleep Mode Code returning to 0) or reports that exact fan value.
+  if (sleep_stage_ > 0) {
+    if (sleep_fan_override_pending_) {
+      const bool requested_fan_applied =
+          fan_ == d_fan_ && fan_turbo_ == d_fan_turbo_;
+      if (requested_fan_applied) {
+        sleep_fan_override_pending_ = false;
+        ESP_LOGD(TAG, "Explicit fan command applied while Sleep remains active");
+      }
+    } else {
+      const bool desired_fan_changed =
+          d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_ || d_quiet_;
+      d_fan_ = fan_;
+      d_fan_turbo_ = fan_turbo_;
+      // Sleep is a preset, not the standalone Quiet custom preset.
+      d_quiet_ = false;
+      pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
+      if (desired_fan_changed) {
+        recalc_desired_sig_();
+        ESP_LOGD(TAG, "Sleep controls fan: synchronized HA fan to actual %s",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
+      }
+    }
+  } else if (sleep_fan_override_pending_) {
+    // The usual result of a deliberate fan change is Sleep Mode Code = 0.
+    // From this point normal desired/actual fan convergence applies.
+    sleep_fan_override_pending_ = false;
+    ESP_LOGD(TAG, "Sleep ended after explicit fan command; normal fan convergence resumed");
+  }
+
   // Swing
   bool updown = (features & UPDOWN_MASK) != 0;
   bool leftright = (features & LEFTRIGHT_MASK) != 0;
@@ -1558,10 +1606,15 @@ void ACHIClimate::publish_gated_state_() {
     d_sleep_stage_ = out_sleep_stage;
     recalc_desired_sig_();
   } else {
-    // Publish desired state (while enforcing)
+    // Publish desired state while enforcing. A confirmed Sleep program is
+    // authoritative for the fan unless the user explicitly requested another
+    // fan mode; therefore show the real QUIET fan instead of stale desired AUTO.
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = d_target_c_;
-    publish_fan_state_(d_fan_turbo_, d_fan_);
+    if (sleep_stage_ > 0 && !sleep_fan_override_pending_)
+      publish_fan_state_(fan_turbo_, fan_);
+    else
+      publish_fan_state_(d_fan_turbo_, d_fan_);
     this->swing_mode = d_swing_;
     if (enable_presets_) {
       if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
@@ -1692,6 +1745,16 @@ void ACHIClimate::recalc_actual_sig_() {
   uint8_t effective_sleep_stage = sleep_stage_;
   auto effective_fan = fan_;
   bool effective_fan_turbo = fan_turbo_;
+
+  // A confirmed Sleep program owns the fan. Mask its automatic QUIET value
+  // from signature comparison unless a user explicitly changed the fan while
+  // Sleep was active. This prevents an unrelated command from creating an
+  // endless AUTO-vs-QUIET mismatch and cancelling Sleep.
+  if (sleep_stage_ > 0 && !sleep_fan_override_pending_) {
+    effective_fan = d_fan_;
+    effective_fan_turbo = d_fan_turbo_;
+    effective_quiet = d_quiet_;
+  }
 
   // Some Hisense indoor units acknowledge special modes only indirectly in
   // status frames. For HA-priority convergence, accept those indirect states
