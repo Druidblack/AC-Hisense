@@ -312,6 +312,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Sleep preset is cleared and no automatic retry is performed.
   bool sleep_confirmation_pending_{false};
 
+  // Fan state that was active immediately before an HA Sleep request. If the
+  // indoor unit rejects Sleep (Sleep Mode Code remains 0), restore this fan
+  // state with one silent normal command. The snapshot is discarded as soon
+  // as Sleep is confirmed by a non-zero status code.
+  bool sleep_restore_fan_valid_{false};
+  climate::ClimateFanMode sleep_restore_fan_{climate::CLIMATE_FAN_AUTO};
+  bool sleep_restore_fan_turbo_{false};
+  bool sleep_restore_quiet_{false};
+
   // Boot guard: avoids querying the indoor AC controller while it is still starting.
   uint32_t boot_ms_{0};
 

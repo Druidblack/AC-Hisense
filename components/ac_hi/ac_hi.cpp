@@ -386,6 +386,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   if (call.get_fan_mode().has_value()) {
+    // An explicit fan command supersedes any pending Sleep rollback snapshot.
+    sleep_restore_fan_valid_ = false;
     d_fan_ = *call.get_fan_mode();
     d_fan_turbo_ = false;
     d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
@@ -401,6 +403,13 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
+    const auto fan_before_preset = d_fan_;
+    const bool fan_turbo_before_preset = d_fan_turbo_;
+    const bool quiet_before_preset = d_quiet_;
+
+    if (p != climate::CLIMATE_PRESET_SLEEP) {
+      sleep_restore_fan_valid_ = false;
+    }
 
     d_eco_ = false;
     d_turbo_ = false;
@@ -448,11 +457,29 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       // Request the first Sleep program without changing the set temperature.
       // The UI does not treat this desired value as active Sleep: only a
       // non-zero Sleep Mode Code in a later status frame can confirm it.
+      // Save the current fan state so a rejected Sleep request can be rolled
+      // back instead of leaving the indoor unit in QUIET fan mode.
+      if (sleep_stage_ == 0) {
+        sleep_restore_fan_ = fan_before_preset;
+        sleep_restore_fan_turbo_ = fan_turbo_before_preset;
+        sleep_restore_quiet_ = quiet_before_preset;
+        sleep_restore_fan_valid_ = true;
+        ESP_LOGD(TAG, "Sleep request: saved previous fan=%s turbo=%s quiet=%s for rollback",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(sleep_restore_fan_)),
+                 sleep_restore_fan_turbo_ ? "YES" : "NO",
+                 sleep_restore_quiet_ ? "YES" : "NO");
+      } else {
+        // Sleep is already confirmed by the AC, so this is not a speculative
+        // activation and no rollback snapshot is needed.
+        sleep_restore_fan_valid_ = false;
+      }
+
       d_sleep_stage_ = 1;
       d_fan_turbo_ = false;
       d_quiet_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
+      sleep_restore_fan_valid_ = false;
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
         g_has_pre_turbo_target = false;
@@ -475,6 +502,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
     if (custom == CUSTOM_PRESET_QUIET) {
+      sleep_restore_fan_valid_ = false;
       d_quiet_ = true;
       d_turbo_ = false;
       d_eco_ = false;
@@ -488,6 +516,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
     if (custom_fan == CUSTOM_FAN_TURBO) {
+      sleep_restore_fan_valid_ = false;
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
       d_fan_turbo_ = true;
@@ -1150,24 +1179,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     default:   sleep_stage_ = 0; break;
   }
 
-  // The first status after a transmitted Sleep-bearing frame decides whether
-  // the request succeeded. Code 0 means the AC rejected or cancelled Sleep.
-  // Return HA to the actual state immediately and stop automatic retries.
-  if (sleep_confirmation_pending_) {
-    sleep_confirmation_pending_ = false;
-    if (sleep_stage_ == 0) {
-      ESP_LOGW(TAG,
-               "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset and stopping retries");
-      pending_control_ = false;
-      ha_priority_active_ = false;
-      accept_remote_changes_ = true;
-      d_sleep_stage_ = 0;
-    } else {
-      ESP_LOGI(TAG, "Sleep confirmed by status: Sleep Mode Code=%u (program %u)",
-               raw_sleep, sleep_stage_);
-    }
-  }
-
   // Target temperature (direct value)
   target_c_ = b[IDX_SET_TEMP];
   if (target_c_ < 16 || target_c_ > 30) target_c_ = 24; // fallback
@@ -1215,6 +1226,57 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (updown) swing_ = climate::CLIMATE_SWING_VERTICAL;
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else swing_ = climate::CLIMATE_SWING_OFF;
+
+  // The first status after a transmitted Sleep-bearing frame decides whether
+  // the request succeeded. Code 0 means the AC rejected Sleep. In that case
+  // clear the HA preset and, when the attempt forced QUIET, restore the fan
+  // state that was active immediately before the request.
+  if (sleep_confirmation_pending_) {
+    sleep_confirmation_pending_ = false;
+    if (sleep_stage_ == 0) {
+      d_sleep_stage_ = 0;
+
+      const bool have_fan_rollback = sleep_restore_fan_valid_;
+      const auto rollback_fan = sleep_restore_fan_;
+      const bool rollback_fan_turbo = sleep_restore_fan_turbo_;
+      const bool rollback_quiet = sleep_restore_quiet_;
+      sleep_restore_fan_valid_ = false;
+
+      if (have_fan_rollback &&
+          (fan_ != rollback_fan || fan_turbo_ != rollback_fan_turbo)) {
+        d_fan_ = rollback_fan;
+        d_fan_turbo_ = rollback_fan_turbo;
+        d_quiet_ = rollback_quiet;
+        d_turbo_ = false;
+        d_eco_ = false;
+
+        // Keep all other desired climate fields intact and send one silent
+        // rollback command. Normal convergence logic confirms the result.
+        accept_remote_changes_ = false;
+        ha_priority_active_ = true;
+        recalc_desired_sig_();
+        pending_control_ = true;
+        last_control_ms_ = millis();
+        user_command_next_write_ = false;
+        beep_on_next_write_ = false;
+
+        ESP_LOGW(TAG,
+                 "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset and restoring previous fan=%s%s",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)),
+                 d_fan_turbo_ ? " (Turbo)" : "");
+      } else {
+        pending_control_ = false;
+        ha_priority_active_ = false;
+        accept_remote_changes_ = true;
+        ESP_LOGW(TAG,
+                 "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset (fan rollback not required)");
+      }
+    } else {
+      sleep_restore_fan_valid_ = false;
+      ESP_LOGI(TAG, "Sleep confirmed by status: Sleep Mode Code=%u (program %u)",
+               raw_sleep, sleep_stage_);
+    }
+  }
 
   // Report the real HVAC action from the confirmed compressor feedback (byte 41).
   // The configured HVAC mode alone is not sufficient: an inverter unit can stay
