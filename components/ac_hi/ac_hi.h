@@ -243,6 +243,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Protocol I/O
   void send_query_status_();
   void send_write_changes_();
+  void send_sleep_action_(uint8_t stage);
 
   // IR iFeel helpers
   Kelon168Data build_kelon_state_from_current_(uint8_t command) const;
@@ -321,8 +322,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool status_query_in_flight_{false};
   uint32_t status_query_time_{0};
 
-  // Pending control from HA (debounced)
+  // Pending control from HA (debounced). Normal climate writes keep the Sleep
+  // field neutral; Sleep itself is changed with a dedicated action frame.
   bool pending_control_{false};
+  bool pending_sleep_action_{false};
+  uint8_t pending_sleep_stage_{0};
   uint32_t last_control_ms_{0};
 
   // Boot guard: avoids querying the indoor AC controller while it is still starting.

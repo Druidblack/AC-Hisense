@@ -211,10 +211,10 @@ void ACHIClimate::update() {
     return;
   }
 
-  if (!writing_lock_ && !pending_control_ && !status_query_in_flight_) {
+  if (!writing_lock_ && !pending_control_ && !pending_sleep_action_ && !status_query_in_flight_) {
     send_query_status_();
   } else {
-    ESP_LOGV(TAG, "Polling skipped (write lock, pending control, or status query active)");
+    ESP_LOGV(TAG, "Polling skipped (write lock, pending climate/Sleep control, or status query active)");
   }
 }
 
@@ -269,12 +269,25 @@ void ACHIClimate::loop() {
     writing_lock_ = false;
   }
 
-  // 7. Send a debounced control command only when neither a write ACK nor a
-  // status response is outstanding. This serializes 0x65 and 0x66 transactions.
-  if (pending_control_ && !writing_lock_ && !status_query_in_flight_ &&
+  // 7. Send one debounced control command only when neither a write ACK nor a
+  // status response is outstanding. Sleep uses a dedicated action frame. When
+  // leaving Sleep, send Sleep OFF before another preset/state command. When
+  // entering Sleep together with a normal mode/temperature change, send the
+  // normal state first and the Sleep action second.
+  if (!writing_lock_ && !status_query_in_flight_ &&
       (millis() - last_control_ms_ >= CONTROL_DEBOUNCE_MS)) {
-    send_write_changes_();
-    pending_control_ = false;
+    if (pending_sleep_action_ && pending_sleep_stage_ == 0) {
+      const uint8_t stage = pending_sleep_stage_;
+      pending_sleep_action_ = false;
+      send_sleep_action_(stage);
+    } else if (pending_control_) {
+      pending_control_ = false;
+      send_write_changes_();
+    } else if (pending_sleep_action_) {
+      const uint8_t stage = pending_sleep_stage_;
+      pending_sleep_action_ = false;
+      send_sleep_action_(stage);
+    }
   }
 
   // 8. Optional memory diagnostics
@@ -358,13 +371,15 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
   if (enable_presets_) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
   publish_state();
 
-  pending_control_ = true;
+  pending_sleep_action_ = true;
+  pending_sleep_stage_ = stage;
   last_control_ms_ = millis();
   user_command_next_write_ = true;
   beep_on_next_write_ = command_sound_enabled_;
 
   ESP_LOGD(TAG,
-           "Active Sleep program changed to %s: TX byte 17=0x%02X, expected Sleep Mode Code=%u",
+           "Active Sleep program changed to %s: queued dedicated Sleep action, "
+           "TX byte[16]=0x05 byte[17]=0x%02X, expected Sleep Mode Code=%u",
            value.c_str(), (unsigned) encode_sleep_byte_(stage),
            (unsigned) sleep_status_code_for_stage(stage));
 }
@@ -372,6 +387,8 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
 // ---- Control from HA ----
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
+  bool generic_write_requested = false;
+  const uint8_t sleep_stage_before_call = d_sleep_stage_;
   bool was_power_on = d_power_on_;
 
   if (call.get_mode().has_value()) {
@@ -456,6 +473,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       }
     }
     changed = true;
+    generic_write_requested = true;
   }
 
   if (call.get_target_temperature().has_value()) {
@@ -466,6 +484,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_target_c_ = c;
       remember_target_for_mode_(d_mode_, c);
       changed = true;
+      generic_write_requested = true;
     }
   }
 
@@ -474,17 +493,20 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     d_fan_turbo_ = false;
     d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
     changed = true;
+    generic_write_requested = true;
   }
 
   if (call.get_swing_mode().has_value()) {
     d_swing_ = *call.get_swing_mode();
     changed = true;
+    generic_write_requested = true;
   }
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
+    bool was_sleep = d_sleep_stage_ > 0;
 
     d_eco_ = false;
     d_turbo_ = false;
@@ -512,6 +534,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_target_c_ = 24;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
       d_quiet_ = false;
+      generic_write_requested = true;
     } else if (p == climate::CLIMATE_PRESET_BOOST) {
       if (!was_turbo) {
         g_pre_turbo_target_c = d_target_c_;
@@ -528,6 +551,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         d_target_c_ = 16;
         d_fan_ = climate::CLIMATE_FAN_HIGH;
       }
+      generic_write_requested = true;
     } else if (p == climate::CLIMATE_PRESET_SLEEP) {
       // The dropdown chooses which protocol program the standard Sleep preset
       // activates. The target temperature is left unchanged; the indoor unit
@@ -538,9 +562,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_turbo_ = false;
       d_eco_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
+      pending_sleep_action_ = true;
+      pending_sleep_stage_ = d_sleep_stage_;
       ESP_LOGD(TAG,
                "Standard Sleep preset selected: %s, target unchanged at %u°C, "
-               "TX byte 17=0x%02X, expected Sleep Mode Code=%u",
+               "queued dedicated Sleep action byte[16]=0x05 byte[17]=0x%02X, "
+               "expected Sleep Mode Code=%u",
                sleep_program_for_stage(d_sleep_stage_), (unsigned) d_target_c_,
                (unsigned) encode_sleep_byte_(d_sleep_stage_),
                (unsigned) sleep_status_code_for_stage(d_sleep_stage_));
@@ -559,6 +586,21 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_quiet_ = false;
       if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco)
         d_fan_ = climate::CLIMATE_FAN_AUTO;
+
+      if (was_sleep) {
+        pending_sleep_action_ = true;
+        pending_sleep_stage_ = 0;
+        ESP_LOGD(TAG, "Standard Sleep preset disabled: queued dedicated Sleep OFF action");
+      } else {
+        generic_write_requested = true;
+      }
+    }
+
+    // Switching directly from Sleep to ECO/BOOST also requires an explicit
+    // Sleep OFF action before the new normal climate command.
+    if (was_sleep && p != climate::CLIMATE_PRESET_SLEEP && p != climate::CLIMATE_PRESET_NONE) {
+      pending_sleep_action_ = true;
+      pending_sleep_stage_ = 0;
     }
 
     changed = true;
@@ -567,6 +609,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
     if (custom == CUSTOM_PRESET_QUIET) {
+      if (d_sleep_stage_ > 0) {
+        pending_sleep_action_ = true;
+        pending_sleep_stage_ = 0;
+      }
       d_quiet_ = true;
       d_turbo_ = false;
       d_eco_ = false;
@@ -574,12 +620,17 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_fan_turbo_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
       changed = true;
+      generic_write_requested = true;
     }
   }
 
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
     if (custom_fan == CUSTOM_FAN_TURBO) {
+      if (d_sleep_stage_ > 0) {
+        pending_sleep_action_ = true;
+        pending_sleep_stage_ = 0;
+      }
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
       d_fan_turbo_ = true;
@@ -589,6 +640,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_eco_ = false;
       d_sleep_stage_ = 0;
       changed = true;
+      generic_write_requested = true;
     }
   }
 
@@ -615,14 +667,24 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   publish_state();
   update_led_switch_state_();
 
-  // Mark that we have a pending command (debounced)
-  pending_control_ = true;
+  // Mark requested commands (debounced). A pure Sleep preset/select change
+  // uses only the dedicated Sleep action frame. Other climate fields still use
+  // the normal state frame, whose Sleep byte is neutral.
+  if (generic_write_requested) pending_control_ = true;
+  if (sleep_stage_before_call > 0 && d_sleep_stage_ == 0 && !pending_sleep_action_) {
+    pending_sleep_action_ = true;
+    pending_sleep_stage_ = 0;
+  }
   last_control_ms_ = millis();
   user_command_next_write_ = true;
   beep_on_next_write_ = command_sound_enabled_;
 
-  ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %lums debounce",
-           command_sound_enabled_ ? "ON" : "OFF", (unsigned long) CONTROL_DEBOUNCE_MS);
+  ESP_LOGD(TAG,
+           "Control queued: normal=%s sleep_action=%s sleep_stage=%u command_sound=%s, "
+           "will send after %lums debounce",
+           pending_control_ ? "YES" : "NO", pending_sleep_action_ ? "YES" : "NO",
+           (unsigned) pending_sleep_stage_, command_sound_enabled_ ? "ON" : "OFF",
+           (unsigned long) CONTROL_DEBOUNCE_MS);
 }
 
 // ---- Build TX frame from desired state ----
@@ -638,8 +700,11 @@ void ACHIClimate::build_tx_from_desired_() {
   // Fan speed (byte 16)
   tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
 
-  // Sleep mode (byte 17)
-  tx_bytes_[IDX_SLEEP] = encode_sleep_byte_(d_sleep_stage_);
+  // Sleep is action-style on this controller. In an ordinary climate state
+  // frame, 0x00 means "do not change Sleep". Sending 0x01/0x03/... here would
+  // disable or corrupt an active program unless the dedicated Sleep command
+  // fields are also present.
+  tx_bytes_[IDX_SLEEP] = 0x00;
 
   // Swing (byte 32)
   bool v = (d_swing_ == climate::CLIMATE_SWING_VERTICAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
@@ -688,10 +753,7 @@ void ACHIClimate::send_write_changes_() {
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
            tx_bytes_[IDX_TX_BEEP], tx_bytes_[IDX_TX_LED]);
-  ESP_LOGD(TAG,
-           "TX Sleep field: program=%s, byte[17]=0x%02X, expected Sleep Mode Code=%u",
-           d_sleep_stage_ > 0 ? sleep_program_for_stage(d_sleep_stage_) : "Off",
-           tx_bytes_[IDX_SLEEP], (unsigned) sleep_status_code_for_stage(d_sleep_stage_));
+  ESP_LOGD(TAG, "TX normal climate frame: Sleep byte[17]=0x00 (neutral / unchanged)");
   send_logical_frame_(tx_bytes_, "TX write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
@@ -699,6 +761,39 @@ void ACHIClimate::send_write_changes_() {
   user_command_next_write_ = false;
   led_command_pending_ = false;
 
+  writing_lock_ = true;
+  write_lock_time_ = millis();
+}
+
+// ---- Send dedicated Sleep action ----
+void ACHIClimate::send_sleep_action_(uint8_t stage) {
+  // Hisense Sleep is not a normal state field. The indoor controller expects
+  // the dedicated 0x65 action layout captured by the donor project:
+  //   byte[16] = 0x05 for Sleep ON/program, 0x01 for Sleep OFF
+  //   byte[17] = 0x03/0x05/0x07/0x09 for Sleep 1..4, 0x01 for OFF
+  //   byte[33] = 0x04 and byte[35] = 0x10
+  // All unrelated action bytes remain zero so current mode/temperature/swing
+  // are preserved by the indoor unit.
+  std::vector<uint8_t> frame = tx_bytes_;
+  std::fill(frame.begin() + 14, frame.begin() + 46, 0x00);
+  frame[16] = stage > 0 ? 0x05 : 0x01;
+  frame[17] = stage > 0 ? encode_sleep_byte_(stage) : 0x01;
+  frame[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
+  frame[IDX_TX_TURBO_ECO] = TxValues::TURBO_OFF;
+  frame[IDX_TX_QUIET] = TxValues::QUIET_OFF;
+  calc_and_patch_crc_(frame);
+
+  ESP_LOGD(TAG,
+           "Sending dedicated Sleep action: program=%s byte[16]=0x%02X byte[17]=0x%02X "
+           "expected Sleep Mode Code=%u beep=0x%02X",
+           stage > 0 ? sleep_program_for_stage(stage) : "Off",
+           frame[16], frame[17], (unsigned) sleep_status_code_for_stage(stage),
+           frame[IDX_TX_BEEP]);
+  send_logical_frame_(frame, "TX Sleep action");
+
+  last_tx_frame_.assign(frame.begin(), frame.end());
+  beep_on_next_write_ = false;
+  user_command_next_write_ = false;
   writing_lock_ = true;
   write_lock_time_ = millis();
 }
@@ -1448,13 +1543,6 @@ void ACHIClimate::publish_gated_state_() {
         out_sleep_stage = 0;
         out_fan = d_fan_;
         out_fan_turbo = false;
-      } else if (d_sleep_stage_ > 0 && sleep_stage_ == 0 && last_raw_wind_ == 10) {
-        out_turbo = false;
-        out_eco = false;
-        out_quiet = false;
-        out_sleep_stage = d_sleep_stage_;
-        out_fan = d_fan_;
-        out_fan_turbo = false;
       } else if (d_quiet_ && (quiet_ || fan_ == climate::CLIMATE_FAN_QUIET)) {
         out_turbo = false;
         out_eco = false;
@@ -1572,14 +1660,22 @@ void ACHIClimate::maybe_force_to_target_() {
     return;
   }
 
-  if (!writing_lock_ && pending_control_) {
-    // There is already a pending command that will be sent soon, no need to duplicate
+  if (!writing_lock_ && (pending_control_ || pending_sleep_action_)) {
+    // There is already a pending command that will be sent soon, no need to duplicate.
     return;
   }
 
   if (!writing_lock_) {
-    ESP_LOGD(TAG, "Enforcing desired state (actual≠desired) – requesting write");
-    pending_control_ = true;
+    if (d_sleep_stage_ != sleep_stage_) {
+      ESP_LOGD(TAG,
+               "Enforcing desired Sleep state: actual=%u desired=%u – queuing dedicated Sleep action",
+               (unsigned) sleep_stage_, (unsigned) d_sleep_stage_);
+      pending_sleep_action_ = true;
+      pending_sleep_stage_ = d_sleep_stage_;
+    } else {
+      ESP_LOGD(TAG, "Enforcing desired state (actual≠desired) – requesting normal write");
+      pending_control_ = true;
+    }
     last_control_ms_ = millis();   // restart debounce
   }
 }
@@ -1672,16 +1768,6 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_turbo = false;
       effective_quiet = false;
       effective_sleep_stage = 0;
-      effective_fan_turbo = false;
-      effective_fan = d_fan_;
-    } else if (d_sleep_stage_ > 0 && sleep_stage_ == 0 &&
-               target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
-      // Fallback only for firmware that does not expose an explicit Sleep code.
-      // When a non-zero code is present, require the exact selected stage.
-      effective_sleep_stage = d_sleep_stage_;
-      effective_eco = false;
-      effective_turbo = false;
-      effective_quiet = false;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
     } else if (d_quiet_ && fan_ == climate::CLIMATE_FAN_QUIET) {
