@@ -256,6 +256,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void update_sound_switch_state_();
   void update_memory_switch_state_();
   void publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan);
+#ifdef USE_SENSOR
+  void publish_sensor_if_changed_(sensor::Sensor *sensor, float value);
+#endif
+#ifdef USE_TEXT_SENSOR
+  void publish_text_sensor_if_changed_(text_sensor::TextSensor *sensor, const char *value);
+#endif
   void remember_target_for_mode_(climate::ClimateMode mode, uint8_t target_c);
   uint8_t target_for_mode_(climate::ClimateMode mode, uint8_t fallback) const;
   void maybe_force_to_target_();                     // <-- добавлено объявление

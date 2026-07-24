@@ -56,6 +56,22 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   }
 }
 
+#ifdef USE_SENSOR
+void ACHIClimate::publish_sensor_if_changed_(sensor::Sensor *sensor, float value) {
+  if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value)) {
+    sensor->publish_state(value);
+  }
+}
+#endif
+
+#ifdef USE_TEXT_SENSOR
+void ACHIClimate::publish_text_sensor_if_changed_(text_sensor::TextSensor *sensor, const char *value) {
+  if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value)) {
+    sensor->publish_state(value);
+  }
+}
+#endif
+
 // ---- ACHILEDTargetSwitch ----
 void ACHILEDTargetSwitch::write_state(bool state) {
   if (parent_ != nullptr) {
@@ -1138,7 +1154,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   current_temperature = b[IDX_CURRENT_TEMP];
 
 #ifdef USE_SENSOR
-  if (pipe_sensor_ != nullptr) pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
+  publish_sensor_if_changed_(pipe_sensor_, b[IDX_PIPE_TEMP]);
 #endif
 
   // Turbo, Eco, Quiet, LED
@@ -1222,45 +1238,38 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   // Publish optional sensors (with sign conversion for outdoor temperatures)
 #ifdef USE_SENSOR
-  if (set_temp_sensor_ != nullptr) set_temp_sensor_->publish_state(b[IDX_SET_TEMP]);
-  if (room_temp_sensor_ != nullptr) room_temp_sensor_->publish_state(b[IDX_CURRENT_TEMP]);
-  if (wind_code_sensor_ != nullptr) wind_code_sensor_->publish_state(b[IDX_WIND]);
-  if (sleep_code_sensor_ != nullptr) sleep_code_sensor_->publish_state(b[IDX_SLEEP]);
-  if (mode_code_sensor_ != nullptr) mode_code_sensor_->publish_state((b[IDX_POWER_MODE] >> 4) & 0x0F);
-  if (quiet_code_sensor_ != nullptr) quiet_code_sensor_->publish_state(quiet_ ? 1.0f : 0.0f);
-  if (turbo_code_sensor_ != nullptr) turbo_code_sensor_->publish_state(turbo_ ? 1.0f : 0.0f);
-  if (eco_code_sensor_ != nullptr)   eco_code_sensor_->publish_state(eco_ ? 1.0f : 0.0f);
-  if (swing_ud_sensor_ != nullptr)   swing_ud_sensor_->publish_state(updown ? 1.0f : 0.0f);
-  if (swing_lr_sensor_ != nullptr)   swing_lr_sensor_->publish_state(leftright ? 1.0f : 0.0f);
-  if (compressor_freq_actual_sensor_ != nullptr)
-    compressor_freq_actual_sensor_->publish_state(b[IDX_COMP_FREQ_ACTUAL]);
-  if (compressor_freq_set_sensor_ != nullptr)
-    compressor_freq_set_sensor_->publish_state(b[IDX_COMP_FREQ_SET]);
-  if (compressor_freq_command_sensor_ != nullptr)
-    compressor_freq_command_sensor_->publish_state(b[IDX_COMP_FREQ_COMMAND]);
+  publish_sensor_if_changed_(set_temp_sensor_, b[IDX_SET_TEMP]);
+  publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
+  publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
+  publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);
+  publish_sensor_if_changed_(mode_code_sensor_, (b[IDX_POWER_MODE] >> 4) & 0x0F);
+  publish_sensor_if_changed_(quiet_code_sensor_, quiet_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(turbo_code_sensor_, turbo_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(eco_code_sensor_, eco_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(swing_ud_sensor_, updown ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(swing_lr_sensor_, leftright ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(compressor_freq_actual_sensor_, b[IDX_COMP_FREQ_ACTUAL]);
+  publish_sensor_if_changed_(compressor_freq_set_sensor_, b[IDX_COMP_FREQ_SET]);
+  publish_sensor_if_changed_(compressor_freq_command_sensor_, b[IDX_COMP_FREQ_COMMAND]);
   // Backward-compatible byte-43 sensor for existing YAML configurations.
-  if (compressor_freq_sensor_ != nullptr)
-    compressor_freq_sensor_->publish_state(b[IDX_COMP_FREQ_COMMAND]);
+  publish_sensor_if_changed_(compressor_freq_sensor_, b[IDX_COMP_FREQ_COMMAND]);
 
   // Outdoor temperatures are signed!
   if (outdoor_temp_sensor_ != nullptr) {
     int8_t t = static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]);
-    outdoor_temp_sensor_->publish_state(static_cast<float>(t));
+    publish_sensor_if_changed_(outdoor_temp_sensor_, static_cast<float>(t));
   }
   if (outdoor_cond_temp_sensor_ != nullptr) {
     int8_t t = static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]);
-    outdoor_cond_temp_sensor_->publish_state(static_cast<float>(t));
+    publish_sensor_if_changed_(outdoor_cond_temp_sensor_, static_cast<float>(t));
   }
-  if (compressor_exhaust_temp_sensor_ != nullptr) {
-    compressor_exhaust_temp_sensor_->publish_state(static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
-  }
+  publish_sensor_if_changed_(compressor_exhaust_temp_sensor_,
+                             static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
 
 #endif
 
 #ifdef USE_TEXT_SENSOR
-  if (power_status_text_ != nullptr) {
-    power_status_text_->publish_state(power_on_ ? "ON" : "OFF");
-  }
+  publish_text_sensor_if_changed_(power_status_text_, power_on_ ? "ON" : "OFF");
 #endif
 
   ESP_LOGD(TAG,
@@ -1719,14 +1728,14 @@ void ACHIClimate::publish_memory_diagnostics_() {
   heap_frag_pct  = ESP.getHeapFragmentation();
 #endif
 
-  if (heap_free_sensor_ != nullptr) heap_free_sensor_->publish_state(static_cast<float>(heap_free));
-  if (heap_total_sensor_ != nullptr && heap_total > 0) heap_total_sensor_->publish_state(static_cast<float>(heap_total));
-  if (heap_used_sensor_ != nullptr && heap_total > 0) heap_used_sensor_->publish_state(static_cast<float>(heap_used));
-  if (heap_min_free_sensor_ != nullptr && heap_min_free > 0) heap_min_free_sensor_->publish_state(static_cast<float>(heap_min_free));
-  if (heap_max_alloc_sensor_ != nullptr && heap_max_alloc > 0) heap_max_alloc_sensor_->publish_state(static_cast<float>(heap_max_alloc));
-  if (heap_fragmentation_sensor_ != nullptr && heap_frag_pct >= 0) heap_fragmentation_sensor_->publish_state(static_cast<float>(heap_frag_pct));
-  if (psram_total_sensor_ != nullptr && psram_total > 0) psram_total_sensor_->publish_state(static_cast<float>(psram_total));
-  if (psram_free_sensor_ != nullptr && psram_free > 0) psram_free_sensor_->publish_state(static_cast<float>(psram_free));
+  publish_sensor_if_changed_(heap_free_sensor_, static_cast<float>(heap_free));
+  if (heap_total > 0) publish_sensor_if_changed_(heap_total_sensor_, static_cast<float>(heap_total));
+  if (heap_total > 0) publish_sensor_if_changed_(heap_used_sensor_, static_cast<float>(heap_used));
+  if (heap_min_free > 0) publish_sensor_if_changed_(heap_min_free_sensor_, static_cast<float>(heap_min_free));
+  if (heap_max_alloc > 0) publish_sensor_if_changed_(heap_max_alloc_sensor_, static_cast<float>(heap_max_alloc));
+  if (heap_frag_pct >= 0) publish_sensor_if_changed_(heap_fragmentation_sensor_, static_cast<float>(heap_frag_pct));
+  if (psram_total > 0) publish_sensor_if_changed_(psram_total_sensor_, static_cast<float>(psram_total));
+  if (psram_free > 0) publish_sensor_if_changed_(psram_free_sensor_, static_cast<float>(psram_free));
 #endif
 }
 
