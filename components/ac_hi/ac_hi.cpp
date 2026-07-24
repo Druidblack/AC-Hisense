@@ -49,10 +49,7 @@ static uint8_t sleep_stage_from_program(const std::string &program) {
   return 0;
 }
 
-// This indoor unit reports Sleep 1..4 as the direct values 2,4,6,8.
-// Previous tests with odd write values 3,5,7,9 were acknowledged by the UART
-// controller but ignored by the indoor unit. This diagnostic build therefore
-// writes the observed even values directly.
+// Status values reported by the indoor unit for Sleep 1..4.
 static uint8_t sleep_status_code_for_stage(uint8_t stage) {
   return (stage >= 1 && stage <= 4) ? static_cast<uint8_t>(stage << 1) : 0;
 }
@@ -770,37 +767,43 @@ void ACHIClimate::send_write_changes_() {
   write_lock_time_ = millis();
 }
 
-// ---- Send Sleep action in a complete climate-state frame ----
+// ---- Send Sleep action using the legacy neutral feature layout ----
 void ACHIClimate::send_sleep_action_(uint8_t stage) {
-  // The original working YAML does not use a short/zero-filled Sleep packet.
-  // It sends the normal 50-byte 0x65 climate frame and changes only byte 17 to
-  // the odd Sleep action value. The remaining fields must contain a coherent
-  // current/desired AC state; otherwise this indoor controller acknowledges the
-  // UART frame but leaves Sleep Mode Code at 0 (or switches an active Sleep off).
+  // The original YAML writes the normal 50-byte 0x65 frame, but leaves the
+  // Turbo/Eco, Quiet and LED action fields neutral unless the user explicitly
+  // changes those functions. Earlier component builds sent explicit OFF values
+  // (0x14 and 0x10) together with Sleep; the UART controller acknowledged those
+  // frames, but the indoor unit kept Sleep Mode Code at 0.
   build_tx_from_desired_();
   std::vector<uint8_t> frame = tx_bytes_;
 
-  // Preserve the fan value that the indoor unit currently reports. The legacy
-  // controller changed only the Sleep byte; it did not pre-command QUIET.
-  // After accepting Sleep, the indoor unit changes Wind Mode Code to QUIET by
-  // itself. Sending QUIET and Sleep in the same request is treated by this model
-  // as an ordinary fan command and Sleep Mode Code remains 0.
+  // Preserve the currently reported fan as its write-code equivalent.
   const climate::ClimateFanMode sleep_action_fan = power_on_ ? fan_ : d_fan_;
   const bool sleep_action_fan_turbo = power_on_ ? fan_turbo_ : d_fan_turbo_;
   frame[IDX_WIND] = encode_fan_byte_(sleep_action_fan, sleep_action_fan_turbo);
+
+  // Legacy command encoding: status 0/2/4/6/8 is written as action
+  // 1/3/5/7/9 by shifting the stage code and setting bit 0.
   frame[IDX_SLEEP] = encode_sleep_byte_(stage);
+
+  // Neutral action fields exactly as in the old YAML bytearray.
+  frame[IDX_TX_TURBO_ECO] = 0x00;
+  frame[IDX_TX_QUIET] = 0x00;
+  frame[IDX_TX_LED] = 0x00;
   frame[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(frame);
 
   ESP_LOGD(TAG,
-           "Sending direct-value Sleep action: program=%s preserved_wind[16]=0x%02X sleep[17]=0x%02X "
-           "power_mode[18]=0x%02X target[19]=0x%02X features[33]=0x%02X quiet[35]=0x%02X "
+           "Sending legacy-neutral Sleep action: program=%s wind[16]=0x%02X sleep[17]=0x%02X "
+           "power_mode[18]=0x%02X target[19]=0x%02X swing[32]=0x%02X "
+           "features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X "
            "expected Sleep Mode Code=%u beep=0x%02X",
            stage > 0 ? sleep_program_for_stage(stage) : "Off",
            frame[IDX_WIND], frame[IDX_SLEEP], frame[IDX_POWER_MODE], frame[IDX_SET_TEMP],
-           frame[IDX_TX_TURBO_ECO], frame[IDX_TX_QUIET],
-           (unsigned) sleep_status_code_for_stage(stage), frame[IDX_TX_BEEP]);
-  log_frame_("TX Sleep full logical frame", frame);
+           frame[IDX_TX_SWING], frame[IDX_TX_TURBO_ECO], frame[IDX_TX_QUIET],
+           frame[IDX_TX_LED], (unsigned) sleep_status_code_for_stage(stage),
+           frame[IDX_TX_BEEP]);
+  log_frame_("TX Sleep legacy-neutral logical frame", frame);
   send_logical_frame_(frame, "TX Sleep action");
 
   last_tx_frame_.assign(frame.begin(), frame.end());
@@ -1964,10 +1967,10 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan)
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  // Diagnostic direct-value test: write exactly the values observed in status
-  // frames from the physical remote: Off=0, Sleep 1=2, Sleep 2=4,
-  // Sleep 3=6, Sleep 4=8.
-  return sleep_status_code_for_stage(stage);
+  // Legacy YAML command encoding:
+  // Off=0x01, Sleep 1=0x03, Sleep 2=0x05, Sleep 3=0x07, Sleep 4=0x09.
+  const uint8_t status_code = sleep_status_code_for_stage(stage);
+  return static_cast<uint8_t>(status_code | 0x01);
 }
 
 // ---- DEBUG-level UART capture helpers ----
