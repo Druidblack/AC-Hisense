@@ -256,6 +256,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void update_sound_switch_state_();
   void update_memory_switch_state_();
   void publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan);
+  void remember_target_for_mode_(climate::ClimateMode mode, uint8_t target_c);
+  uint8_t target_for_mode_(climate::ClimateMode mode, uint8_t fallback) const;
   void maybe_force_to_target_();                     // <-- добавлено объявление
   void maybe_send_pending_control_();                // (опционально, если используется)
 
@@ -385,6 +387,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t d_target_c_{24};
   climate::ClimateMode d_mode_{climate::CLIMATE_MODE_OFF};
   climate::ClimateMode last_active_mode_{climate::CLIMATE_MODE_COOL};
+  uint8_t last_cool_target_c_{24};
+  uint8_t last_heat_target_c_{24};
   climate::ClimateFanMode d_fan_{climate::CLIMATE_FAN_AUTO};
   bool d_fan_turbo_{false};
   climate::ClimateSwingMode d_swing_{climate::CLIMATE_SWING_OFF};

@@ -24,6 +24,7 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
 }
 
 static const char *const CUSTOM_PRESET_QUIET = "Quiet";
+static const char *const CUSTOM_FAN_QUIET = "Quiet";
 static const char *const CUSTOM_FAN_TURBO = "Turbo";
 
 // Restore the last target temperature after Turbo is turned off from HA.
@@ -92,9 +93,9 @@ void ACHIClimate::setup() {
   if (enable_presets_) {
     this->set_supported_custom_presets({CUSTOM_PRESET_QUIET});
   }
-  // Fan Turbo is exposed as a custom fan mode, not as a preset.
-  // It only sends raw Wind Mode Code 18 without changing target temperature.
-  this->set_supported_custom_fan_modes({CUSTOM_FAN_TURBO});
+  // Quiet and Turbo are exposed as custom fan modes so their names are not
+  // localized by Home Assistant (for example, Quiet must not appear as "Тихий").
+  this->set_supported_custom_fan_modes({CUSTOM_FAN_QUIET, CUSTOM_FAN_TURBO});
 
   // Initial HA‑visible state
   mode = climate::CLIMATE_MODE_OFF;
@@ -107,6 +108,8 @@ void ACHIClimate::setup() {
   d_mode_         = climate::CLIMATE_MODE_OFF;
   last_active_mode_ = climate::CLIMATE_MODE_COOL;
   d_target_c_     = 24;
+  last_cool_target_c_ = 24;
+  last_heat_target_c_ = 24;
   d_fan_          = climate::CLIMATE_FAN_AUTO;
   d_fan_turbo_    = false;
   d_swing_        = climate::CLIMATE_SWING_OFF;
@@ -235,8 +238,7 @@ climate::ClimateTraits ACHIClimate::traits() {
     climate::CLIMATE_MODE_FAN_ONLY
   });
   t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
-                             climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
-                             climate::CLIMATE_FAN_QUIET});
+                             climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH});
   t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
                                climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
   if (enable_presets_) {
@@ -251,6 +253,22 @@ climate::ClimateTraits ACHIClimate::traits() {
   return t;
 }
 
+// ---- Per-mode target temperature memory ----
+void ACHIClimate::remember_target_for_mode_(climate::ClimateMode mode, uint8_t target_c) {
+  target_c = std::max<uint8_t>(16, std::min<uint8_t>(30, target_c));
+  if (mode == climate::CLIMATE_MODE_COOL) {
+    last_cool_target_c_ = target_c;
+  } else if (mode == climate::CLIMATE_MODE_HEAT) {
+    last_heat_target_c_ = target_c;
+  }
+}
+
+uint8_t ACHIClimate::target_for_mode_(climate::ClimateMode mode, uint8_t fallback) const {
+  if (mode == climate::CLIMATE_MODE_COOL) return last_cool_target_c_;
+  if (mode == climate::CLIMATE_MODE_HEAT) return last_heat_target_c_;
+  return fallback;
+}
+
 // ---- Control from HA ----
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
@@ -259,6 +277,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
+      // Preserve the normal setpoint of the mode being turned off. Temporary
+      // Boost/Eco/Sleep targets are intentionally excluded.
+      if (d_power_on_ && !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+        remember_target_for_mode_(d_mode_, d_target_c_);
+      }
+
       if (memory_mode_enabled_) {
         // Remember the last real working mode before OFF. Do not let OFF erase it.
         if (d_power_on_ && d_mode_ != climate::CLIMATE_MODE_OFF) {
@@ -289,6 +313,21 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
                  LOG_STR_ARG(climate::climate_mode_to_string(requested_mode)),
                  LOG_STR_ARG(climate::climate_mode_to_string(last_active_mode_)));
         requested_mode = last_active_mode_;
+      }
+
+      if ((!was_power_on || requested_mode != d_mode_) &&
+          !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+        if (was_power_on && requested_mode != d_mode_) {
+          remember_target_for_mode_(d_mode_, d_target_c_);
+        }
+        const uint8_t restored_target = target_for_mode_(requested_mode, d_target_c_);
+        if ((requested_mode == climate::CLIMATE_MODE_COOL || requested_mode == climate::CLIMATE_MODE_HEAT) &&
+            restored_target != d_target_c_) {
+          ESP_LOGD(TAG, "Mode %s: restoring remembered target %u°C",
+                   LOG_STR_ARG(climate::climate_mode_to_string(requested_mode)),
+                   (unsigned) restored_target);
+        }
+        d_target_c_ = restored_target;
       }
 
       d_mode_ = requested_mode;
@@ -322,6 +361,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
       d_target_c_ = c;
+      remember_target_for_mode_(d_mode_, c);
       changed = true;
     }
   }
@@ -431,7 +471,15 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
-    if (custom_fan == CUSTOM_FAN_TURBO) {
+    if (custom_fan == CUSTOM_FAN_QUIET) {
+      d_fan_turbo_ = false;
+      d_fan_ = climate::CLIMATE_FAN_QUIET;
+      d_quiet_ = true;
+      d_turbo_ = false;
+      d_eco_ = false;
+      d_sleep_stage_ = 0;
+      changed = true;
+    } else if (custom_fan == CUSTOM_FAN_TURBO) {
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
       d_fan_turbo_ = true;
@@ -1249,6 +1297,8 @@ void ACHIClimate::handle_ack_101_() {
 void ACHIClimate::publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan) {
   if (turbo_fan) {
     this->set_custom_fan_mode_(CUSTOM_FAN_TURBO);
+  } else if (fan == climate::CLIMATE_FAN_QUIET) {
+    this->set_custom_fan_mode_(CUSTOM_FAN_QUIET);
   } else {
     this->set_fan_mode_(fan);
   }
@@ -1313,6 +1363,13 @@ void ACHIClimate::publish_gated_state_() {
 
     if (memory_mode_enabled_ && power_on_ && mode_ != climate::CLIMATE_MODE_OFF) {
       last_active_mode_ = mode_;
+    }
+
+    // Learn normal COOL/HEAT setpoints from the physical remote or the indoor
+    // controller. Temporary preset targets (Boost/Eco/Sleep) must not overwrite
+    // the remembered temperatures.
+    if (!out_turbo && !out_eco && out_sleep_stage == 0) {
+      remember_target_for_mode_(mode_, target_c_);
     }
 
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
