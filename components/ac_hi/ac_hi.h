@@ -102,6 +102,22 @@ enum FrameIndex : uint8_t {
   IDX_COMPRESSOR_EXHAUST_TEMP = 46,
 };
 
+// Command fields in the 0x65 write frame. A zero byte means "do not change"
+// for the corresponding AC setting. Normal Home Assistant commands therefore
+// queue only the fields that actually changed instead of retransmitting a full
+// climate state and accidentally clearing action-style modes such as Sleep.
+enum CommandFieldMask : uint16_t {
+  CMD_FIELD_NONE       = 0,
+  CMD_FIELD_WIND       = 1u << 0,
+  CMD_FIELD_SLEEP      = 1u << 1,
+  CMD_FIELD_POWER_MODE = 1u << 2,
+  CMD_FIELD_TEMP       = 1u << 3,
+  CMD_FIELD_SWING      = 1u << 4,
+  CMD_FIELD_TURBO_ECO  = 1u << 5,
+  CMD_FIELD_QUIET      = 1u << 6,
+  CMD_FIELD_LED        = 1u << 7,
+};
+
 // Bit masks within specific bytes
 enum BitMasks : uint8_t {
   POWER_MASK      = 0b00001000,
@@ -250,7 +266,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_ack_101_();
 
   // State management
-  void build_tx_from_desired_();
+  void build_tx_from_pending_fields_(uint16_t fields);
+  void queue_retry_fields_from_state_();
   void publish_gated_state_();
   void update_led_switch_state_();
   void update_sound_switch_state_();
@@ -303,8 +320,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool status_query_in_flight_{false};
   uint32_t status_query_time_{0};
 
-  // Pending control from HA (debounced)
+  // Pending control from HA (debounced). pending_command_fields_ contains
+  // exactly the action fields that will be written; all other 0x65 payload
+  // bytes stay zero/neutral.
   bool pending_control_{false};
+  uint16_t pending_command_fields_{CMD_FIELD_NONE};
   uint32_t last_control_ms_{0};
 
   // True only after a UART write containing desired Sleep was actually sent.

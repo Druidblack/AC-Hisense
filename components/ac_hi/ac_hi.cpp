@@ -235,7 +235,7 @@ void ACHIClimate::loop() {
   if (pending_control_ && !writing_lock_ && !status_query_in_flight_ &&
       (millis() - last_control_ms_ >= CONTROL_DEBOUNCE_MS)) {
     send_write_changes_();
-    pending_control_ = false;
+    pending_control_ = pending_command_fields_ != CMD_FIELD_NONE;
   }
 
   // 8. Optional memory diagnostics
@@ -289,6 +289,20 @@ uint8_t ACHIClimate::target_for_mode_(climate::ClimateMode mode, uint8_t fallbac
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
   bool was_power_on = d_power_on_;
+
+  // Snapshot the desired state. After applying the ClimateCall we compare the
+  // result with this snapshot and queue only the fields that really changed.
+  const bool before_power_on = d_power_on_;
+  const auto before_mode = d_mode_;
+  const uint8_t before_target = d_target_c_;
+  const auto before_fan = d_fan_;
+  const bool before_fan_turbo = d_fan_turbo_;
+  const auto before_swing = d_swing_;
+  const bool before_turbo = d_turbo_;
+  const bool before_eco = d_eco_;
+  const bool before_quiet = d_quiet_;
+  const bool before_led = d_led_;
+  const uint8_t before_sleep_stage = d_sleep_stage_;
 
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
@@ -531,6 +545,31 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (!changed) return;
 
+  uint16_t changed_fields = CMD_FIELD_NONE;
+  if (d_power_on_ != before_power_on || d_mode_ != before_mode)
+    changed_fields |= CMD_FIELD_POWER_MODE;
+  if (d_target_c_ != before_target)
+    changed_fields |= CMD_FIELD_TEMP;
+  if (d_fan_ != before_fan || d_fan_turbo_ != before_fan_turbo)
+    changed_fields |= CMD_FIELD_WIND;
+  if (d_swing_ != before_swing)
+    changed_fields |= CMD_FIELD_SWING;
+  if (d_turbo_ != before_turbo || d_eco_ != before_eco)
+    changed_fields |= CMD_FIELD_TURBO_ECO;
+  if (d_quiet_ != before_quiet)
+    changed_fields |= CMD_FIELD_QUIET;
+  if (d_led_ != before_led || led_command_pending_)
+    changed_fields |= CMD_FIELD_LED;
+  if (d_sleep_stage_ != before_sleep_stage)
+    changed_fields |= CMD_FIELD_SLEEP;
+
+  // A no-op ClimateCall does not need an empty write frame.
+  if (changed_fields == CMD_FIELD_NONE) {
+    ESP_LOGD(TAG, "Control: desired state unchanged; no UART write queued");
+    return;
+  }
+  pending_command_fields_ |= changed_fields;
+
   // HA takes priority over remote changes
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
@@ -562,51 +601,70 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
            command_sound_enabled_ ? "ON" : "OFF", (unsigned long) CONTROL_DEBOUNCE_MS);
 }
 
-// ---- Build TX frame from desired state ----
-void ACHIClimate::build_tx_from_desired_() {
-  // Power + mode (byte 18)
-  uint8_t power_bin = d_power_on_ ? 0b00001100 : 0b00000100;
-  uint8_t mode_hi = encode_mode_hi_nibble_(d_mode_); // returns nibble << 4
-  tx_bytes_[IDX_POWER_MODE] = power_bin + mode_hi;
+// ---- Build a one-shot neutral TX frame ----
+void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
+  // Bytes 16..45 are command/action payload. Zero means "do not change".
+  // Never copy the complete desired state into an ordinary write frame.
+  std::fill(tx_bytes_.begin() + IDX_WIND, tx_bytes_.begin() + 46, 0x00);
 
-  // Target temperature (encoded)
-  tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
-
-  // Fan speed (byte 16)
-  tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
-
-  // Sleep mode (byte 17)
-  tx_bytes_[IDX_SLEEP] = encode_sleep_byte_(d_sleep_stage_);
-
-  // Swing (byte 32)
-  bool v = (d_swing_ == climate::CLIMATE_SWING_VERTICAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
-  bool h = (d_swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
-  uint8_t updown = v ? TxValues::UPDOWN_ON : TxValues::UPDOWN_OFF;
-  uint8_t leftright = h ? TxValues::LEFTRIGHT_ON : TxValues::LEFTRIGHT_OFF;
-  tx_bytes_[IDX_TX_SWING] = updown + leftright;
-
-  // Turbo, Eco, Quiet (bytes 33 and 35) – Turbo has priority
-  if (d_turbo_) {
-    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_ON;
-    tx_bytes_[IDX_TX_QUIET] = TxValues::QUIET_OFF;   // Turbo disables quiet
-  } else {
-    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_OFF + (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF);
-    tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
+  if (fields & CMD_FIELD_POWER_MODE) {
+    const uint8_t power_bin = d_power_on_ ? 0b00001100 : 0b00000100;
+    const uint8_t mode_hi = encode_mode_hi_nibble_(d_mode_);
+    tx_bytes_[IDX_POWER_MODE] = power_bin + mode_hi;
   }
 
-  // Display/LED command (byte 36).
-  // 0xC0/0x40 are explicit display ON/OFF actions.
-  // Keep automatic HA-priority re-sends neutral (0x00) so they stay silent.
-  // But when the user sends a real climate command while the display is OFF,
-  // include LED_OFF once in that command; otherwise this indoor unit turns the
-  // front display back on after mode/preset changes. This must be independent
-  // from audible confirmation, because sound can be disabled by sound_switch.
-  if (led_command_pending_) {
+  if (fields & CMD_FIELD_TEMP)
+    tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
+
+  if (fields & CMD_FIELD_WIND)
+    tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
+
+  if (fields & CMD_FIELD_SLEEP)
+    tx_bytes_[IDX_SLEEP] = encode_sleep_byte_(d_sleep_stage_);
+
+  if (fields & CMD_FIELD_SWING) {
+    const bool v = d_swing_ == climate::CLIMATE_SWING_VERTICAL ||
+                   d_swing_ == climate::CLIMATE_SWING_BOTH;
+    const bool h = d_swing_ == climate::CLIMATE_SWING_HORIZONTAL ||
+                   d_swing_ == climate::CLIMATE_SWING_BOTH;
+    tx_bytes_[IDX_TX_SWING] = (v ? TxValues::UPDOWN_ON : TxValues::UPDOWN_OFF) +
+                              (h ? TxValues::LEFTRIGHT_ON : TxValues::LEFTRIGHT_OFF);
+  }
+
+  if (fields & CMD_FIELD_TURBO_ECO) {
+    tx_bytes_[IDX_TX_TURBO_ECO] = d_turbo_
+        ? TxValues::TURBO_ON
+        : static_cast<uint8_t>(TxValues::TURBO_OFF +
+                               (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF));
+  }
+
+  if (fields & CMD_FIELD_QUIET)
+    tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
+
+  // Display is also action-style. Send it only when explicitly changed, or
+  // append LED_OFF once to a real user command while the desired display is off.
+  if ((fields & CMD_FIELD_LED) || (user_command_next_write_ && !d_led_))
     tx_bytes_[IDX_TX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
-  } else if (user_command_next_write_ && !d_led_) {
-    tx_bytes_[IDX_TX_LED] = TxValues::LED_OFF;
-  } else {
-    tx_bytes_[IDX_TX_LED] = 0x00;
+}
+
+// Queue only the fields that still differ after a status response. Sleep is
+// deliberately excluded: Sleep Mode Code is authoritative and failed Sleep
+// activation is handled by the confirmation/rollback logic without retries.
+void ACHIClimate::queue_retry_fields_from_state_() {
+  if (d_power_on_ != power_on_ || (d_power_on_ && d_mode_ != mode_))
+    pending_command_fields_ |= CMD_FIELD_POWER_MODE;
+
+  if (d_power_on_ && power_on_) {
+    if (d_target_c_ != target_c_)
+      pending_command_fields_ |= CMD_FIELD_TEMP;
+    if (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_)
+      pending_command_fields_ |= CMD_FIELD_WIND;
+    if (d_swing_ != swing_)
+      pending_command_fields_ |= CMD_FIELD_SWING;
+    if (d_turbo_ != turbo_ || d_eco_ != eco_)
+      pending_command_fields_ |= CMD_FIELD_TURBO_ECO;
+    if (d_quiet_ != quiet_)
+      pending_command_fields_ |= CMD_FIELD_QUIET;
   }
 }
 
@@ -620,18 +678,29 @@ void ACHIClimate::send_query_status_() {
 
 // ---- Send write command ----
 void ACHIClimate::send_write_changes_() {
-  build_tx_from_desired_();                // ensure tx_bytes_ reflects latest d_*
-  // A Sleep request becomes pending only after a frame containing it is
-  // actually transmitted. This prevents an older in-flight status response
-  // with Sleep Mode Code=0 from rejecting a command before it was sent.
-  sleep_confirmation_pending_ = d_sleep_stage_ > 0;
+  const uint16_t fields = pending_command_fields_;
+  if (fields == CMD_FIELD_NONE) {
+    ESP_LOGV(TAG, "Pending write contained no command fields; skipped");
+    return;
+  }
+
+  build_tx_from_pending_fields_(fields);
+
+  // Sleep confirmation is armed only when this exact one-shot frame contains
+  // a Sleep action. Ordinary commands keep byte 17 equal to 0x00.
+  sleep_confirmation_pending_ = (fields & CMD_FIELD_SLEEP) && d_sleep_stage_ > 0;
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
-  ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
-           tx_bytes_[IDX_TX_BEEP], tx_bytes_[IDX_TX_LED]);
-  send_logical_frame_(tx_bytes_, "TX write");
+  ESP_LOGD(TAG,
+           "Sending neutral one-shot write (0x65): fields=0x%02X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X beep[23]=0x%02X",
+           (unsigned) fields, tx_bytes_[IDX_WIND], tx_bytes_[IDX_SLEEP],
+           tx_bytes_[IDX_POWER_MODE], tx_bytes_[IDX_SET_TEMP],
+           tx_bytes_[IDX_TX_SWING], tx_bytes_[IDX_TX_TURBO_ECO],
+           tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED], tx_bytes_[IDX_TX_BEEP]);
+  send_logical_frame_(tx_bytes_, "TX one-shot write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
+  pending_command_fields_ &= static_cast<uint16_t>(~fields);
   beep_on_next_write_ = false;
   user_command_next_write_ = false;
   led_command_pending_ = false;
@@ -1179,6 +1248,17 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     default:   sleep_stage_ = 0; break;
   }
 
+  // Once Sleep was confirmed, a later status code 0 is authoritative too.
+  // Clear the desired preset instead of trying to reconstruct it with ordinary
+  // climate writes. A newly transmitted Sleep request is handled separately
+  // below by sleep_confirmation_pending_.
+  if (!sleep_confirmation_pending_ && d_sleep_stage_ > 0 && sleep_stage_ == 0) {
+    d_sleep_stage_ = 0;
+    pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+    recalc_desired_sig_();
+    ESP_LOGD(TAG, "Sleep Mode Code returned to 0; clearing desired HA Sleep preset");
+  }
+
   // Target temperature (direct value)
   target_c_ = b[IDX_SET_TEMP];
   if (target_c_ < 16 || target_c_ > 30) target_c_ = 24; // fallback
@@ -1255,6 +1335,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
         accept_remote_changes_ = false;
         ha_priority_active_ = true;
         recalc_desired_sig_();
+        pending_command_fields_ |= CMD_FIELD_WIND | CMD_FIELD_QUIET | CMD_FIELD_TURBO_ECO;
         pending_control_ = true;
         last_control_ms_ = millis();
         user_command_next_write_ = false;
@@ -1533,7 +1614,17 @@ void ACHIClimate::maybe_force_to_target_() {
   }
 
   if (!writing_lock_) {
-    ESP_LOGD(TAG, "Enforcing desired state (actual≠desired) – requesting write");
+    queue_retry_fields_from_state_();
+    if (pending_command_fields_ == CMD_FIELD_NONE) {
+      // The only remaining mismatch can be an action-style field such as
+      // Sleep or display. Do not generate a full-state retry.
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      ESP_LOGD(TAG, "Desired/actual mismatch has no retryable one-shot fields; accepting status");
+      return;
+    }
+    ESP_LOGD(TAG, "Enforcing desired state with neutral one-shot fields=0x%02X",
+             (unsigned) pending_command_fields_);
     pending_control_ = true;
     last_control_ms_ = millis();   // restart debounce
   }
@@ -1662,6 +1753,7 @@ void ACHIClimate::set_desired_led(bool on) {
   }
 
   led_command_pending_ = true;
+  pending_command_fields_ |= CMD_FIELD_LED;
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
   recalc_desired_sig_();
