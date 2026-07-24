@@ -49,8 +49,10 @@ static uint8_t sleep_stage_from_program(const std::string &program) {
   return 0;
 }
 
-// Status frames from this indoor unit report Sleep 1..4 as 2,4,6,8.
-// Write frames use the corresponding odd action value 3,5,7,9.
+// This indoor unit reports Sleep 1..4 as the direct values 2,4,6,8.
+// Previous tests with odd write values 3,5,7,9 were acknowledged by the UART
+// controller but ignored by the indoor unit. This diagnostic build therefore
+// writes the observed even values directly.
 static uint8_t sleep_status_code_for_stage(uint8_t stage) {
   return (stage >= 1 && stage <= 4) ? static_cast<uint8_t>(stage << 1) : 0;
 }
@@ -786,12 +788,12 @@ void ACHIClimate::send_sleep_action_(uint8_t stage) {
   const climate::ClimateFanMode sleep_action_fan = power_on_ ? fan_ : d_fan_;
   const bool sleep_action_fan_turbo = power_on_ ? fan_turbo_ : d_fan_turbo_;
   frame[IDX_WIND] = encode_fan_byte_(sleep_action_fan, sleep_action_fan_turbo);
-  frame[IDX_SLEEP] = stage > 0 ? encode_sleep_byte_(stage) : 0x01;
+  frame[IDX_SLEEP] = encode_sleep_byte_(stage);
   frame[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(frame);
 
   ESP_LOGD(TAG,
-           "Sending full-state Sleep action: program=%s preserved_wind[16]=0x%02X sleep[17]=0x%02X "
+           "Sending direct-value Sleep action: program=%s preserved_wind[16]=0x%02X sleep[17]=0x%02X "
            "power_mode[18]=0x%02X target[19]=0x%02X features[33]=0x%02X quiet[35]=0x%02X "
            "expected Sleep Mode Code=%u beep=0x%02X",
            stage > 0 ? sleep_program_for_stage(stage) : "Off",
@@ -1747,16 +1749,21 @@ void ACHIClimate::maybe_force_to_target_() {
 
   if (!writing_lock_) {
     if (d_sleep_stage_ != sleep_stage_) {
-      ESP_LOGD(TAG,
-               "Enforcing desired Sleep state: actual=%u desired=%u – queuing dedicated Sleep action",
+      // Sleep writes are deliberately one-shot in this diagnostic build.
+      // Repeating a rejected command every status cycle obscures the capture
+      // and can keep the indoor controller busy without changing its state.
+      ESP_LOGW(TAG,
+               "Sleep command was not confirmed: actual=%u desired=%u; "
+               "automatic retries disabled for direct-value test",
                (unsigned) sleep_stage_, (unsigned) d_sleep_stage_);
-      pending_sleep_action_ = true;
-      pending_sleep_stage_ = d_sleep_stage_;
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      return;
     } else {
       ESP_LOGD(TAG, "Enforcing desired state (actual≠desired) – requesting normal write");
       pending_control_ = true;
+      last_control_ms_ = millis();   // restart debounce
     }
-    last_control_ms_ = millis();   // restart debounce
   }
 }
 
@@ -1957,9 +1964,10 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan)
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  // Status values are 0,2,4,6,8. A write uses the corresponding odd action
-  // value: off=1, Sleep 1=3, Sleep 2=5, Sleep 3=7, Sleep 4=9.
-  return static_cast<uint8_t>(sleep_status_code_for_stage(stage) | 0x01);
+  // Diagnostic direct-value test: write exactly the values observed in status
+  // frames from the physical remote: Off=0, Sleep 1=2, Sleep 2=4,
+  // Sleep 3=6, Sleep 4=8.
+  return sleep_status_code_for_stage(stage);
 }
 
 // ---- DEBUG-level UART capture helpers ----
