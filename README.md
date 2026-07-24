@@ -133,14 +133,26 @@ climate:
       accuracy_decimals: 0
       icon: "mdi:coolant-temperature"
 
+    compressor_frequency:
+      name: "Compressor Frequency"
+      unit_of_measurement: "Hz"
+      accuracy_decimals: 0
+      icon: "mdi:sine-wave"
+
+    compressor_frequency_actual:
+      name: "Compressor Frequency Actual"
+      unit_of_measurement: "Hz"
+      accuracy_decimals: 0
+      icon: "mdi:sine-wave"
+    
     compressor_frequency_set:
       name: "Compressor Frequency Set"
       unit_of_measurement: "Hz"
       accuracy_decimals: 0
       icon: "mdi:sine-wave"
-
-    compressor_frequency:
-      name: "Compressor Frequency"
+    
+    compressor_frequency_command:
+      name: "Compressor Frequency Command"
       unit_of_measurement: "Hz"
       accuracy_decimals: 0
       icon: "mdi:sine-wave"
