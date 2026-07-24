@@ -2,7 +2,7 @@ import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
 from esphome.components import climate, uart, sensor, switch, text_sensor, remote_base
-from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_NONE, ICON_LIGHTBULB
+from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ICON_LIGHTBULB
 
 AUTO_LOAD = ["climate", "uart", "sensor", "switch", "text_sensor", "remote_base"]
 
@@ -86,22 +86,10 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_ECONOMY): sensor.sensor_schema(),
     cv.Optional(CONF_SWING_UD): sensor.sensor_schema(),
     cv.Optional(CONF_SWING_LR): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR_ACTUAL): sensor.sensor_schema(
-        icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_NONE,
-    ),
-    cv.Optional(CONF_COMP_FR_SET): sensor.sensor_schema(
-        icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_NONE,
-    ),
-    cv.Optional(CONF_COMP_FR_COMMAND): sensor.sensor_schema(
-        icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_NONE,
-    ),
-    cv.Optional(CONF_COMP_FR): sensor.sensor_schema(
-        icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_NONE,
-    ),
+    cv.Optional(CONF_COMP_FR_ACTUAL): sensor.sensor_schema(),
+    cv.Optional(CONF_COMP_FR_SET): sensor.sensor_schema(),
+    cv.Optional(CONF_COMP_FR_COMMAND): sensor.sensor_schema(),
+    cv.Optional(CONF_COMP_FR): sensor.sensor_schema(),
     cv.Optional(CONF_OUTDOOR_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
@@ -114,7 +102,6 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_LED_SWITCH): switch.switch_schema(
         ACHILEDTargetSwitch,
         icon=ICON_LIGHTBULB,
-        entity_category=ENTITY_CATEGORY_NONE,
     ),
     # Command sound switch is created by default. The user may still override its
     # name/icon by specifying sound_switch: in YAML.
