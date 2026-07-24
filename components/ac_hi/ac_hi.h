@@ -362,6 +362,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // only indirectly via this code when the display is off.
   uint8_t last_raw_wind_{0};
 
+  // Last raw byte 17 from a status frame. Used to log and synchronize the
+  // Sleep Program select only when the real AC value changes.
+  uint8_t last_raw_sleep_code_{0xFF};
+
   // Base write frame (template)
   std::vector<uint8_t> tx_bytes_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x29, 0x00, 0x00, 0x01, 0x01, 0xFE, 0x01, 0x00, 0x00,

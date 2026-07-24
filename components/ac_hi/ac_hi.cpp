@@ -48,6 +48,12 @@ static uint8_t sleep_stage_from_program(const std::string &program) {
   return 0;
 }
 
+// Status frames from this indoor unit report Sleep 1..4 as 2,4,6,8.
+// Write frames use the corresponding odd action value 3,5,7,9.
+static uint8_t sleep_status_code_for_stage(uint8_t stage) {
+  return (stage >= 1 && stage <= 4) ? static_cast<uint8_t>(stage << 1) : 0;
+}
+
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
 static bool g_has_pre_turbo_target = false;
@@ -332,8 +338,7 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
   update_sleep_program_select_state_();
 
   // Merely choosing a program does not enable Sleep. If the standard Sleep
-  // preset is already active, switch its protocol stage immediately without
-  // applying the +1°C entry adjustment again.
+  // preset is already active, switch its protocol stage immediately.
   if (d_sleep_stage_ == 0 || !changed_selection) {
     ESP_LOGD(TAG, "Sleep program selected for next Sleep preset: %s", value.c_str());
     return;
@@ -358,8 +363,10 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
   user_command_next_write_ = true;
   beep_on_next_write_ = command_sound_enabled_;
 
-  ESP_LOGD(TAG, "Active Sleep program changed to %s (TX byte 17 = 0x%02X)",
-           value.c_str(), (unsigned) encode_sleep_byte_(stage));
+  ESP_LOGD(TAG,
+           "Active Sleep program changed to %s: TX byte 17=0x%02X, expected Sleep Mode Code=%u",
+           value.c_str(), (unsigned) encode_sleep_byte_(stage),
+           (unsigned) sleep_status_code_for_stage(stage));
 }
 
 // ---- Control from HA ----
@@ -478,7 +485,6 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
-    bool was_sleep = d_sleep_stage_ > 0;
 
     d_eco_ = false;
     d_turbo_ = false;
@@ -524,20 +530,20 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       }
     } else if (p == climate::CLIMATE_PRESET_SLEEP) {
       // The dropdown chooses which protocol program the standard Sleep preset
-      // activates. Increase the target only when entering Sleep, not when the
-      // preset is selected again or the dropdown changes while Sleep is active.
-      if (!was_sleep && d_target_c_ < 30) {
-        d_target_c_ += 1;
-      }
+      // activates. The target temperature is left unchanged; the indoor unit
+      // executes the selected Sleep program itself.
       d_sleep_stage_ = selected_sleep_stage_;
       d_fan_turbo_ = false;
       d_quiet_ = false;
       d_turbo_ = false;
       d_eco_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
-      ESP_LOGD(TAG, "Standard Sleep preset selected: %s (TX byte 17 = 0x%02X)",
-               sleep_program_for_stage(d_sleep_stage_),
-               (unsigned) encode_sleep_byte_(d_sleep_stage_));
+      ESP_LOGD(TAG,
+               "Standard Sleep preset selected: %s, target unchanged at %u°C, "
+               "TX byte 17=0x%02X, expected Sleep Mode Code=%u",
+               sleep_program_for_stage(d_sleep_stage_), (unsigned) d_target_c_,
+               (unsigned) encode_sleep_byte_(d_sleep_stage_),
+               (unsigned) sleep_status_code_for_stage(d_sleep_stage_));
     } else if (p == climate::CLIMATE_PRESET_NONE) {
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
@@ -682,6 +688,10 @@ void ACHIClimate::send_write_changes_() {
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
            tx_bytes_[IDX_TX_BEEP], tx_bytes_[IDX_TX_LED]);
+  ESP_LOGD(TAG,
+           "TX Sleep field: program=%s, byte[17]=0x%02X, expected Sleep Mode Code=%u",
+           d_sleep_stage_ > 0 ? sleep_program_for_stage(d_sleep_stage_) : "Off",
+           tx_bytes_[IDX_SLEEP], (unsigned) sleep_status_code_for_stage(d_sleep_stage_));
   send_logical_frame_(tx_bytes_, "TX write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
@@ -1213,20 +1223,36 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_turbo_ = false;
   }
 
-  // Sleep stage.
-  // Some units report the live status as direct values 0..4,
-  // while writes still use the encoded form (value<<1)|1.
-  uint8_t raw_sleep = b[IDX_SLEEP];
+  // Sleep stage. This indoor unit reports the live status as even values:
+  //   0 = off, 2 = Sleep 1, 4 = Sleep 2, 6 = Sleep 3, 8 = Sleep 4.
+  // Odd values 1,3,5,7,9 are accepted as write/action echoes for compatibility.
+  const uint8_t raw_sleep = b[IDX_SLEEP];
+  const uint8_t previous_raw_sleep = last_raw_sleep_code_;
+  last_raw_sleep_code_ = raw_sleep;
   switch (raw_sleep) {
-    case 0x00: sleep_stage_ = 0; break;
-    case 0x01: sleep_stage_ = 1; break;
-    case 0x02: sleep_stage_ = 2; break;
+    case 0x00:
+    case 0x01: sleep_stage_ = 0; break;
+    case 0x02:
     case 0x03: sleep_stage_ = 1; break;
-    case 0x04: sleep_stage_ = 3; break;
+    case 0x04:
     case 0x05: sleep_stage_ = 2; break;
-    case 0x09: sleep_stage_ = 3; break;
+    case 0x06:
+    case 0x07: sleep_stage_ = 3; break;
+    case 0x08:
+    case 0x09:
     case 0x11: sleep_stage_ = 4; break;
     default:   sleep_stage_ = 0; break;
+  }
+
+  if (previous_raw_sleep != raw_sleep) {
+    if (sleep_stage_ > 0) {
+      ESP_LOGD(TAG, "RX Sleep Mode Code changed: %u (0x%02X) -> %s",
+               (unsigned) raw_sleep, (unsigned) raw_sleep,
+               sleep_program_for_stage(sleep_stage_));
+    } else {
+      ESP_LOGD(TAG, "RX Sleep Mode Code changed: %u (0x%02X) -> Off",
+               (unsigned) raw_sleep, (unsigned) raw_sleep);
+    }
   }
 
   // Target temperature (direct value)
@@ -1396,7 +1422,7 @@ void ACHIClimate::publish_gated_state_() {
     // those presets indirectly via target temperature and raw fan/wind code:
     //   BOOST -> target 16/30 and raw wind 18
     //   ECO   -> target 24 and raw wind 10
-    //   SLEEP -> previous target+1 and raw wind 10
+    //   SLEEP -> explicit Sleep Mode Code, or raw wind 10 as a fallback
     // If the last HA-selected preset still matches that indirect state, keep it
     // visible in HA instead of immediately publishing Preset=None on the next
     // status frame.
@@ -1422,7 +1448,7 @@ void ACHIClimate::publish_gated_state_() {
         out_sleep_stage = 0;
         out_fan = d_fan_;
         out_fan_turbo = false;
-      } else if (d_sleep_stage_ > 0 && last_raw_wind_ == 10) {
+      } else if (d_sleep_stage_ > 0 && sleep_stage_ == 0 && last_raw_wind_ == 10) {
         out_turbo = false;
         out_eco = false;
         out_quiet = false;
@@ -1485,6 +1511,9 @@ void ACHIClimate::publish_gated_state_() {
     if (out_sleep_stage > 0 && selected_sleep_stage_ != out_sleep_stage) {
       selected_sleep_stage_ = out_sleep_stage;
       update_sleep_program_select_state_();
+      ESP_LOGD(TAG, "Sleep Program select synchronized from AC: %s (Sleep Mode Code=%u)",
+               sleep_program_for_stage(selected_sleep_stage_),
+               (unsigned) last_raw_sleep_code_);
     }
     recalc_desired_sig_();
   } else {
@@ -1645,7 +1674,10 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_sleep_stage = 0;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
-    } else if (d_sleep_stage_ > 0 && target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
+    } else if (d_sleep_stage_ > 0 && sleep_stage_ == 0 &&
+               target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
+      // Fallback only for firmware that does not expose an explicit Sleep code.
+      // When a non-zero code is present, require the exact selected stage.
       effective_sleep_stage = d_sleep_stage_;
       effective_eco = false;
       effective_turbo = false;
@@ -1759,15 +1791,9 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan)
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  uint8_t code = 0;
-  switch (stage) {
-    case 1: code = 1; break;
-    case 2: code = 2; break;
-    case 3: code = 4; break;
-    case 4: code = 8; break;
-    default: code = 0; break;
-  }
-  return static_cast<uint8_t>((code << 1) | 0x01);
+  // Status values are 0,2,4,6,8. A write uses the corresponding odd action
+  // value: off=1, Sleep 1=3, Sleep 2=5, Sleep 3=7, Sleep 4=9.
+  return static_cast<uint8_t>(sleep_status_code_for_stage(stage) | 0x01);
 }
 
 // ---- Logging helper ----
