@@ -47,19 +47,14 @@ CONF_ECONOMY = "economy"
 CONF_SWING_UD = "swing_up_down"
 CONF_SWING_LR = "swing_left_right"
 CONF_POWER_STATUS = "power_status"
+CONF_COMP_FR_ACTUAL = "compressor_frequency_actual"
 CONF_COMP_FR_SET = "compressor_frequency_set"
+CONF_COMP_FR_COMMAND = "compressor_frequency_command"
+# Backward-compatible alias for byte 43 used by older YAML configurations.
 CONF_COMP_FR = "compressor_frequency"
 CONF_OUTDOOR_TEMP = "outdoor_temperature"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
 CONF_COMPRESSOR_EXHAUST_TEMP = "compressor_exhaust_temperature"
-
-# Temporary raw status-byte diagnostics (zero-based frame indexes)
-CONF_RAW_BYTE_22 = "raw_byte_22"
-CONF_RAW_BYTE_23 = "raw_byte_23"
-CONF_RAW_BYTE_41 = "raw_byte_41"
-CONF_RAW_BYTE_42 = "raw_byte_42"
-CONF_RAW_BYTE_43 = "raw_byte_43"
-CONF_RAW_BYTE_47 = "raw_byte_47"
 
 # New memory diagnostics sensor keys
 CONF_HEAP_FREE = "heap_free"
@@ -91,19 +86,13 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_ECONOMY): sensor.sensor_schema(),
     cv.Optional(CONF_SWING_UD): sensor.sensor_schema(),
     cv.Optional(CONF_SWING_LR): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR_SET): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR): sensor.sensor_schema(),
+    cv.Optional(CONF_COMP_FR_ACTUAL): sensor.sensor_schema(icon="mdi:sine-wave"),
+    cv.Optional(CONF_COMP_FR_SET): sensor.sensor_schema(icon="mdi:sine-wave"),
+    cv.Optional(CONF_COMP_FR_COMMAND): sensor.sensor_schema(icon="mdi:sine-wave"),
+    cv.Optional(CONF_COMP_FR): sensor.sensor_schema(icon="mdi:sine-wave"),
     cv.Optional(CONF_OUTDOOR_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
-
-    # Temporary raw status-byte diagnostics
-    cv.Optional(CONF_RAW_BYTE_22): sensor.sensor_schema(),
-    cv.Optional(CONF_RAW_BYTE_23): sensor.sensor_schema(),
-    cv.Optional(CONF_RAW_BYTE_41): sensor.sensor_schema(),
-    cv.Optional(CONF_RAW_BYTE_42): sensor.sensor_schema(),
-    cv.Optional(CONF_RAW_BYTE_43): sensor.sensor_schema(),
-    cv.Optional(CONF_RAW_BYTE_47): sensor.sensor_schema(),
 
     # Power status is a text sensor ("ON"/"OFF")
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
@@ -113,7 +102,6 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_LED_SWITCH): switch.switch_schema(
         ACHILEDTargetSwitch,
         icon=ICON_LIGHTBULB,
-        entity_category=ENTITY_CATEGORY_CONFIG,
     ),
     # Command sound switch is created by default. The user may still override its
     # name/icon by specifying sound_switch: in YAML.
@@ -203,10 +191,19 @@ async def to_code(config):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_swing_lr_sensor(sens))
 
+    if conf := config.get(CONF_COMP_FR_ACTUAL):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_compr_freq_actual_sensor(sens))
+
     if conf := config.get(CONF_COMP_FR_SET):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compr_freq_set_sensor(sens))
 
+    if conf := config.get(CONF_COMP_FR_COMMAND):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_compr_freq_command_sensor(sens))
+
+    # Legacy key retained for compatibility. It still publishes status byte 43.
     if conf := config.get(CONF_COMP_FR):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compr_freq_sensor(sens))
@@ -222,31 +219,6 @@ async def to_code(config):
     if conf := config.get(CONF_COMPRESSOR_EXHAUST_TEMP):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compressor_exhaust_temp_sensor(sens))
-
-    # Temporary raw status-byte diagnostics
-    if conf := config.get(CONF_RAW_BYTE_22):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_22_sensor(sens))
-
-    if conf := config.get(CONF_RAW_BYTE_23):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_23_sensor(sens))
-
-    if conf := config.get(CONF_RAW_BYTE_41):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_41_sensor(sens))
-
-    if conf := config.get(CONF_RAW_BYTE_42):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_42_sensor(sens))
-
-    if conf := config.get(CONF_RAW_BYTE_43):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_43_sensor(sens))
-
-    if conf := config.get(CONF_RAW_BYTE_47):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_raw_byte_47_sensor(sens))
 
     # Optional text sensor for power status
     if conf := config.get(CONF_POWER_STATUS):

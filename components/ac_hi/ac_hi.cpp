@@ -275,8 +275,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       if (memory_mode_enabled_ && !was_power_on && last_active_mode_ != climate::CLIMATE_MODE_OFF &&
           requested_mode != last_active_mode_) {
         ESP_LOGD(TAG, "Power-on mode %s replaced by last active mode %s because Memory is ON",
-                 climate::climate_mode_to_string(requested_mode),
-                 climate::climate_mode_to_string(last_active_mode_));
+                 LOG_STR_ARG(climate::climate_mode_to_string(requested_mode)),
+                 LOG_STR_ARG(climate::climate_mode_to_string(last_active_mode_)));
         requested_mode = last_active_mode_;
       }
 
@@ -462,8 +462,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   user_command_next_write_ = true;
   beep_on_next_write_ = command_sound_enabled_;
 
-  ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %ums debounce",
-           command_sound_enabled_ ? "ON" : "OFF", CONTROL_DEBOUNCE_MS);
+  ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %lums debounce",
+           command_sound_enabled_ ? "ON" : "OFF", (unsigned long) CONTROL_DEBOUNCE_MS);
 }
 
 // ---- Build TX frame from desired state ----
@@ -1024,11 +1024,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   publish_gated_state_();
   update_led_switch_state_();
 
-  // Keep still-unmapped candidate fields available only in verbose logs.
   ESP_LOGV(TAG,
-           "Extended status: compressor_set=%uHz compressor=%uHz exhaust=%u°C raw_b47=%u/%d raw_b48=%u/%d",
-           b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ], b[IDX_COMPRESSOR_EXHAUST_TEMP],
-           b[47], static_cast<int8_t>(b[47]),
+           "Extended status: compressor_actual=%uHz compressor_set=%uHz compressor_command=%uHz "
+           "exhaust=%u°C raw_b22=0x%02X raw_b23=0x%02X raw_b47=0x%02X raw_b48=%u/%d",
+           b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
+           b[IDX_COMPRESSOR_EXHAUST_TEMP], b[22], b[23], b[47],
            b[48], static_cast<int8_t>(b[48]));
 
   // Publish optional sensors (with sign conversion for outdoor temperatures)
@@ -1043,8 +1043,15 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (eco_code_sensor_ != nullptr)   eco_code_sensor_->publish_state(eco_ ? 1.0f : 0.0f);
   if (swing_ud_sensor_ != nullptr)   swing_ud_sensor_->publish_state(updown ? 1.0f : 0.0f);
   if (swing_lr_sensor_ != nullptr)   swing_lr_sensor_->publish_state(leftright ? 1.0f : 0.0f);
-  if (compressor_freq_set_sensor_ != nullptr) compressor_freq_set_sensor_->publish_state(b[IDX_COMP_FREQ_SET]);
-  if (compressor_freq_sensor_ != nullptr)     compressor_freq_sensor_->publish_state(b[IDX_COMP_FREQ]);
+  if (compressor_freq_actual_sensor_ != nullptr)
+    compressor_freq_actual_sensor_->publish_state(b[IDX_COMP_FREQ_ACTUAL]);
+  if (compressor_freq_set_sensor_ != nullptr)
+    compressor_freq_set_sensor_->publish_state(b[IDX_COMP_FREQ_SET]);
+  if (compressor_freq_command_sensor_ != nullptr)
+    compressor_freq_command_sensor_->publish_state(b[IDX_COMP_FREQ_COMMAND]);
+  // Backward-compatible byte-43 sensor for existing YAML configurations.
+  if (compressor_freq_sensor_ != nullptr)
+    compressor_freq_sensor_->publish_state(b[IDX_COMP_FREQ_COMMAND]);
 
   // Outdoor temperatures are signed!
   if (outdoor_temp_sensor_ != nullptr) {
@@ -1059,14 +1066,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     compressor_exhaust_temp_sensor_->publish_state(static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
   }
 
-  // Raw values are intentionally published without conversion. These temporary
-  // sensors help identify the exact meaning of status-frame bytes on this unit.
-  if (raw_byte_22_sensor_ != nullptr) raw_byte_22_sensor_->publish_state(static_cast<float>(b[22]));
-  if (raw_byte_23_sensor_ != nullptr) raw_byte_23_sensor_->publish_state(static_cast<float>(b[23]));
-  if (raw_byte_41_sensor_ != nullptr) raw_byte_41_sensor_->publish_state(static_cast<float>(b[41]));
-  if (raw_byte_42_sensor_ != nullptr) raw_byte_42_sensor_->publish_state(static_cast<float>(b[42]));
-  if (raw_byte_43_sensor_ != nullptr) raw_byte_43_sensor_->publish_state(static_cast<float>(b[43]));
-  if (raw_byte_47_sensor_ != nullptr) raw_byte_47_sensor_->publish_state(static_cast<float>(b[47]));
 #endif
 
 #ifdef USE_TEXT_SENSOR
@@ -1076,14 +1075,16 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, compressor=%uHz, exhaust=%u°C",
+           "Parsed: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
+           "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
-           climate::climate_mode_to_string(mode_),
-           climate::climate_fan_mode_to_string(fan_),
-           climate::climate_swing_mode_to_string(swing_),
+           LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
+           LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
+           LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
            (unsigned) target_c_, current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
-           b[IDX_COMP_FREQ], b[IDX_COMPRESSOR_EXHAUST_TEMP]);
+           b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
+           b[IDX_COMPRESSOR_EXHAUST_TEMP]);
 
   // If HA has priority, check convergence and possibly enforce
   maybe_force_to_target_();
