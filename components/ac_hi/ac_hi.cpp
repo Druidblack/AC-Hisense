@@ -153,10 +153,10 @@ void ACHIClimate::update() {
     return;
   }
 
-  if (!writing_lock_ && !pending_control_) {
+  if (!writing_lock_ && !pending_control_ && !status_query_in_flight_) {
     send_query_status_();
   } else {
-    ESP_LOGV(TAG, "Polling skipped (write lock active or pending control)");
+    ESP_LOGV(TAG, "Polling skipped (write lock, pending control, or status query active)");
   }
 }
 
@@ -197,20 +197,29 @@ void ACHIClimate::loop() {
   // 4. Parse incoming frames (time‑bounded)
   try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
 
-  // 5. Handle write lock timeout
+  // 5. Release a lost status request. Until this timeout expires, a pending
+  // 0x65 command is deliberately held back so it cannot collide with the 0x66 response.
+  if (status_query_in_flight_ && (millis() - status_query_time_ > STATUS_QUERY_TIMEOUT)) {
+    ESP_LOGW(TAG, "Status query timeout after %lums; allowing pending control",
+             (unsigned long) STATUS_QUERY_TIMEOUT);
+    status_query_in_flight_ = false;
+  }
+
+  // 6. Handle write lock timeout
   if (writing_lock_ && (millis() - write_lock_time_ > WRITE_LOCK_TIMEOUT)) {
     ESP_LOGW(TAG, "Write lock timeout, forcing unlock");
     writing_lock_ = false;
   }
 
-  // 6. Send pending control command if debounce period passed and no lock
-  if (pending_control_ && !writing_lock_ &&
+  // 7. Send a debounced control command only when neither a write ACK nor a
+  // status response is outstanding. This serializes 0x65 and 0x66 transactions.
+  if (pending_control_ && !writing_lock_ && !status_query_in_flight_ &&
       (millis() - last_control_ms_ >= CONTROL_DEBOUNCE_MS)) {
     send_write_changes_();
     pending_control_ = false;
   }
 
-  // 7. Optional memory diagnostics
+  // 8. Optional memory diagnostics
   publish_memory_diagnostics_();
 }
 
@@ -517,9 +526,9 @@ void ACHIClimate::build_tx_from_desired_() {
 // ---- Send status query ----
 void ACHIClimate::send_query_status_() {
   ESP_LOGD(TAG, "Sending status query (0x66)");
-  log_frame_("TX query", query_);
-  for (auto b : query_) write_byte(b);
-  flush();
+  send_logical_frame_(query_, "TX query");
+  status_query_in_flight_ = true;
+  status_query_time_ = millis();
 }
 
 // ---- Send write command ----
@@ -529,9 +538,7 @@ void ACHIClimate::send_write_changes_() {
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
            tx_bytes_[IDX_TX_BEEP], tx_bytes_[IDX_TX_LED]);
-  log_frame_("TX write", tx_bytes_);
-  for (auto b : tx_bytes_) write_byte(b);
-  flush();
+  send_logical_frame_(tx_bytes_, "TX write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
   beep_on_next_write_ = false;
@@ -826,6 +833,46 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
   return (buf[n - 4] == ((csum >> 8) & 0xFF)) && (buf[n - 3] == (csum & 0xFF));
 }
 
+// Hisense/Kelon UART byte stuffing: every logical 0xF4 between the header and
+// footer is duplicated on the wire. The header F4 F5 and footer F4 FB remain
+// unescaped. The declared length and CRC are calculated from the logical frame.
+std::vector<uint8_t> ACHIClimate::encode_wire_frame_(const std::vector<uint8_t> &logical) const {
+  if (logical.size() < 4 || logical[0] != HI_HDR0 || logical[1] != HI_HDR1 ||
+      logical[logical.size() - 2] != HI_TAIL0 || logical.back() != HI_TAIL1) {
+    ESP_LOGE(TAG, "Cannot byte-stuff malformed logical frame (%u bytes)",
+             (unsigned) logical.size());
+    return logical;
+  }
+
+  std::vector<uint8_t> wire;
+  wire.reserve(std::min(MAX_WIRE_FRAME_BYTES, logical.size() * 2));
+  wire.push_back(logical[0]);
+  wire.push_back(logical[1]);
+
+  for (size_t i = 2; i + 2 < logical.size(); i++) {
+    wire.push_back(logical[i]);
+    if (logical[i] == HI_HDR0) {
+      wire.push_back(HI_HDR0);
+    }
+  }
+
+  wire.push_back(HI_TAIL0);
+  wire.push_back(HI_TAIL1);
+  return wire;
+}
+
+void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const char *log_prefix) {
+  const auto wire = encode_wire_frame_(logical);
+  log_frame_(log_prefix, logical);
+  if (wire.size() != logical.size()) {
+    ESP_LOGD(TAG, "%s: byte-stuffed %u logical bytes to %u wire bytes", log_prefix,
+             (unsigned) logical.size(), (unsigned) wire.size());
+    log_frame_("TX wire", wire);
+  }
+  for (auto b : wire) write_byte(b);
+  flush();
+}
+
 // ---- RX frame parsing ----
 void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   std::vector<uint8_t> frame;
@@ -843,6 +890,11 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     uint16_t sum = 0;
     if (!validate_crc_(frame, &sum)) {
       ESP_LOGW(TAG, "CRC mismatch, ignoring frame");
+      if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66) {
+        // The requested response arrived but was corrupt. Do not hold a user
+        // command for the full query timeout; the next poll will refresh state.
+        status_query_in_flight_ = false;
+      }
       continue;                     // drop invalid frame
     }
 
@@ -854,53 +906,115 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
 
 bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   frame.clear();
-  if (rx_.size() <= rx_start_ + 5) return false;
 
-  // Find header F4 F5
-  size_t i = rx_start_;
-  bool found = false;
-  for (; i + 1 < rx_.size(); i++) {
-    if (rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1) {
-      found = true;
-      break;
+  while (true) {
+    if (rx_.size() <= rx_start_ + 1) return false;
+
+    // Find an unescaped frame header F4 F5. Payload F4 values are doubled on
+    // the wire. In the sequence F4 F4 F5, the second F4 belongs to an escaped
+    // payload byte and must not be treated as a new header.
+    size_t frame_start = rx_start_;
+    bool found = false;
+    for (; frame_start + 1 < rx_.size(); frame_start++) {
+      const bool preceded_by_f4 = frame_start > 0 && rx_[frame_start - 1] == HI_HDR0;
+      if (!preceded_by_f4 && rx_[frame_start] == HI_HDR0 && rx_[frame_start + 1] == HI_HDR1) {
+        found = true;
+        break;
+      }
     }
-  }
-  if (!found) {
-    // No header in remaining data – keep only possible trailing header byte
-    if (!rx_.empty() && rx_.back() == HI_HDR0) {
-      uint8_t keep = rx_.back();
-      rx_.clear();
-      rx_.push_back(keep);
+
+    if (!found) {
+      // Keep a possible first byte of a split header and discard older noise.
+      if (!rx_.empty() && rx_.back() == HI_HDR0) {
+        const uint8_t keep = rx_.back();
+        rx_.clear();
+        rx_.push_back(keep);
+      } else {
+        rx_.clear();
+      }
       rx_start_ = 0;
-    } else {
-      rx_.clear();
-      rx_start_ = 0;
+      return false;
     }
-    return false;
-  }
-  rx_start_ = i;
 
-  // Try to slice by declared length (byte 4)
-  if (rx_.size() > rx_start_ + 5) {
-    uint8_t decl = rx_[rx_start_ + 4];
-    size_t expected = static_cast<size_t>(decl) + 9;
-    if (rx_.size() >= rx_start_ + expected) {
-      frame.assign(rx_.begin() + rx_start_, rx_.begin() + rx_start_ + expected);
-      rx_start_ += expected;
-      return true;
-    }
-  }
+    frame.clear();
+    frame.reserve(MAX_FRAME_BYTES);
+    frame.push_back(HI_HDR0);
+    frame.push_back(HI_HDR1);
 
-  // Otherwise search for tail F4 FB
-  size_t j = rx_start_ + 2;
-  for (; j + 1 < rx_.size(); j++) {
-    if (rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1) {
-      frame.assign(rx_.begin() + rx_start_, rx_.begin() + j + 2);
-      rx_start_ = j + 2;
-      return true;
+    size_t wire_pos = frame_start + 2;
+    size_t expected_logical_size = 0;
+    bool invalid = false;
+
+    while (wire_pos < rx_.size()) {
+      const uint8_t value = rx_[wire_pos];
+
+      if (value == HI_HDR0) {
+        if (wire_pos + 1 >= rx_.size()) {
+          // A stuffed F4 pair or footer may be split across loop iterations.
+          return false;
+        }
+
+        const uint8_t next = rx_[wire_pos + 1];
+        if (next == HI_HDR0) {
+          // F4 F4 on the wire represents one logical payload/CRC byte F4.
+          frame.push_back(HI_HDR0);
+          wire_pos += 2;
+        } else if (next == HI_TAIL1) {
+          // Unescaped F4 FB uniquely identifies the logical footer.
+          frame.push_back(HI_TAIL0);
+          frame.push_back(HI_TAIL1);
+          wire_pos += 2;
+
+          if (expected_logical_size != 0 && frame.size() == expected_logical_size) {
+            rx_start_ = wire_pos;
+            return true;
+          }
+
+          ESP_LOGW(TAG,
+                   "Frame length mismatch after unstuffing: declared=%u logical=%u wire=%u", 
+                   (unsigned) expected_logical_size, (unsigned) frame.size(),
+                   (unsigned) (wire_pos - frame_start));
+          invalid = true;
+          break;
+        } else {
+          ESP_LOGW(TAG, "Invalid unescaped F4 0x%02X inside frame; resynchronizing", next);
+          invalid = true;
+          break;
+        }
+      } else {
+        frame.push_back(value);
+        wire_pos++;
+      }
+
+      if (frame.size() == 5) {
+        expected_logical_size = static_cast<size_t>(frame[4]) + 9;
+        if (expected_logical_size < 9 || expected_logical_size > MAX_FRAME_BYTES) {
+          ESP_LOGW(TAG, "Invalid declared logical frame size %u; resynchronizing",
+                   (unsigned) expected_logical_size);
+          invalid = true;
+          break;
+        }
+      }
+
+      if (expected_logical_size != 0 && frame.size() >= expected_logical_size) {
+        // A valid frame reaches its declared logical size only when the footer
+        // branch above appends F4 FB. Reaching it here means the frame is corrupt.
+        ESP_LOGW(TAG, "Declared frame length reached without footer; resynchronizing");
+        invalid = true;
+        break;
+      }
     }
+
+    if (!invalid) {
+      // Header and a partial body are present; wait for more UART bytes.
+      return false;
+    }
+
+    // Drop only the first byte of the bad candidate, then search for the next
+    // header. This preserves any valid frame that follows immediately.
+    rx_start_ = frame_start + 1;
+    frame.clear();
   }
-  return false;
 }
 
 void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
@@ -910,6 +1024,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   }
   uint8_t cmd = b[IDX_CMD];
   if (cmd == 102) {          // 0x66 – status response
+    status_query_in_flight_ = false;
     parse_status_102_(b);
   } else if (cmd == 101) {   // 0x65 – write acknowledge
     handle_ack_101_();
@@ -1019,6 +1134,14 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   // Recalculate actual signature
   recalc_actual_sig_();
+
+  // Some firmware revisions confirm a write with a status frame rather than a
+  // dedicated 0x65 ACK. A matching status is therefore sufficient to release
+  // the write lock without waiting five seconds for the fallback timeout.
+  if (writing_lock_ && actual_sig_ == desired_sig_) {
+    writing_lock_ = false;
+    ESP_LOGD(TAG, "Write confirmed by matching status (lock cleared)");
+  }
 
   // Publish state with gating
   publish_gated_state_();

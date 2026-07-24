@@ -137,8 +137,10 @@ static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;
 static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;
 static constexpr size_t   RX_COMPACT_THRESHOLD = 512;
 static constexpr size_t   RX_BUFFER_RESERVE    = 2048;
-static constexpr size_t   MAX_FRAME_BYTES      = 96;
+static constexpr size_t   MAX_FRAME_BYTES      = 96;   // logical (unescaped) frame size
+static constexpr size_t   MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES * 2;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
+static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x66 overlap
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
@@ -233,6 +235,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_kelon_mode_(climate::ClimateMode mode) const;
   void calc_and_patch_crc_(std::vector<uint8_t> &buf);
   bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
+  std::vector<uint8_t> encode_wire_frame_(const std::vector<uint8_t> &logical) const;
+  void send_logical_frame_(const std::vector<uint8_t> &logical, const char *log_prefix);
 
   // RX parser
   void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS);
@@ -281,6 +285,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   bool writing_lock_{false};
   uint32_t write_lock_time_{0};               // when lock was set
+
+  // A status request and a write command must never share the RS-485 bus window.
+  // While waiting for the 0x66 response, debounced 0x65 writes remain pending.
+  bool status_query_in_flight_{false};
+  uint32_t status_query_time_{0};
 
   // Pending control from HA (debounced)
   bool pending_control_{false};

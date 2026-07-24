@@ -102,6 +102,7 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_LED_SWITCH): switch.switch_schema(
         ACHILEDTargetSwitch,
         icon=ICON_LIGHTBULB,
+        entity_category=ENTITY_CATEGORY_CONFIG,
     ),
     # Command sound switch is created by default. The user may still override its
     # name/icon by specifying sound_switch: in YAML.
