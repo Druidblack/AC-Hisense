@@ -29,6 +29,7 @@ static const char *const SLEEP_PROGRAM_1 = "Sleep 1";
 static const char *const SLEEP_PROGRAM_2 = "Sleep 2";
 static const char *const SLEEP_PROGRAM_3 = "Sleep 3";
 static const char *const SLEEP_PROGRAM_4 = "Sleep 4";
+static constexpr uint32_t SLEEP_LED_RESTORE_TIMEOUT_MS = 10000;
 
 static const char *sleep_program_for_stage(uint8_t stage) {
   switch (stage) {
@@ -558,10 +559,15 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         sleep_restore_fan_turbo_ = fan_turbo_before_preset;
         sleep_restore_quiet_ = quiet_before_preset;
         sleep_restore_fan_valid_ = true;
-        ESP_LOGD(TAG, "Sleep request: saved previous fan=%s turbo=%s quiet=%s for rollback",
+        sleep_restore_led_ = d_led_;
+        sleep_restore_led_valid_ = true;
+        sleep_led_restore_pending_ = false;
+        ESP_LOGD(TAG,
+                 "Sleep request: saved previous fan=%s turbo=%s quiet=%s and LED=%s for restore",
                  LOG_STR_ARG(climate::climate_fan_mode_to_string(sleep_restore_fan_)),
                  sleep_restore_fan_turbo_ ? "YES" : "NO",
-                 sleep_restore_quiet_ ? "YES" : "NO");
+                 sleep_restore_quiet_ ? "YES" : "NO",
+                 sleep_restore_led_ ? "ON" : "OFF");
       } else {
         // Sleep is already confirmed. Keep the original pre-Sleep fan snapshot
         // so changing Sleep 1..4 does not lose the value needed on Sleep OFF.
@@ -722,9 +728,20 @@ void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
   if (fields & CMD_FIELD_QUIET)
     tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
 
-  // Display is also action-style. Send it only when explicitly changed, or
-  // append LED_OFF once to a real user command while the desired display is off.
-  if ((fields & CMD_FIELD_LED) || (user_command_next_write_ && !d_led_))
+  // Display is also action-style. Send it when explicitly changed, or append
+  // LED_OFF once to an ordinary user command while the desired display is off.
+  // A confirmed Sleep program temporarily reports the panel as OFF even when it
+  // was ON before Sleep. Never turn that temporary status into an LED_OFF action:
+  // otherwise Sleep OFF first wakes the panel and the delayed LED_OFF turns it
+  // dark again a few seconds later.
+  const bool sleep_session =
+      sleep_stage_ > 0 || d_sleep_stage_ > 0 || sleep_confirmation_pending_ ||
+      (fields & CMD_FIELD_SLEEP);
+  const bool sleep_temporarily_owns_led =
+      sleep_session && (!sleep_restore_led_valid_ || sleep_restore_led_);
+  const bool append_led_off =
+      user_command_next_write_ && !d_led_ && !sleep_temporarily_owns_led;
+  if ((fields & CMD_FIELD_LED) || append_led_off)
     tx_bytes_[IDX_TX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
 }
 
@@ -1371,6 +1388,29 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   quiet_ = (b[IDX_RX_QUIET] & QUIET_MASK) != 0;   // byte 36 in status frame
   led_   = (b[IDX_RX_LED] & LED_MASK) != 0;       // byte 37 in status frame
 
+  if (sleep_led_restore_pending_) {
+    if (led_) {
+      sleep_led_restore_pending_ = false;
+      d_led_ = true;
+      ESP_LOGI(TAG, "Pre-Sleep LED=ON restored and confirmed by status");
+    } else if (millis() - sleep_led_restore_started_ms_ >= SLEEP_LED_RESTORE_TIMEOUT_MS) {
+      // Normally the indoor unit restores the panel by itself after Sleep OFF.
+      // If it does not, send one silent explicit LED_ON action as a fallback.
+      sleep_led_restore_pending_ = false;
+      d_led_ = true;
+      led_command_pending_ = true;
+      pending_command_fields_ |= CMD_FIELD_LED;
+      pending_control_ = true;
+      last_control_ms_ = millis();
+      user_command_next_write_ = false;
+      beep_on_next_write_ = false;
+      accept_remote_changes_ = false;
+      ha_priority_active_ = true;
+      recalc_desired_sig_();
+      ESP_LOGW(TAG, "Pre-Sleep LED=ON was not restored in time; queued silent LED_ON fallback");
+    }
+  }
+
   // On this model Quiet is signaled by the quiet flag, while raw_wind may remain 2.
   if (quiet_) {
     fan_ = climate::CLIMATE_FAN_QUIET;
@@ -1454,6 +1494,27 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
         ESP_LOGI(TAG, "Sleep confirmed by status: requested=%s Sleep Mode Code=%u",
                  sleep_program_for_stage(requested_stage), raw_sleep);
       } else {
+        // Restore the display preference that existed before Sleep. Sleep's
+        // temporary LED=OFF status is not a user preference and must not survive
+        // the transition back to Preset=None.
+        const bool have_saved_led = sleep_restore_led_valid_;
+        const bool saved_led = sleep_restore_led_;
+        sleep_restore_led_valid_ = false;
+        if (have_saved_led) {
+          d_led_ = saved_led;
+          pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_LED);
+          led_command_pending_ = false;
+          if (saved_led) {
+            sleep_led_restore_pending_ = !led_;
+            sleep_led_restore_started_ms_ = millis();
+            ESP_LOGI(TAG,
+                     "Sleep OFF confirmed: restoring pre-Sleep LED=ON; ignoring temporary LED_OFF status");
+          } else {
+            sleep_led_restore_pending_ = false;
+            ESP_LOGI(TAG, "Sleep OFF confirmed: preserving pre-Sleep LED=OFF");
+          }
+        }
+
         // This indoor unit leaves the fan in QUIET after Sleep OFF. Restore the
         // fan that was active immediately before Sleep was enabled from HA.
         const bool have_saved_fan = sleep_restore_fan_valid_;
@@ -1498,6 +1559,12 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
       // Preserve the proven rollback behavior. With byte-17-only activation the
       // fan normally never changes on failure, so no rollback write is needed.
       d_sleep_stage_ = 0;
+
+      if (sleep_restore_led_valid_) {
+        d_led_ = sleep_restore_led_;
+        sleep_restore_led_valid_ = false;
+      }
+      sleep_led_restore_pending_ = false;
 
       const bool have_fan_rollback = sleep_restore_fan_valid_;
       const auto rollback_fan = sleep_restore_fan_;
@@ -1761,7 +1828,8 @@ void ACHIClimate::publish_gated_state_() {
     d_eco_         = out_eco;
     d_turbo_       = out_turbo;
     d_quiet_       = out_quiet;
-    d_led_         = led_;
+    if (!(sleep_led_restore_pending_ && !led_))
+      d_led_ = led_;
     d_sleep_stage_ = out_sleep_stage;
     recalc_desired_sig_();
   } else {
@@ -1970,6 +2038,14 @@ void ACHIClimate::log_sig_diff_() const {
 // ---- External LED control ----
 void ACHIClimate::set_desired_led(bool on) {
   d_led_ = on;
+
+  // If the user explicitly changes the display while Sleep is active, this is
+  // the preference that must remain after Sleep ends.
+  if (sleep_restore_led_valid_ &&
+      (sleep_stage_ > 0 || d_sleep_stage_ > 0 || sleep_confirmation_pending_)) {
+    sleep_restore_led_ = on;
+  }
+  sleep_led_restore_pending_ = false;
 
   // Dependency: turning the display OFF also turns command sound ON.
   // This keeps HA from showing an unsupported combination for this protocol.

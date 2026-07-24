@@ -353,12 +353,20 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Fan state that was active immediately before an HA Sleep request. If the
   // indoor unit rejects Sleep (Sleep Mode Code remains 0), restore this fan
-  // state with one silent normal command. The snapshot is discarded as soon
-  // as Sleep is confirmed by a non-zero status code.
+  // state with one silent normal command. The snapshot is retained through the
+  // confirmed Sleep session and consumed when Sleep is disabled.
   bool sleep_restore_fan_valid_{false};
   climate::ClimateFanMode sleep_restore_fan_{climate::CLIMATE_FAN_AUTO};
   bool sleep_restore_fan_turbo_{false};
   bool sleep_restore_quiet_{false};
+
+  // Display preference that was active immediately before an HA Sleep request.
+  // Sleep itself temporarily turns the panel off; that temporary status must not
+  // be converted into a delayed LED_OFF action when Sleep is later disabled.
+  bool sleep_restore_led_valid_{false};
+  bool sleep_restore_led_{true};
+  bool sleep_led_restore_pending_{false};
+  uint32_t sleep_led_restore_started_ms_{0};
 
   // True only after the user explicitly changes the fan while a confirmed
   // Sleep program is active. Without this flag, Sleep's automatic QUIET fan is
