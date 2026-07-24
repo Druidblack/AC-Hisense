@@ -1058,6 +1058,15 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (compressor_exhaust_temp_sensor_ != nullptr) {
     compressor_exhaust_temp_sensor_->publish_state(static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
   }
+
+  // Raw values are intentionally published without conversion. These temporary
+  // sensors help identify the exact meaning of status-frame bytes on this unit.
+  if (raw_byte_22_sensor_ != nullptr) raw_byte_22_sensor_->publish_state(static_cast<float>(b[22]));
+  if (raw_byte_23_sensor_ != nullptr) raw_byte_23_sensor_->publish_state(static_cast<float>(b[23]));
+  if (raw_byte_41_sensor_ != nullptr) raw_byte_41_sensor_->publish_state(static_cast<float>(b[41]));
+  if (raw_byte_42_sensor_ != nullptr) raw_byte_42_sensor_->publish_state(static_cast<float>(b[42]));
+  if (raw_byte_43_sensor_ != nullptr) raw_byte_43_sensor_->publish_state(static_cast<float>(b[43]));
+  if (raw_byte_47_sensor_ != nullptr) raw_byte_47_sensor_->publish_state(static_cast<float>(b[47]));
 #endif
 
 #ifdef USE_TEXT_SENSOR

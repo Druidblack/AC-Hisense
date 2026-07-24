@@ -53,6 +53,14 @@ CONF_OUTDOOR_TEMP = "outdoor_temperature"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
 CONF_COMPRESSOR_EXHAUST_TEMP = "compressor_exhaust_temperature"
 
+# Temporary raw status-byte diagnostics (zero-based frame indexes)
+CONF_RAW_BYTE_22 = "raw_byte_22"
+CONF_RAW_BYTE_23 = "raw_byte_23"
+CONF_RAW_BYTE_41 = "raw_byte_41"
+CONF_RAW_BYTE_42 = "raw_byte_42"
+CONF_RAW_BYTE_43 = "raw_byte_43"
+CONF_RAW_BYTE_47 = "raw_byte_47"
+
 # New memory diagnostics sensor keys
 CONF_HEAP_FREE = "heap_free"
 CONF_HEAP_TOTAL = "heap_total"
@@ -88,6 +96,14 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_OUTDOOR_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
+
+    # Temporary raw status-byte diagnostics
+    cv.Optional(CONF_RAW_BYTE_22): sensor.sensor_schema(),
+    cv.Optional(CONF_RAW_BYTE_23): sensor.sensor_schema(),
+    cv.Optional(CONF_RAW_BYTE_41): sensor.sensor_schema(),
+    cv.Optional(CONF_RAW_BYTE_42): sensor.sensor_schema(),
+    cv.Optional(CONF_RAW_BYTE_43): sensor.sensor_schema(),
+    cv.Optional(CONF_RAW_BYTE_47): sensor.sensor_schema(),
 
     # Power status is a text sensor ("ON"/"OFF")
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
@@ -206,6 +222,31 @@ async def to_code(config):
     if conf := config.get(CONF_COMPRESSOR_EXHAUST_TEMP):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compressor_exhaust_temp_sensor(sens))
+
+    # Temporary raw status-byte diagnostics
+    if conf := config.get(CONF_RAW_BYTE_22):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_22_sensor(sens))
+
+    if conf := config.get(CONF_RAW_BYTE_23):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_23_sensor(sens))
+
+    if conf := config.get(CONF_RAW_BYTE_41):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_41_sensor(sens))
+
+    if conf := config.get(CONF_RAW_BYTE_42):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_42_sensor(sens))
+
+    if conf := config.get(CONF_RAW_BYTE_43):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_43_sensor(sens))
+
+    if conf := config.get(CONF_RAW_BYTE_47):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_raw_byte_47_sensor(sens))
 
     # Optional text sensor for power status
     if conf := config.get(CONF_POWER_STATUS):
