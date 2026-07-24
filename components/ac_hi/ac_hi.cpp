@@ -23,8 +23,30 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
   ESP_LOGI(TAG, "%s Kelon168 IR: %s (command=0x%02X)", prefix, buffer, data.command());
 }
 
-static const char *const CUSTOM_PRESET_QUIET = "Тихий";
-static const char *const CUSTOM_FAN_TURBO = "Турбо";
+static const char *const CUSTOM_PRESET_QUIET = "Quiet";
+static const char *const CUSTOM_FAN_TURBO = "Turbo";
+static const char *const SLEEP_PROGRAM_1 = "Sleep 1";
+static const char *const SLEEP_PROGRAM_2 = "Sleep 2";
+static const char *const SLEEP_PROGRAM_3 = "Sleep 3";
+static const char *const SLEEP_PROGRAM_4 = "Sleep 4";
+
+static const char *sleep_program_for_stage(uint8_t stage) {
+  switch (stage) {
+    case 1: return SLEEP_PROGRAM_1;
+    case 2: return SLEEP_PROGRAM_2;
+    case 3: return SLEEP_PROGRAM_3;
+    case 4: return SLEEP_PROGRAM_4;
+    default: return SLEEP_PROGRAM_2;
+  }
+}
+
+static uint8_t sleep_stage_from_program(const std::string &program) {
+  if (program == SLEEP_PROGRAM_1) return 1;
+  if (program == SLEEP_PROGRAM_2) return 2;
+  if (program == SLEEP_PROGRAM_3) return 3;
+  if (program == SLEEP_PROGRAM_4) return 4;
+  return 0;
+}
 
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
@@ -56,6 +78,22 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   }
 }
 
+#ifdef USE_SENSOR
+void ACHIClimate::publish_sensor_if_changed_(sensor::Sensor *sensor, float value) {
+  if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value)) {
+    sensor->publish_state(value);
+  }
+}
+#endif
+
+#ifdef USE_TEXT_SENSOR
+void ACHIClimate::publish_text_sensor_if_changed_(text_sensor::TextSensor *sensor, const char *value) {
+  if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value)) {
+    sensor->publish_state(value);
+  }
+}
+#endif
+
 // ---- ACHILEDTargetSwitch ----
 void ACHILEDTargetSwitch::write_state(bool state) {
   if (parent_ != nullptr) {
@@ -84,6 +122,15 @@ void ACHIMemorySwitch::write_state(bool state) {
   }
 }
 
+// ---- ACHISleepProgramSelect ----
+void ACHISleepProgramSelect::control(const std::string &value) {
+  if (parent_ != nullptr) {
+    parent_->set_sleep_program(value);
+  } else {
+    publish_state(value);
+  }
+}
+
 // ---- ACHIClimate implementation ----
 
 void ACHIClimate::setup() {
@@ -101,11 +148,14 @@ void ACHIClimate::setup() {
   target_temperature = 24;
   fan_mode = climate::CLIMATE_FAN_AUTO;
   swing_mode = climate::CLIMATE_SWING_OFF;
+  action = climate::CLIMATE_ACTION_OFF;
   // Desired state mirrors initial
   d_power_on_     = false;
   d_mode_         = climate::CLIMATE_MODE_OFF;
   last_active_mode_ = climate::CLIMATE_MODE_COOL;
   d_target_c_     = 24;
+  last_cool_target_c_ = 24;
+  last_heat_target_c_ = 24;
   d_fan_          = climate::CLIMATE_FAN_AUTO;
   d_fan_turbo_    = false;
   d_swing_        = climate::CLIMATE_SWING_OFF;
@@ -129,6 +179,7 @@ void ACHIClimate::setup() {
   update_led_switch_state_();
   update_sound_switch_state_();
   update_memory_switch_state_();
+  update_sleep_program_select_state_();
 
   // Remember boot time so the first status poll is delayed after a full power restore.
   // Indoor AC boards can be noisy on UART while they are still booting; polling too early
@@ -153,10 +204,10 @@ void ACHIClimate::update() {
     return;
   }
 
-  if (!writing_lock_ && !pending_control_) {
+  if (!writing_lock_ && !pending_control_ && !status_query_in_flight_) {
     send_query_status_();
   } else {
-    ESP_LOGV(TAG, "Polling skipped (write lock active or pending control)");
+    ESP_LOGV(TAG, "Polling skipped (write lock, pending control, or status query active)");
   }
 }
 
@@ -197,20 +248,29 @@ void ACHIClimate::loop() {
   // 4. Parse incoming frames (time‑bounded)
   try_parse_frames_from_buffer_(MAX_PARSE_TIME_MS);
 
-  // 5. Handle write lock timeout
+  // 5. Release a lost status request. Until this timeout expires, a pending
+  // 0x65 command is deliberately held back so it cannot collide with the 0x66 response.
+  if (status_query_in_flight_ && (millis() - status_query_time_ > STATUS_QUERY_TIMEOUT)) {
+    ESP_LOGW(TAG, "Status query timeout after %lums; allowing pending control",
+             (unsigned long) STATUS_QUERY_TIMEOUT);
+    status_query_in_flight_ = false;
+  }
+
+  // 6. Handle write lock timeout
   if (writing_lock_ && (millis() - write_lock_time_ > WRITE_LOCK_TIMEOUT)) {
     ESP_LOGW(TAG, "Write lock timeout, forcing unlock");
     writing_lock_ = false;
   }
 
-  // 6. Send pending control command if debounce period passed and no lock
-  if (pending_control_ && !writing_lock_ &&
+  // 7. Send a debounced control command only when neither a write ACK nor a
+  // status response is outstanding. This serializes 0x65 and 0x66 transactions.
+  if (pending_control_ && !writing_lock_ && !status_query_in_flight_ &&
       (millis() - last_control_ms_ >= CONTROL_DEBOUNCE_MS)) {
     send_write_changes_();
-    pending_control_ = false;
+    pending_control_ = pending_command_fields_ != CMD_FIELD_NONE;
   }
 
-  // 7. Optional memory diagnostics
+  // 8. Optional memory diagnostics
   publish_memory_diagnostics_();
 }
 
@@ -237,7 +297,62 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.set_visual_max_temperature(30);
   t.set_visual_temperature_step(1.0f);
   t.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+  t.add_feature_flags(climate::CLIMATE_SUPPORTS_ACTION);
   return t;
+}
+
+// ---- Per-mode target temperature memory ----
+void ACHIClimate::remember_target_for_mode_(climate::ClimateMode mode, uint8_t target_c) {
+  target_c = std::max<uint8_t>(16, std::min<uint8_t>(30, target_c));
+  if (mode == climate::CLIMATE_MODE_COOL) {
+    last_cool_target_c_ = target_c;
+  } else if (mode == climate::CLIMATE_MODE_HEAT) {
+    last_heat_target_c_ = target_c;
+  }
+}
+
+uint8_t ACHIClimate::target_for_mode_(climate::ClimateMode mode, uint8_t fallback) const {
+  if (mode == climate::CLIMATE_MODE_COOL) return last_cool_target_c_;
+  if (mode == climate::CLIMATE_MODE_HEAT) return last_heat_target_c_;
+  return fallback;
+}
+
+// ---- Sleep program select ----
+void ACHIClimate::set_sleep_program(const std::string &value) {
+  const uint8_t stage = sleep_stage_from_program(value);
+  if (stage == 0) {
+    ESP_LOGW(TAG, "Unknown Sleep program: %s", value.c_str());
+    update_sleep_program_select_state_();
+    return;
+  }
+
+  const bool changed_selection = selected_sleep_stage_ != stage;
+  selected_sleep_stage_ = stage;
+  update_sleep_program_select_state_();
+
+  // Merely choosing a program does not activate Sleep. If Sleep is already
+  // confirmed (or an activation is currently pending), send a new one-shot
+  // byte-17 action for the newly selected program.
+  const bool sleep_active_or_pending = sleep_stage_ > 0 || d_sleep_stage_ > 0 || sleep_confirmation_pending_;
+  if (!sleep_active_or_pending || !changed_selection) {
+    ESP_LOGD(TAG, "Sleep program selected for next Sleep preset: %s", value.c_str());
+    return;
+  }
+
+  d_sleep_stage_ = stage;
+  // Preserve the fan snapshot captured before Sleep activation while switching
+  // between Sleep 1..4. It is needed to restore the original fan on Sleep OFF.
+  pending_command_fields_ |= CMD_FIELD_SLEEP;
+  accept_remote_changes_ = false;
+  ha_priority_active_ = true;
+  recalc_desired_sig_();
+  pending_control_ = true;
+  last_control_ms_ = millis();
+  user_command_next_write_ = true;
+  beep_on_next_write_ = command_sound_enabled_;
+
+  ESP_LOGD(TAG, "Changing active Sleep program to %s with a byte-17-only command",
+           sleep_program_for_stage(stage));
 }
 
 // ---- Control from HA ----
@@ -245,9 +360,29 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
   bool was_power_on = d_power_on_;
 
+  // Snapshot the desired state. After applying the ClimateCall we compare the
+  // result with this snapshot and queue only the fields that really changed.
+  const bool before_power_on = d_power_on_;
+  const auto before_mode = d_mode_;
+  const uint8_t before_target = d_target_c_;
+  const auto before_fan = d_fan_;
+  const bool before_fan_turbo = d_fan_turbo_;
+  const auto before_swing = d_swing_;
+  const bool before_turbo = d_turbo_;
+  const bool before_eco = d_eco_;
+  const bool before_quiet = d_quiet_;
+  const bool before_led = d_led_;
+  const uint8_t before_sleep_stage = d_sleep_stage_;
+
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
     if (m == climate::CLIMATE_MODE_OFF) {
+      // Preserve the normal setpoint of the mode being turned off. Temporary
+      // Boost/Eco/Sleep targets are intentionally excluded.
+      if (d_power_on_ && !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+        remember_target_for_mode_(d_mode_, d_target_c_);
+      }
+
       if (memory_mode_enabled_) {
         // Remember the last real working mode before OFF. Do not let OFF erase it.
         if (d_power_on_ && d_mode_ != climate::CLIMATE_MODE_OFF) {
@@ -275,9 +410,27 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       if (memory_mode_enabled_ && !was_power_on && last_active_mode_ != climate::CLIMATE_MODE_OFF &&
           requested_mode != last_active_mode_) {
         ESP_LOGD(TAG, "Power-on mode %s replaced by last active mode %s because Memory is ON",
-                 climate::climate_mode_to_string(requested_mode),
-                 climate::climate_mode_to_string(last_active_mode_));
+                 LOG_STR_ARG(climate::climate_mode_to_string(requested_mode)),
+                 LOG_STR_ARG(climate::climate_mode_to_string(last_active_mode_)));
         requested_mode = last_active_mode_;
+      }
+
+      // Store the normal target of the mode we are leaving and restore the
+      // separately remembered target of COOL or HEAT. An explicitly supplied
+      // target temperature in the same ClimateCall is processed below and wins.
+      if ((!was_power_on || requested_mode != d_mode_) &&
+          !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+        if (was_power_on && requested_mode != d_mode_) {
+          remember_target_for_mode_(d_mode_, d_target_c_);
+        }
+        const uint8_t restored_target = target_for_mode_(requested_mode, d_target_c_);
+        if ((requested_mode == climate::CLIMATE_MODE_COOL || requested_mode == climate::CLIMATE_MODE_HEAT) &&
+            restored_target != d_target_c_) {
+          ESP_LOGD(TAG, "Mode %s: restoring remembered target %u°C",
+                   LOG_STR_ARG(climate::climate_mode_to_string(requested_mode)),
+                   (unsigned) restored_target);
+        }
+        d_target_c_ = restored_target;
       }
 
       d_mode_ = requested_mode;
@@ -311,11 +464,19 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
       d_target_c_ = c;
+      remember_target_for_mode_(d_mode_, c);
       changed = true;
     }
   }
 
   if (call.get_fan_mode().has_value()) {
+    // While Sleep is active, QUIET is controlled by the indoor unit itself.
+    // Remember that this fan change is explicit so the next status parser does
+    // not immediately replace the requested fan with Sleep's QUIET value.
+    sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
+
+    // An explicit fan command supersedes any pending Sleep rollback snapshot.
+    sleep_restore_fan_valid_ = false;
     d_fan_ = *call.get_fan_mode();
     d_fan_turbo_ = false;
     d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
@@ -331,6 +492,18 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
+    const bool was_sleep = before_sleep_stage > 0 || sleep_stage_ > 0;
+    const auto fan_before_preset = d_fan_;
+    const bool fan_turbo_before_preset = d_fan_turbo_;
+    const bool quiet_before_preset = d_quiet_;
+
+    // Preserve the pre-Sleep fan snapshot only while leaving an active Sleep
+    // preset through Preset=None. Any other preset/fan choice supersedes it.
+    const bool leaving_sleep_to_none =
+        p == climate::CLIMATE_PRESET_NONE && was_sleep;
+    if (p != climate::CLIMATE_PRESET_SLEEP && !leaving_sleep_to_none) {
+      sleep_restore_fan_valid_ = false;
+    }
 
     d_eco_ = false;
     d_turbo_ = false;
@@ -375,16 +548,29 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         d_fan_ = climate::CLIMATE_FAN_HIGH;
       }
     } else if (p == climate::CLIMATE_PRESET_SLEEP) {
-      // Match the behavior observed from the remote:
-      // SLEEP uses QUIET fan, target temperature increases by 1°C,
-      // and the status frame reports sleep code 2 / 4 rather than 1.
-      if (d_target_c_ < 30) {
-        d_target_c_ += 1;
+      // Request the first Sleep program without changing the set temperature.
+      // The UI does not treat this desired value as active Sleep: only a
+      // non-zero Sleep Mode Code in a later status frame can confirm it.
+      // Save the current fan state so it can be restored both when a Sleep
+      // request is rejected and when a successfully activated Sleep is turned off.
+      if (sleep_stage_ == 0) {
+        sleep_restore_fan_ = fan_before_preset;
+        sleep_restore_fan_turbo_ = fan_turbo_before_preset;
+        sleep_restore_quiet_ = quiet_before_preset;
+        sleep_restore_fan_valid_ = true;
+        ESP_LOGD(TAG, "Sleep request: saved previous fan=%s turbo=%s quiet=%s for rollback",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(sleep_restore_fan_)),
+                 sleep_restore_fan_turbo_ ? "YES" : "NO",
+                 sleep_restore_quiet_ ? "YES" : "NO");
+      } else {
+        // Sleep is already confirmed. Keep the original pre-Sleep fan snapshot
+        // so changing Sleep 1..4 does not lose the value needed on Sleep OFF.
       }
-      d_sleep_stage_ = 2;
-      d_fan_turbo_ = false;
-      d_quiet_ = false;
-      d_fan_ = climate::CLIMATE_FAN_QUIET;
+
+      // Send only the selected Sleep action. Do not pre-emptively change
+      // Wind/Quiet: a successful indoor-unit Sleep program will report its own
+      // QUIET fan state in the following status frame.
+      d_sleep_stage_ = selected_sleep_stage_;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
@@ -398,7 +584,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       }
 
       d_quiet_ = false;
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco)
+      // A Sleep OFF action must remain byte-17-only. Let the indoor unit
+      // report the fan it restores after leaving Sleep, then synchronize to it.
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco && !was_sleep)
         d_fan_ = climate::CLIMATE_FAN_AUTO;
     }
 
@@ -408,6 +596,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
     if (custom == CUSTOM_PRESET_QUIET) {
+      sleep_restore_fan_valid_ = false;
       d_quiet_ = true;
       d_turbo_ = false;
       d_eco_ = false;
@@ -421,6 +610,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
     if (custom_fan == CUSTOM_FAN_TURBO) {
+      sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
+      sleep_restore_fan_valid_ = false;
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
       d_fan_turbo_ = true;
@@ -434,6 +625,31 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   if (!changed) return;
+
+  uint16_t changed_fields = CMD_FIELD_NONE;
+  if (d_power_on_ != before_power_on || d_mode_ != before_mode)
+    changed_fields |= CMD_FIELD_POWER_MODE;
+  if (d_target_c_ != before_target)
+    changed_fields |= CMD_FIELD_TEMP;
+  if (d_fan_ != before_fan || d_fan_turbo_ != before_fan_turbo)
+    changed_fields |= CMD_FIELD_WIND;
+  if (d_swing_ != before_swing)
+    changed_fields |= CMD_FIELD_SWING;
+  if (d_turbo_ != before_turbo || d_eco_ != before_eco)
+    changed_fields |= CMD_FIELD_TURBO_ECO;
+  if (d_quiet_ != before_quiet)
+    changed_fields |= CMD_FIELD_QUIET;
+  if (d_led_ != before_led || led_command_pending_)
+    changed_fields |= CMD_FIELD_LED;
+  if (d_sleep_stage_ != before_sleep_stage)
+    changed_fields |= CMD_FIELD_SLEEP;
+
+  // A no-op ClimateCall does not need an empty write frame.
+  if (changed_fields == CMD_FIELD_NONE) {
+    ESP_LOGD(TAG, "Control: desired state unchanged; no UART write queued");
+    return;
+  }
+  pending_command_fields_ |= changed_fields;
 
   // HA takes priority over remote changes
   accept_remote_changes_ = false;
@@ -449,7 +665,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (enable_presets_) {
     if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
     else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-    else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+    else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
     else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
     else this->set_preset_(climate::CLIMATE_PRESET_NONE);
   }
@@ -462,78 +678,117 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   user_command_next_write_ = true;
   beep_on_next_write_ = command_sound_enabled_;
 
-  ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %ums debounce",
-           command_sound_enabled_ ? "ON" : "OFF", CONTROL_DEBOUNCE_MS);
+  ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %lums debounce",
+           command_sound_enabled_ ? "ON" : "OFF", (unsigned long) CONTROL_DEBOUNCE_MS);
 }
 
-// ---- Build TX frame from desired state ----
-void ACHIClimate::build_tx_from_desired_() {
-  // Power + mode (byte 18)
-  uint8_t power_bin = d_power_on_ ? 0b00001100 : 0b00000100;
-  uint8_t mode_hi = encode_mode_hi_nibble_(d_mode_); // returns nibble << 4
-  tx_bytes_[IDX_POWER_MODE] = power_bin + mode_hi;
+// ---- Build a one-shot neutral TX frame ----
+void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
+  // Bytes 16..45 are command/action payload. Zero means "do not change".
+  // Never copy the complete desired state into an ordinary write frame.
+  std::fill(tx_bytes_.begin() + IDX_WIND, tx_bytes_.begin() + 46, 0x00);
 
-  // Target temperature (encoded)
-  tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
-
-  // Fan speed (byte 16)
-  tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
-
-  // Sleep mode (byte 17)
-  tx_bytes_[IDX_SLEEP] = encode_sleep_byte_(d_sleep_stage_);
-
-  // Swing (byte 32)
-  bool v = (d_swing_ == climate::CLIMATE_SWING_VERTICAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
-  bool h = (d_swing_ == climate::CLIMATE_SWING_HORIZONTAL) || (d_swing_ == climate::CLIMATE_SWING_BOTH);
-  uint8_t updown = v ? TxValues::UPDOWN_ON : TxValues::UPDOWN_OFF;
-  uint8_t leftright = h ? TxValues::LEFTRIGHT_ON : TxValues::LEFTRIGHT_OFF;
-  tx_bytes_[IDX_TX_SWING] = updown + leftright;
-
-  // Turbo, Eco, Quiet (bytes 33 and 35) – Turbo has priority
-  if (d_turbo_) {
-    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_ON;
-    tx_bytes_[IDX_TX_QUIET] = TxValues::QUIET_OFF;   // Turbo disables quiet
-  } else {
-    tx_bytes_[IDX_TX_TURBO_ECO] = TxValues::TURBO_OFF + (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF);
-    tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
+  if (fields & CMD_FIELD_POWER_MODE) {
+    const uint8_t power_bin = d_power_on_ ? 0b00001100 : 0b00000100;
+    const uint8_t mode_hi = encode_mode_hi_nibble_(d_mode_);
+    tx_bytes_[IDX_POWER_MODE] = power_bin + mode_hi;
   }
 
-  // Display/LED command (byte 36).
-  // 0xC0/0x40 are explicit display ON/OFF actions.
-  // Keep automatic HA-priority re-sends neutral (0x00) so they stay silent.
-  // But when the user sends a real climate command while the display is OFF,
-  // include LED_OFF once in that command; otherwise this indoor unit turns the
-  // front display back on after mode/preset changes. This must be independent
-  // from audible confirmation, because sound can be disabled by sound_switch.
-  if (led_command_pending_) {
+  if (fields & CMD_FIELD_TEMP)
+    tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
+
+  if (fields & CMD_FIELD_WIND)
+    tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
+
+  if (fields & CMD_FIELD_SLEEP)
+    tx_bytes_[IDX_SLEEP] = encode_sleep_byte_(d_sleep_stage_);
+
+  if (fields & CMD_FIELD_SWING) {
+    const bool v = d_swing_ == climate::CLIMATE_SWING_VERTICAL ||
+                   d_swing_ == climate::CLIMATE_SWING_BOTH;
+    const bool h = d_swing_ == climate::CLIMATE_SWING_HORIZONTAL ||
+                   d_swing_ == climate::CLIMATE_SWING_BOTH;
+    tx_bytes_[IDX_TX_SWING] = (v ? TxValues::UPDOWN_ON : TxValues::UPDOWN_OFF) +
+                              (h ? TxValues::LEFTRIGHT_ON : TxValues::LEFTRIGHT_OFF);
+  }
+
+  if (fields & CMD_FIELD_TURBO_ECO) {
+    tx_bytes_[IDX_TX_TURBO_ECO] = d_turbo_
+        ? TxValues::TURBO_ON
+        : static_cast<uint8_t>(TxValues::TURBO_OFF +
+                               (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF));
+  }
+
+  if (fields & CMD_FIELD_QUIET)
+    tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
+
+  // Display is also action-style. Send it only when explicitly changed, or
+  // append LED_OFF once to a real user command while the desired display is off.
+  if ((fields & CMD_FIELD_LED) || (user_command_next_write_ && !d_led_))
     tx_bytes_[IDX_TX_LED] = d_led_ ? TxValues::LED_ON : TxValues::LED_OFF;
-  } else if (user_command_next_write_ && !d_led_) {
-    tx_bytes_[IDX_TX_LED] = TxValues::LED_OFF;
-  } else {
-    tx_bytes_[IDX_TX_LED] = 0x00;
+}
+
+// Queue only the fields that still differ after a status response. Sleep is
+// deliberately excluded: Sleep Mode Code is authoritative and failed Sleep
+// activation is handled by the confirmation/rollback logic without retries.
+void ACHIClimate::queue_retry_fields_from_state_() {
+  if (d_power_on_ != power_on_ || (d_power_on_ && d_mode_ != mode_))
+    pending_command_fields_ |= CMD_FIELD_POWER_MODE;
+
+  if (d_power_on_ && power_on_) {
+    if (d_target_c_ != target_c_)
+      pending_command_fields_ |= CMD_FIELD_TEMP;
+
+    // A confirmed Sleep program owns the fan and normally forces QUIET. Do not
+    // fight that automatic fan value unless the user explicitly selected a fan
+    // mode in Home Assistant while Sleep was active.
+    const bool sleep_owns_fan = sleep_stage_ > 0 && !sleep_fan_override_pending_;
+    if (!sleep_owns_fan && (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
+      pending_command_fields_ |= CMD_FIELD_WIND;
+    if (d_swing_ != swing_)
+      pending_command_fields_ |= CMD_FIELD_SWING;
+    if (d_turbo_ != turbo_ || d_eco_ != eco_)
+      pending_command_fields_ |= CMD_FIELD_TURBO_ECO;
+    if (d_quiet_ != quiet_)
+      pending_command_fields_ |= CMD_FIELD_QUIET;
   }
 }
 
 // ---- Send status query ----
 void ACHIClimate::send_query_status_() {
   ESP_LOGD(TAG, "Sending status query (0x66)");
-  log_frame_("TX query", query_);
-  for (auto b : query_) write_byte(b);
-  flush();
+  send_logical_frame_(query_, "TX query");
+  status_query_in_flight_ = true;
+  status_query_time_ = millis();
 }
 
 // ---- Send write command ----
 void ACHIClimate::send_write_changes_() {
-  build_tx_from_desired_();                // ensure tx_bytes_ reflects latest d_*
+  const uint16_t fields = pending_command_fields_;
+  if (fields == CMD_FIELD_NONE) {
+    ESP_LOGV(TAG, "Pending write contained no command fields; skipped");
+    return;
+  }
+
+  build_tx_from_pending_fields_(fields);
+
+  // Every explicit Sleep action, including OFF, is confirmed only by the
+  // next real Sleep Mode Code. Ordinary commands keep byte 17 equal to 0x00.
+  sleep_confirmation_pending_ = (fields & CMD_FIELD_SLEEP) != 0;
+  if (sleep_confirmation_pending_)
+    sleep_confirmation_target_stage_ = d_sleep_stage_;
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
-  ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
-           tx_bytes_[IDX_TX_BEEP], tx_bytes_[IDX_TX_LED]);
-  log_frame_("TX write", tx_bytes_);
-  for (auto b : tx_bytes_) write_byte(b);
-  flush();
+  ESP_LOGD(TAG,
+           "Sending neutral one-shot write (0x65): fields=0x%02X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X beep[23]=0x%02X",
+           (unsigned) fields, tx_bytes_[IDX_WIND], tx_bytes_[IDX_SLEEP],
+           tx_bytes_[IDX_POWER_MODE], tx_bytes_[IDX_SET_TEMP],
+           tx_bytes_[IDX_TX_SWING], tx_bytes_[IDX_TX_TURBO_ECO],
+           tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED], tx_bytes_[IDX_TX_BEEP]);
+  send_logical_frame_(tx_bytes_, "TX one-shot write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
+  pending_command_fields_ &= static_cast<uint16_t>(~fields);
   beep_on_next_write_ = false;
   user_command_next_write_ = false;
   led_command_pending_ = false;
@@ -826,6 +1081,46 @@ bool ACHIClimate::validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_s
   return (buf[n - 4] == ((csum >> 8) & 0xFF)) && (buf[n - 3] == (csum & 0xFF));
 }
 
+// Hisense/Kelon UART byte stuffing: every logical 0xF4 between the header and
+// footer is duplicated on the wire. The header F4 F5 and footer F4 FB remain
+// unescaped. The declared length and CRC are calculated from the logical frame.
+std::vector<uint8_t> ACHIClimate::encode_wire_frame_(const std::vector<uint8_t> &logical) const {
+  if (logical.size() < 4 || logical[0] != HI_HDR0 || logical[1] != HI_HDR1 ||
+      logical[logical.size() - 2] != HI_TAIL0 || logical.back() != HI_TAIL1) {
+    ESP_LOGE(TAG, "Cannot byte-stuff malformed logical frame (%u bytes)",
+             (unsigned) logical.size());
+    return logical;
+  }
+
+  std::vector<uint8_t> wire;
+  wire.reserve(std::min(MAX_WIRE_FRAME_BYTES, logical.size() * 2));
+  wire.push_back(logical[0]);
+  wire.push_back(logical[1]);
+
+  for (size_t i = 2; i + 2 < logical.size(); i++) {
+    wire.push_back(logical[i]);
+    if (logical[i] == HI_HDR0) {
+      wire.push_back(HI_HDR0);
+    }
+  }
+
+  wire.push_back(HI_TAIL0);
+  wire.push_back(HI_TAIL1);
+  return wire;
+}
+
+void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const char *log_prefix) {
+  const auto wire = encode_wire_frame_(logical);
+  log_frame_(log_prefix, logical);
+  if (wire.size() != logical.size()) {
+    ESP_LOGD(TAG, "%s: byte-stuffed %u logical bytes to %u wire bytes", log_prefix,
+             (unsigned) logical.size(), (unsigned) wire.size());
+    log_frame_("TX wire", wire);
+  }
+  for (auto b : wire) write_byte(b);
+  flush();
+}
+
 // ---- RX frame parsing ----
 void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   std::vector<uint8_t> frame;
@@ -843,6 +1138,11 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     uint16_t sum = 0;
     if (!validate_crc_(frame, &sum)) {
       ESP_LOGW(TAG, "CRC mismatch, ignoring frame");
+      if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66) {
+        // The requested response arrived but was corrupt. Do not hold a user
+        // command for the full query timeout; the next poll will refresh state.
+        status_query_in_flight_ = false;
+      }
       continue;                     // drop invalid frame
     }
 
@@ -854,53 +1154,116 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
 
 bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
   frame.clear();
-  if (rx_.size() <= rx_start_ + 5) return false;
 
-  // Find header F4 F5
-  size_t i = rx_start_;
-  bool found = false;
-  for (; i + 1 < rx_.size(); i++) {
-    if (rx_[i] == HI_HDR0 && rx_[i + 1] == HI_HDR1) {
-      found = true;
-      break;
+  while (true) {
+    if (rx_.size() <= rx_start_ + 1) return false;
+
+    // Find an unescaped frame header F4 F5. Payload F4 values are doubled on
+    // the wire. In the sequence F4 F4 F5, the second F4 belongs to an escaped
+    // payload byte and must not be treated as a new header.
+    size_t frame_start = rx_start_;
+    bool found = false;
+    for (; frame_start + 1 < rx_.size(); frame_start++) {
+      const bool preceded_by_f4 = frame_start > 0 && rx_[frame_start - 1] == HI_HDR0;
+      if (!preceded_by_f4 && rx_[frame_start] == HI_HDR0 && rx_[frame_start + 1] == HI_HDR1) {
+        found = true;
+        break;
+      }
     }
-  }
-  if (!found) {
-    // No header in remaining data – keep only possible trailing header byte
-    if (!rx_.empty() && rx_.back() == HI_HDR0) {
-      uint8_t keep = rx_.back();
-      rx_.clear();
-      rx_.push_back(keep);
+
+    if (!found) {
+      // Keep a possible first byte of a split header and discard older noise.
+      if (!rx_.empty() && rx_.back() == HI_HDR0) {
+        const uint8_t keep = rx_.back();
+        rx_.clear();
+        rx_.push_back(keep);
+      } else {
+        rx_.clear();
+      }
       rx_start_ = 0;
-    } else {
-      rx_.clear();
-      rx_start_ = 0;
+      return false;
     }
-    return false;
-  }
-  rx_start_ = i;
 
-  // Try to slice by declared length (byte 4)
-  if (rx_.size() > rx_start_ + 5) {
-    uint8_t decl = rx_[rx_start_ + 4];
-    size_t expected = static_cast<size_t>(decl) + 9;
-    if (rx_.size() >= rx_start_ + expected) {
-      frame.assign(rx_.begin() + rx_start_, rx_.begin() + rx_start_ + expected);
-      rx_start_ += expected;
-      return true;
-    }
-  }
+    frame.clear();
+    frame.reserve(MAX_FRAME_BYTES);
+    frame.push_back(HI_HDR0);
+    frame.push_back(HI_HDR1);
 
-  // Otherwise search for tail F4 FB
-  size_t j = rx_start_ + 2;
-  for (; j + 1 < rx_.size(); j++) {
-    if (rx_[j] == HI_TAIL0 && rx_[j + 1] == HI_TAIL1) {
-      frame.assign(rx_.begin() + rx_start_, rx_.begin() + j + 2);
-      rx_start_ = j + 2;
-      return true;
+    size_t wire_pos = frame_start + 2;
+    size_t expected_logical_size = 0;
+    bool invalid = false;
+
+    while (wire_pos < rx_.size()) {
+      const uint8_t value = rx_[wire_pos];
+
+      if (value == HI_HDR0) {
+        if (wire_pos + 1 >= rx_.size()) {
+          // A stuffed F4 pair or footer may be split across loop iterations.
+          return false;
+        }
+
+        const uint8_t next = rx_[wire_pos + 1];
+        if (next == HI_HDR0) {
+          // F4 F4 on the wire represents one logical payload/CRC byte F4.
+          frame.push_back(HI_HDR0);
+          wire_pos += 2;
+        } else if (next == HI_TAIL1) {
+          // Unescaped F4 FB uniquely identifies the logical footer.
+          frame.push_back(HI_TAIL0);
+          frame.push_back(HI_TAIL1);
+          wire_pos += 2;
+
+          if (expected_logical_size != 0 && frame.size() == expected_logical_size) {
+            rx_start_ = wire_pos;
+            return true;
+          }
+
+          ESP_LOGW(TAG,
+                   "Frame length mismatch after unstuffing: declared=%u logical=%u wire=%u", 
+                   (unsigned) expected_logical_size, (unsigned) frame.size(),
+                   (unsigned) (wire_pos - frame_start));
+          invalid = true;
+          break;
+        } else {
+          ESP_LOGW(TAG, "Invalid unescaped F4 0x%02X inside frame; resynchronizing", next);
+          invalid = true;
+          break;
+        }
+      } else {
+        frame.push_back(value);
+        wire_pos++;
+      }
+
+      if (frame.size() == 5) {
+        expected_logical_size = static_cast<size_t>(frame[4]) + 9;
+        if (expected_logical_size < 9 || expected_logical_size > MAX_FRAME_BYTES) {
+          ESP_LOGW(TAG, "Invalid declared logical frame size %u; resynchronizing",
+                   (unsigned) expected_logical_size);
+          invalid = true;
+          break;
+        }
+        ESP_LOGV(TAG, "RX frame declares %u logical bytes", (unsigned) expected_logical_size);
+      }
+
+      if (expected_logical_size != 0 && frame.size() >= expected_logical_size) {
+        // A valid frame reaches its declared logical size only when the footer
+        // branch above appends F4 FB. Reaching it here means the frame is corrupt.
+        ESP_LOGW(TAG, "Declared frame length reached without footer; resynchronizing");
+        invalid = true;
+        break;
+      }
     }
+
+    if (!invalid) {
+      // Header and a partial body are present; wait for more UART bytes.
+      return false;
+    }
+
+    // Drop only the first byte of the bad candidate, then search for the next
+    // header. This preserves any valid frame that follows immediately.
+    rx_start_ = frame_start + 1;
+    frame.clear();
   }
-  return false;
 }
 
 void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
@@ -910,6 +1273,7 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   }
   uint8_t cmd = b[IDX_CMD];
   if (cmd == 102) {          // 0x66 – status response
+    status_query_in_flight_ = false;
     parse_status_102_(b);
   } else if (cmd == 101) {   // 0x65 – write acknowledge
     handle_ack_101_();
@@ -953,20 +1317,40 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_turbo_ = false;
   }
 
-  // Sleep stage.
-  // Some units report the live status as direct values 0..4,
-  // while writes still use the encoded form (value<<1)|1.
+  // Sleep Mode Code is the only authoritative indication that Sleep is active.
+  // This indoor unit reports the remote programs as 2, 4, 6 and 8.
+  // Odd values are retained only as compatibility fallbacks for other revisions.
   uint8_t raw_sleep = b[IDX_SLEEP];
   switch (raw_sleep) {
     case 0x00: sleep_stage_ = 0; break;
-    case 0x01: sleep_stage_ = 1; break;
-    case 0x02: sleep_stage_ = 2; break;
+    case 0x02: sleep_stage_ = 1; break;
+    case 0x04: sleep_stage_ = 2; break;
+    case 0x06: sleep_stage_ = 3; break;
+    case 0x08: sleep_stage_ = 4; break;
+    case 0x01: sleep_stage_ = 0; break;  // Sleep OFF action compatibility
     case 0x03: sleep_stage_ = 1; break;
-    case 0x04: sleep_stage_ = 3; break;
     case 0x05: sleep_stage_ = 2; break;
-    case 0x09: sleep_stage_ = 3; break;
-    case 0x11: sleep_stage_ = 4; break;
+    case 0x07: sleep_stage_ = 3; break;
+    case 0x09: sleep_stage_ = 4; break;
     default:   sleep_stage_ = 0; break;
+  }
+
+  if (sleep_stage_ > 0 && selected_sleep_stage_ != sleep_stage_) {
+    selected_sleep_stage_ = sleep_stage_;
+    update_sleep_program_select_state_();
+    ESP_LOGD(TAG, "Sleep Program synchronized from AC: %s (Sleep Mode Code=%u)",
+             sleep_program_for_stage(selected_sleep_stage_), raw_sleep);
+  }
+
+  // Once Sleep was confirmed, a later status code 0 is authoritative too.
+  // Clear the desired preset instead of trying to reconstruct it with ordinary
+  // climate writes. A newly transmitted Sleep request is handled separately
+  // below by sleep_confirmation_pending_.
+  if (!sleep_confirmation_pending_ && d_sleep_stage_ > 0 && sleep_stage_ == 0) {
+    d_sleep_stage_ = 0;
+    pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+    recalc_desired_sig_();
+    ESP_LOGD(TAG, "Sleep Mode Code returned to 0; clearing desired HA Sleep preset");
   }
 
   // Target temperature (direct value)
@@ -977,7 +1361,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   current_temperature = b[IDX_CURRENT_TEMP];
 
 #ifdef USE_SENSOR
-  if (pipe_sensor_ != nullptr) pipe_sensor_->publish_state(b[IDX_PIPE_TEMP]);
+  publish_sensor_if_changed_(pipe_sensor_, b[IDX_PIPE_TEMP]);
 #endif
 
   // Turbo, Eco, Quiet, LED
@@ -1009,6 +1393,43 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_ = climate::CLIMATE_FAN_HIGH;
   }
 
+  // During a confirmed Sleep program the indoor unit controls the fan and
+  // normally reports QUIET. Keep the desired/UI fan synchronized with that
+  // real value so unrelated HA commands (temperature, swing, display, etc.) do
+  // not trigger repeated AUTO writes that eventually cancel Sleep.
+  //
+  // An explicit fan command made while Sleep is active is the only exception:
+  // preserve the user's requested fan until the unit applies it (usually with
+  // Sleep Mode Code returning to 0) or reports that exact fan value.
+  if (sleep_stage_ > 0) {
+    if (sleep_fan_override_pending_) {
+      const bool requested_fan_applied =
+          fan_ == d_fan_ && fan_turbo_ == d_fan_turbo_;
+      if (requested_fan_applied) {
+        sleep_fan_override_pending_ = false;
+        ESP_LOGD(TAG, "Explicit fan command applied while Sleep remains active");
+      }
+    } else {
+      const bool desired_fan_changed =
+          d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_ || d_quiet_;
+      d_fan_ = fan_;
+      d_fan_turbo_ = fan_turbo_;
+      // Sleep is a preset, not the standalone Quiet custom preset.
+      d_quiet_ = false;
+      pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
+      if (desired_fan_changed) {
+        recalc_desired_sig_();
+        ESP_LOGD(TAG, "Sleep controls fan: synchronized HA fan to actual %s",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
+      }
+    }
+  } else if (sleep_fan_override_pending_) {
+    // The usual result of a deliberate fan change is Sleep Mode Code = 0.
+    // From this point normal desired/actual fan convergence applies.
+    sleep_fan_override_pending_ = false;
+    ESP_LOGD(TAG, "Sleep ended after explicit fan command; normal fan convergence resumed");
+  }
+
   // Swing
   bool updown = (features & UPDOWN_MASK) != 0;
   bool leftright = (features & LEFTRIGHT_MASK) != 0;
@@ -1017,64 +1438,221 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else swing_ = climate::CLIMATE_SWING_OFF;
 
+  // The first status after a byte-17 Sleep action is authoritative. A command
+  // is successful only when the reported program exactly matches the requested
+  // program. Failed commands are not retried automatically.
+  if (sleep_confirmation_pending_) {
+    sleep_confirmation_pending_ = false;
+    const uint8_t requested_stage = sleep_confirmation_target_stage_;
+    sleep_confirmation_target_stage_ = 0;
+
+    if (sleep_stage_ == requested_stage) {
+      d_sleep_stage_ = requested_stage;
+      if (requested_stage > 0) {
+        selected_sleep_stage_ = requested_stage;
+        update_sleep_program_select_state_();
+        ESP_LOGI(TAG, "Sleep confirmed by status: requested=%s Sleep Mode Code=%u",
+                 sleep_program_for_stage(requested_stage), raw_sleep);
+      } else {
+        // This indoor unit leaves the fan in QUIET after Sleep OFF. Restore the
+        // fan that was active immediately before Sleep was enabled from HA.
+        const bool have_saved_fan = sleep_restore_fan_valid_;
+        const auto saved_fan = sleep_restore_fan_;
+        const bool saved_fan_turbo = sleep_restore_fan_turbo_;
+        const bool saved_quiet = sleep_restore_quiet_;
+        sleep_restore_fan_valid_ = false;
+
+        if (have_saved_fan &&
+            (fan_ != saved_fan || fan_turbo_ != saved_fan_turbo || quiet_ != saved_quiet)) {
+          d_fan_ = saved_fan;
+          d_fan_turbo_ = saved_fan_turbo;
+          d_quiet_ = saved_quiet;
+          d_turbo_ = false;
+          d_eco_ = false;
+
+          pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+          pending_command_fields_ |= CMD_FIELD_WIND | CMD_FIELD_QUIET;
+          accept_remote_changes_ = false;
+          ha_priority_active_ = true;
+          pending_control_ = true;
+          last_control_ms_ = millis();
+          user_command_next_write_ = false;
+          beep_on_next_write_ = false;
+          recalc_desired_sig_();
+
+          ESP_LOGI(TAG,
+                   "Sleep OFF confirmed: restoring pre-Sleep fan=%s%s with a neutral one-shot command",
+                   LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)),
+                   d_fan_turbo_ ? " (Turbo)" : "");
+        } else {
+          d_fan_ = fan_;
+          d_fan_turbo_ = fan_turbo_;
+          d_quiet_ = quiet_;
+          pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
+          recalc_desired_sig_();
+          ESP_LOGI(TAG,
+                   "Sleep OFF confirmed by status: Sleep Mode Code=0; no pre-Sleep fan restore needed");
+        }
+      }
+    } else if (requested_stage > 0 && sleep_stage_ == 0) {
+      // Preserve the proven rollback behavior. With byte-17-only activation the
+      // fan normally never changes on failure, so no rollback write is needed.
+      d_sleep_stage_ = 0;
+
+      const bool have_fan_rollback = sleep_restore_fan_valid_;
+      const auto rollback_fan = sleep_restore_fan_;
+      const bool rollback_fan_turbo = sleep_restore_fan_turbo_;
+      const bool rollback_quiet = sleep_restore_quiet_;
+      sleep_restore_fan_valid_ = false;
+
+      if (have_fan_rollback &&
+          (fan_ != rollback_fan || fan_turbo_ != rollback_fan_turbo)) {
+        d_fan_ = rollback_fan;
+        d_fan_turbo_ = rollback_fan_turbo;
+        d_quiet_ = rollback_quiet;
+        d_turbo_ = false;
+        d_eco_ = false;
+        accept_remote_changes_ = false;
+        ha_priority_active_ = true;
+        recalc_desired_sig_();
+        pending_command_fields_ |= CMD_FIELD_WIND | CMD_FIELD_QUIET | CMD_FIELD_TURBO_ECO;
+        pending_control_ = true;
+        last_control_ms_ = millis();
+        user_command_next_write_ = false;
+        beep_on_next_write_ = false;
+        ESP_LOGW(TAG,
+                 "Sleep %s not confirmed: Sleep Mode Code=0; restoring previous fan=%s%s",
+                 sleep_program_for_stage(requested_stage),
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)),
+                 d_fan_turbo_ ? " (Turbo)" : "");
+      } else {
+        pending_control_ = false;
+        pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+        ha_priority_active_ = false;
+        accept_remote_changes_ = true;
+        recalc_desired_sig_();
+        ESP_LOGW(TAG,
+                 "Sleep %s not confirmed: Sleep Mode Code=0; HA Sleep preset cleared",
+                 sleep_program_for_stage(requested_stage));
+      }
+    } else {
+      // The AC stayed in another Sleep program (or rejected an OFF command).
+      // Reflect the actual program and stop without fighting it.
+      d_sleep_stage_ = sleep_stage_;
+      // If Sleep is still active, retain the original pre-Sleep fan snapshot.
+      // It remains valid for a later successful Sleep OFF action.
+      pending_control_ = false;
+      pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      if (sleep_stage_ > 0) {
+        selected_sleep_stage_ = sleep_stage_;
+        update_sleep_program_select_state_();
+      }
+      recalc_desired_sig_();
+      ESP_LOGW(TAG,
+               "Sleep command not confirmed: requested=%s, actual=%s, Sleep Mode Code=%u",
+               requested_stage > 0 ? sleep_program_for_stage(requested_stage) : "Off",
+               sleep_stage_ > 0 ? sleep_program_for_stage(sleep_stage_) : "Off",
+               raw_sleep);
+    }
+  }
+
+  // Report the real HVAC action from the confirmed compressor feedback (byte 41).
+  // The configured HVAC mode alone is not sufficient: an inverter unit can stay
+  // powered in COOL/HEAT/DRY while the compressor is stopped.
+  const bool compressor_running = b[IDX_COMP_FREQ_ACTUAL] > 0;
+  if (!power_on_) {
+    this->action = climate::CLIMATE_ACTION_OFF;
+  } else if (mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+    this->action = climate::CLIMATE_ACTION_FAN;
+  } else if (!compressor_running) {
+    this->action = climate::CLIMATE_ACTION_IDLE;
+  } else if (mode_ == climate::CLIMATE_MODE_COOL) {
+    this->action = climate::CLIMATE_ACTION_COOLING;
+  } else if (mode_ == climate::CLIMATE_MODE_HEAT) {
+    this->action = climate::CLIMATE_ACTION_HEATING;
+  } else if (mode_ == climate::CLIMATE_MODE_DRY) {
+    this->action = climate::CLIMATE_ACTION_DRYING;
+  } else {
+    this->action = climate::CLIMATE_ACTION_IDLE;
+  }
+
   // Recalculate actual signature
   recalc_actual_sig_();
+
+  // Some firmware revisions confirm a write with a status frame rather than a
+  // dedicated 0x65 ACK. A matching status is therefore sufficient to release
+  // the write lock without waiting five seconds for the fallback timeout.
+  if (writing_lock_ && actual_sig_ == desired_sig_) {
+    writing_lock_ = false;
+    ESP_LOGD(TAG, "Write confirmed by matching status (lock cleared)");
+  }
 
   // Publish state with gating
   publish_gated_state_();
   update_led_switch_state_();
 
-  // Keep still-unmapped candidate fields available only in verbose logs.
   ESP_LOGV(TAG,
-           "Extended status: compressor_set=%uHz compressor=%uHz exhaust=%u°C raw_b47=%u/%d raw_b48=%u/%d",
-           b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ], b[IDX_COMPRESSOR_EXHAUST_TEMP],
-           b[47], static_cast<int8_t>(b[47]),
+           "Extended status: compressor_actual=%uHz compressor_set=%uHz compressor_command=%uHz "
+           "exhaust=%u°C raw_b22=0x%02X raw_b23=0x%02X raw_b47=0x%02X raw_b48=%u/%d",
+           b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
+           b[IDX_COMPRESSOR_EXHAUST_TEMP], b[22], b[23], b[47],
            b[48], static_cast<int8_t>(b[48]));
 
   // Publish optional sensors (with sign conversion for outdoor temperatures)
 #ifdef USE_SENSOR
-  if (set_temp_sensor_ != nullptr) set_temp_sensor_->publish_state(b[IDX_SET_TEMP]);
-  if (room_temp_sensor_ != nullptr) room_temp_sensor_->publish_state(b[IDX_CURRENT_TEMP]);
-  if (wind_code_sensor_ != nullptr) wind_code_sensor_->publish_state(b[IDX_WIND]);
-  if (sleep_code_sensor_ != nullptr) sleep_code_sensor_->publish_state(b[IDX_SLEEP]);
-  if (mode_code_sensor_ != nullptr) mode_code_sensor_->publish_state((b[IDX_POWER_MODE] >> 4) & 0x0F);
-  if (quiet_code_sensor_ != nullptr) quiet_code_sensor_->publish_state(quiet_ ? 1.0f : 0.0f);
-  if (turbo_code_sensor_ != nullptr) turbo_code_sensor_->publish_state(turbo_ ? 1.0f : 0.0f);
-  if (eco_code_sensor_ != nullptr)   eco_code_sensor_->publish_state(eco_ ? 1.0f : 0.0f);
-  if (swing_ud_sensor_ != nullptr)   swing_ud_sensor_->publish_state(updown ? 1.0f : 0.0f);
-  if (swing_lr_sensor_ != nullptr)   swing_lr_sensor_->publish_state(leftright ? 1.0f : 0.0f);
-  if (compressor_freq_set_sensor_ != nullptr) compressor_freq_set_sensor_->publish_state(b[IDX_COMP_FREQ_SET]);
-  if (compressor_freq_sensor_ != nullptr)     compressor_freq_sensor_->publish_state(b[IDX_COMP_FREQ]);
+  // The OFF status of this indoor unit reports 26°C as a service/default value.
+  // Keep the user-facing setpoint sensor aligned with the remembered COOL/HEAT
+  // target instead of exposing that transient value.
+  const uint8_t published_setpoint =
+      power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_);
+  publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
+  publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
+  publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
+  publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);
+  publish_sensor_if_changed_(mode_code_sensor_, (b[IDX_POWER_MODE] >> 4) & 0x0F);
+  publish_sensor_if_changed_(quiet_code_sensor_, quiet_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(turbo_code_sensor_, turbo_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(eco_code_sensor_, eco_ ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(swing_ud_sensor_, updown ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(swing_lr_sensor_, leftright ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(compressor_freq_actual_sensor_, b[IDX_COMP_FREQ_ACTUAL]);
+  publish_sensor_if_changed_(compressor_freq_set_sensor_, b[IDX_COMP_FREQ_SET]);
+  publish_sensor_if_changed_(compressor_freq_command_sensor_, b[IDX_COMP_FREQ_COMMAND]);
+  // Backward-compatible byte-43 sensor for existing YAML configurations.
+  publish_sensor_if_changed_(compressor_freq_sensor_, b[IDX_COMP_FREQ_COMMAND]);
 
   // Outdoor temperatures are signed!
   if (outdoor_temp_sensor_ != nullptr) {
     int8_t t = static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]);
-    outdoor_temp_sensor_->publish_state(static_cast<float>(t));
+    publish_sensor_if_changed_(outdoor_temp_sensor_, static_cast<float>(t));
   }
   if (outdoor_cond_temp_sensor_ != nullptr) {
     int8_t t = static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]);
-    outdoor_cond_temp_sensor_->publish_state(static_cast<float>(t));
+    publish_sensor_if_changed_(outdoor_cond_temp_sensor_, static_cast<float>(t));
   }
-  if (compressor_exhaust_temp_sensor_ != nullptr) {
-    compressor_exhaust_temp_sensor_->publish_state(static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
-  }
+  publish_sensor_if_changed_(compressor_exhaust_temp_sensor_,
+                             static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
+
 #endif
 
 #ifdef USE_TEXT_SENSOR
-  if (power_status_text_ != nullptr) {
-    power_status_text_->publish_state(power_on_ ? "ON" : "OFF");
-  }
+  publish_text_sensor_if_changed_(power_status_text_, power_on_ ? "ON" : "OFF");
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, compressor=%uHz, exhaust=%u°C",
+           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
+           "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
-           climate::climate_mode_to_string(mode_),
-           climate::climate_fan_mode_to_string(fan_),
-           climate::climate_swing_mode_to_string(swing_),
+           LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
+           LOG_STR_ARG(climate::climate_action_to_string(this->action)),
+           LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
+           LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
            (unsigned) target_c_, current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
-           b[IDX_COMP_FREQ], b[IDX_COMPRESSOR_EXHAUST_TEMP]);
+           b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
+           b[IDX_COMPRESSOR_EXHAUST_TEMP]);
 
   // If HA has priority, check convergence and possibly enforce
   maybe_force_to_target_();
@@ -1100,12 +1678,10 @@ void ACHIClimate::publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan
 void ACHIClimate::publish_gated_state_() {
   if (accept_remote_changes_) {
     // Publish actual state (from AC). Some Hisense units do not return explicit
-    // Turbo/ECO/Sleep/Quiet bits when the front display is off. They acknowledge
-    // those presets indirectly via target temperature and raw fan/wind code:
-    //   BOOST -> target 16/30 and raw wind 18
-    //   ECO   -> target 24 and raw wind 10
-    //   SLEEP -> previous target+1 and raw wind 10
-    // If the last HA-selected preset still matches that indirect state, keep it
+    // Turbo/ECO/Quiet bits when the front display is off may be acknowledged
+    // indirectly via target temperature and raw fan/wind code. Sleep is
+    // deliberately excluded: only Sleep Mode Code > 0 may expose the Sleep
+    // preset in Home Assistant. If a non-Sleep mode still matches, keep it
     // visible in HA instead of immediately publishing Preset=None on the next
     // status frame.
     bool out_turbo = turbo_;
@@ -1130,13 +1706,7 @@ void ACHIClimate::publish_gated_state_() {
         out_sleep_stage = 0;
         out_fan = d_fan_;
         out_fan_turbo = false;
-      } else if (d_sleep_stage_ > 0 && last_raw_wind_ == 10) {
-        out_turbo = false;
-        out_eco = false;
-        out_quiet = false;
-        out_sleep_stage = d_sleep_stage_;
-        out_fan = d_fan_;
-        out_fan_turbo = false;
+
       } else if (d_quiet_ && (quiet_ || fan_ == climate::CLIMATE_FAN_QUIET)) {
         out_turbo = false;
         out_eco = false;
@@ -1158,8 +1728,18 @@ void ACHIClimate::publish_gated_state_() {
       last_active_mode_ = mode_;
     }
 
+    // Learn normal COOL/HEAT setpoints only while the unit is powered on.
+    // When this model is OFF it reports a service/default value of 26°C in
+    // COOL, which must never overwrite the last real cooling setpoint.
+    if (power_on_ && !out_turbo && !out_eco && out_sleep_stage == 0) {
+      remember_target_for_mode_(mode_, target_c_);
+    }
+
+    const uint8_t published_target =
+        power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_);
+
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
-    this->target_temperature = target_c_;
+    this->target_temperature = published_target;
     publish_fan_state_(out_fan_turbo, out_fan);
     this->swing_mode = swing_;
     if (enable_presets_) {
@@ -1174,7 +1754,7 @@ void ACHIClimate::publish_gated_state_() {
     // remote/HA changes to clear them when the indirect state no longer matches.
     d_power_on_    = power_on_;
     d_mode_        = mode_;
-    d_target_c_    = target_c_;
+    d_target_c_    = published_target;
     d_fan_         = out_fan;
     d_fan_turbo_   = out_fan_turbo;
     d_swing_       = swing_;
@@ -1185,15 +1765,20 @@ void ACHIClimate::publish_gated_state_() {
     d_sleep_stage_ = out_sleep_stage;
     recalc_desired_sig_();
   } else {
-    // Publish desired state (while enforcing)
+    // Publish desired state while enforcing. A confirmed Sleep program is
+    // authoritative for the fan unless the user explicitly requested another
+    // fan mode; therefore show the real QUIET fan instead of stale desired AUTO.
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = d_target_c_;
-    publish_fan_state_(d_fan_turbo_, d_fan_);
+    if (sleep_stage_ > 0 && !sleep_fan_override_pending_)
+      publish_fan_state_(fan_turbo_, fan_);
+    else
+      publish_fan_state_(d_fan_turbo_, d_fan_);
     this->swing_mode = d_swing_;
     if (enable_presets_) {
       if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-      else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
       else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
@@ -1225,6 +1810,11 @@ void ACHIClimate::update_memory_switch_state_() {
   memory_switch_->publish_state(memory_mode_enabled_);
 }
 
+void ACHIClimate::update_sleep_program_select_state_() {
+  if (sleep_program_select_ == nullptr) return;
+  sleep_program_select_->publish_state(sleep_program_for_stage(selected_sleep_stage_));
+}
+
 void ACHIClimate::maybe_force_to_target_() {
   if (!ha_priority_active_) return;
 
@@ -1241,7 +1831,17 @@ void ACHIClimate::maybe_force_to_target_() {
   }
 
   if (!writing_lock_) {
-    ESP_LOGD(TAG, "Enforcing desired state (actual≠desired) – requesting write");
+    queue_retry_fields_from_state_();
+    if (pending_command_fields_ == CMD_FIELD_NONE) {
+      // The only remaining mismatch can be an action-style field such as
+      // Sleep or display. Do not generate a full-state retry.
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      ESP_LOGD(TAG, "Desired/actual mismatch has no retryable one-shot fields; accepting status");
+      return;
+    }
+    ESP_LOGD(TAG, "Enforcing desired state with neutral one-shot fields=0x%02X",
+             (unsigned) pending_command_fields_);
     pending_control_ = true;
     last_control_ms_ = millis();   // restart debounce
   }
@@ -1310,11 +1910,21 @@ void ACHIClimate::recalc_actual_sig_() {
   auto effective_fan = fan_;
   bool effective_fan_turbo = fan_turbo_;
 
+  // A confirmed Sleep program owns the fan. Mask its automatic QUIET value
+  // from signature comparison unless a user explicitly changed the fan while
+  // Sleep was active. This prevents an unrelated command from creating an
+  // endless AUTO-vs-QUIET mismatch and cancelling Sleep.
+  if (sleep_stage_ > 0 && !sleep_fan_override_pending_) {
+    effective_fan = d_fan_;
+    effective_fan_turbo = d_fan_turbo_;
+    effective_quiet = d_quiet_;
+  }
+
   // Some Hisense indoor units acknowledge special modes only indirectly in
   // status frames. For HA-priority convergence, accept those indirect states
   // without changing the normal published UI state. This stops repeated silent
-  // writes after BOOST/ECO/SLEEP while preserving the original preset display
-  // behavior from the working baseline.
+  // writes after BOOST/ECO while preserving the original preset display.
+  // Sleep is never accepted indirectly; it requires Sleep Mode Code > 0.
   if (ha_priority_active_ && d_power_on_ && power_on_ && mode_ == d_mode_) {
     if (d_fan_turbo_ && target_c_ == d_target_c_ && last_raw_wind_ == 18) {
       effective_fan_turbo = true;
@@ -1337,13 +1947,7 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_sleep_stage = 0;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
-    } else if (d_sleep_stage_ > 0 && target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
-      effective_sleep_stage = d_sleep_stage_;
-      effective_eco = false;
-      effective_turbo = false;
-      effective_quiet = false;
-      effective_fan_turbo = false;
-      effective_fan = d_fan_;
+
     } else if (d_quiet_ && fan_ == climate::CLIMATE_FAN_QUIET) {
       effective_quiet = true;
       effective_eco = false;
@@ -1376,6 +1980,7 @@ void ACHIClimate::set_desired_led(bool on) {
   }
 
   led_command_pending_ = true;
+  pending_command_fields_ |= CMD_FIELD_LED;
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
   recalc_desired_sig_();
@@ -1434,32 +2039,27 @@ uint8_t ACHIClimate::encode_mode_hi_nibble_(climate::ClimateMode m) {
 }
 
 uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan) {
-  uint8_t code = 1;
-  if (turbo_fan) {
-    code = 18;
-    return static_cast<uint8_t>(code + 1);   // writing requires +1
-  }
+  // Fan values in a neutral one-shot 0x65 frame are action codes.
+  // AUTO is the special case: its action value is 0x01, not the
+  // status-derived value 0x02 that was accepted in the old full-state frame.
+  if (turbo_fan)
+    return 0x13;
+
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   code = 1;  break;
-    case climate::CLIMATE_FAN_LOW:    code = 12; break;
-    case climate::CLIMATE_FAN_MEDIUM: code = 14; break;
-    case climate::CLIMATE_FAN_HIGH:   code = 16; break;
-    case climate::CLIMATE_FAN_QUIET:  code = 10; break;
-    default:                          code = 1;  break;
+    case climate::CLIMATE_FAN_AUTO:   return 0x01;
+    case climate::CLIMATE_FAN_LOW:    return 0x0D;
+    case climate::CLIMATE_FAN_MEDIUM: return 0x0F;
+    case climate::CLIMATE_FAN_HIGH:   return 0x11;
+    case climate::CLIMATE_FAN_QUIET:  return 0x0B;
+    default:                          return 0x01;
   }
-  return static_cast<uint8_t>(code + 1);   // writing requires +1
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  uint8_t code = 0;
-  switch (stage) {
-    case 1: code = 1; break;
-    case 2: code = 2; break;
-    case 3: code = 4; break;
-    case 4: code = 8; break;
-    default: code = 0; break;
-  }
-  return static_cast<uint8_t>((code << 1) | 0x01);
+  // The indoor unit reports programs as status codes 2/4/6/8, while the
+  // corresponding one-shot action values are 3/5/7/9. Stage 0 uses action 1.
+  stage = std::min<uint8_t>(stage, 4);
+  return static_cast<uint8_t>((stage << 1) | 0x01);
 }
 
 // ---- Logging helper ----
@@ -1512,14 +2112,14 @@ void ACHIClimate::publish_memory_diagnostics_() {
   heap_frag_pct  = ESP.getHeapFragmentation();
 #endif
 
-  if (heap_free_sensor_ != nullptr) heap_free_sensor_->publish_state(static_cast<float>(heap_free));
-  if (heap_total_sensor_ != nullptr && heap_total > 0) heap_total_sensor_->publish_state(static_cast<float>(heap_total));
-  if (heap_used_sensor_ != nullptr && heap_total > 0) heap_used_sensor_->publish_state(static_cast<float>(heap_used));
-  if (heap_min_free_sensor_ != nullptr && heap_min_free > 0) heap_min_free_sensor_->publish_state(static_cast<float>(heap_min_free));
-  if (heap_max_alloc_sensor_ != nullptr && heap_max_alloc > 0) heap_max_alloc_sensor_->publish_state(static_cast<float>(heap_max_alloc));
-  if (heap_fragmentation_sensor_ != nullptr && heap_frag_pct >= 0) heap_fragmentation_sensor_->publish_state(static_cast<float>(heap_frag_pct));
-  if (psram_total_sensor_ != nullptr && psram_total > 0) psram_total_sensor_->publish_state(static_cast<float>(psram_total));
-  if (psram_free_sensor_ != nullptr && psram_free > 0) psram_free_sensor_->publish_state(static_cast<float>(psram_free));
+  publish_sensor_if_changed_(heap_free_sensor_, static_cast<float>(heap_free));
+  if (heap_total > 0) publish_sensor_if_changed_(heap_total_sensor_, static_cast<float>(heap_total));
+  if (heap_total > 0) publish_sensor_if_changed_(heap_used_sensor_, static_cast<float>(heap_used));
+  if (heap_min_free > 0) publish_sensor_if_changed_(heap_min_free_sensor_, static_cast<float>(heap_min_free));
+  if (heap_max_alloc > 0) publish_sensor_if_changed_(heap_max_alloc_sensor_, static_cast<float>(heap_max_alloc));
+  if (heap_frag_pct >= 0) publish_sensor_if_changed_(heap_fragmentation_sensor_, static_cast<float>(heap_frag_pct));
+  if (psram_total > 0) publish_sensor_if_changed_(psram_total_sensor_, static_cast<float>(psram_total));
+  if (psram_free > 0) publish_sensor_if_changed_(psram_free_sensor_, static_cast<float>(psram_free));
 #endif
 }
 
