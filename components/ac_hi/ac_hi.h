@@ -262,7 +262,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // RX parser
   void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS);
-  bool extract_next_frame_(std::vector<uint8_t> &frame);
+  bool extract_next_frame_(std::vector<uint8_t> &frame, std::vector<uint8_t> *wire_frame = nullptr);
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
@@ -307,8 +307,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan);
   uint8_t encode_sleep_byte_(uint8_t stage);
 
-  // Logging helper
+  // Logging helpers. The DEBUG-level capture is intentionally limited to
+  // complete TX writes and RX frames whose contents changed, so a normal
+  // two-second status poll does not flood the ESPHome log.
   void log_frame_(const char *prefix, const std::vector<uint8_t> &b) const;
+  void log_frame_debug_(const char *prefix, const std::vector<uint8_t> &b) const;
+  void log_frame_summary_debug_(const char *direction, const std::vector<uint8_t> &logical,
+                                const std::vector<uint8_t> &wire, bool crc_ok, uint16_t crc_sum) const;
+  void log_frame_diff_debug_(const std::vector<uint8_t> &previous,
+                             const std::vector<uint8_t> &current) const;
 
   // ----- Buffers and state -----
   std::vector<uint8_t> rx_;
@@ -491,6 +498,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // For debugging (optional)
   std::vector<uint8_t> last_status_frame_;
   std::vector<uint8_t> last_tx_frame_;
+  std::vector<uint8_t> last_debug_status_frame_;
+  std::vector<uint8_t> last_debug_status_wire_frame_;
 };
 
 template<typename... Ts> class ACHIIFeelAction : public Action<Ts...> {

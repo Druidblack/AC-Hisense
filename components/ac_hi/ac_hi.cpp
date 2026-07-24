@@ -1,6 +1,7 @@
 #include "ac_hi.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <Arduino.h>
 #include "esphome/core/log.h"
@@ -197,6 +198,8 @@ void ACHIClimate::setup() {
   rx_.reserve(RX_BUFFER_RESERVE);
   last_status_frame_.reserve(MAX_FRAME_BYTES);
   last_tx_frame_.reserve(MAX_FRAME_BYTES);
+  last_debug_status_frame_.reserve(MAX_FRAME_BYTES);
+  last_debug_status_wire_frame_.reserve(MAX_WIRE_FRAME_BYTES);
 
   ESP_LOGI(TAG, "Setup complete; first AC status query will be delayed by %u ms",
            (unsigned) STARTUP_POLL_DELAY_MS);
@@ -1121,11 +1124,21 @@ std::vector<uint8_t> ACHIClimate::encode_wire_frame_(const std::vector<uint8_t> 
 void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const char *log_prefix) {
   const auto wire = encode_wire_frame_(logical);
   log_frame_(log_prefix, logical);
-  if (wire.size() != logical.size()) {
+
+  const uint8_t cmd = logical.size() > IDX_CMD ? logical[IDX_CMD] : 0x00;
+  // The periodic 0x66 query is constant and would only add noise. Dump every
+  // 0x65 write (including Sleep attempts) and every non-standard frame at DEBUG.
+  if (cmd != 0x66) {
+    uint16_t crc_sum = 0;
+    const bool crc_ok = validate_crc_(logical, &crc_sum);
+    log_frame_summary_debug_("TX", logical, wire, crc_ok, crc_sum);
+    log_frame_debug_("UART TX logical", logical);
+    log_frame_debug_("UART TX wire", wire);
+  } else if (wire.size() != logical.size()) {
     ESP_LOGD(TAG, "%s: byte-stuffed %u logical bytes to %u wire bytes", log_prefix,
              (unsigned) logical.size(), (unsigned) wire.size());
-    log_frame_("TX wire", wire);
   }
+
   for (auto b : wire) write_byte(b);
   flush();
 }
@@ -1133,21 +1146,52 @@ void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const
 // ---- RX frame parsing ----
 void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   std::vector<uint8_t> frame;
+  std::vector<uint8_t> wire_frame;
   frame.reserve(MAX_FRAME_BYTES);
+  wire_frame.reserve(MAX_WIRE_FRAME_BYTES);
 
   uint8_t handled = 0;
   uint32_t start = millis();
 
   while (handled < MAX_FRAMES_PER_LOOP &&
          (millis() - start) < budget_ms &&
-         extract_next_frame_(frame)) {
+         extract_next_frame_(frame, &wire_frame)) {
 
     log_frame_("RX", frame);
 
     uint16_t sum = 0;
-    if (!validate_crc_(frame, &sum)) {
+    const bool crc_ok = validate_crc_(frame, &sum);
+    const uint8_t cmd = frame.size() > IDX_CMD ? frame[IDX_CMD] : 0x00;
+
+    // For routine status responses, record a full baseline once and then dump
+    // only frames whose logical bytes changed. This captures every remote-control
+    // transition without printing the same 150-byte status frame every two seconds.
+    if (cmd == 0x66) {
+      const bool first_status = last_debug_status_frame_.empty();
+      const bool changed = first_status || frame != last_debug_status_frame_;
+      if (changed) {
+        log_frame_summary_debug_("RX", frame, wire_frame, crc_ok, sum);
+        if (!first_status) {
+          log_frame_diff_debug_(last_debug_status_frame_, frame);
+        } else {
+          ESP_LOGD(TAG, "UART RX status baseline captured; use later DIFF lines to identify remote changes");
+        }
+        log_frame_debug_("UART RX logical", frame);
+        log_frame_debug_("UART RX wire", wire_frame);
+        last_debug_status_frame_ = frame;
+        last_debug_status_wire_frame_ = wire_frame;
+      }
+    } else {
+      // ACKs and unknown/unsolicited frames are always important for protocol
+      // analysis, so log every one in both logical and exact on-wire form.
+      log_frame_summary_debug_("RX", frame, wire_frame, crc_ok, sum);
+      log_frame_debug_("UART RX logical", frame);
+      log_frame_debug_("UART RX wire", wire_frame);
+    }
+
+    if (!crc_ok) {
       ESP_LOGW(TAG, "CRC mismatch, ignoring frame");
-      if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66) {
+      if (cmd == 0x66) {
         // The requested response arrived but was corrupt. Do not hold a user
         // command for the full query timeout; the next poll will refresh state.
         status_query_in_flight_ = false;
@@ -1161,8 +1205,9 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
   }
 }
 
-bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
+bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame, std::vector<uint8_t> *wire_frame) {
   frame.clear();
+  if (wire_frame != nullptr) wire_frame->clear();
 
   while (true) {
     if (rx_.size() <= rx_start_ + 1) return false;
@@ -1182,6 +1227,14 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
 
     if (!found) {
       // Keep a possible first byte of a split header and discard older noise.
+      const size_t discard_end = (!rx_.empty() && rx_.back() == HI_HDR0) ? rx_.size() - 1 : rx_.size();
+      if (discard_end > rx_start_) {
+        std::vector<uint8_t> discarded(rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+                                       rx_.begin() + static_cast<std::ptrdiff_t>(discard_end));
+        ESP_LOGD(TAG, "UART RX discarded %u unframed byte(s) while searching for F4 F5",
+                 (unsigned) discarded.size());
+        log_frame_debug_("UART RX unframed", discarded);
+      }
       if (!rx_.empty() && rx_.back() == HI_HDR0) {
         const uint8_t keep = rx_.back();
         rx_.clear();
@@ -1191,6 +1244,13 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
       }
       rx_start_ = 0;
       return false;
+    }
+
+    if (frame_start > rx_start_) {
+      std::vector<uint8_t> discarded(rx_.begin() + static_cast<std::ptrdiff_t>(rx_start_),
+                                     rx_.begin() + static_cast<std::ptrdiff_t>(frame_start));
+      ESP_LOGD(TAG, "UART RX skipped %u byte(s) before frame header", (unsigned) discarded.size());
+      log_frame_debug_("UART RX pre-header", discarded);
     }
 
     frame.clear();
@@ -1223,6 +1283,10 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
           wire_pos += 2;
 
           if (expected_logical_size != 0 && frame.size() == expected_logical_size) {
+            if (wire_frame != nullptr) {
+              wire_frame->assign(rx_.begin() + static_cast<std::ptrdiff_t>(frame_start),
+                                 rx_.begin() + static_cast<std::ptrdiff_t>(wire_pos));
+            }
             rx_start_ = wire_pos;
             return true;
           }
@@ -1266,6 +1330,14 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
     if (!invalid) {
       // Header and a partial body are present; wait for more UART bytes.
       return false;
+    }
+
+    // Record the exact invalid wire candidate before resynchronizing.
+    const size_t invalid_end = std::min(wire_pos, rx_.size());
+    if (invalid_end > frame_start) {
+      std::vector<uint8_t> invalid_wire(rx_.begin() + static_cast<std::ptrdiff_t>(frame_start),
+                                        rx_.begin() + static_cast<std::ptrdiff_t>(invalid_end));
+      log_frame_debug_("UART RX invalid wire candidate", invalid_wire);
     }
 
     // Drop only the first byte of the bad candidate, then search for the next
@@ -1888,6 +1960,118 @@ uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
   // Status values are 0,2,4,6,8. A write uses the corresponding odd action
   // value: off=1, Sleep 1=3, Sleep 2=5, Sleep 3=7, Sleep 4=9.
   return static_cast<uint8_t>(sleep_status_code_for_stage(stage) | 0x01);
+}
+
+// ---- DEBUG-level UART capture helpers ----
+static const char *frame_index_name_(size_t index, uint8_t cmd) {
+  switch (index) {
+    case IDX_CMD: return "CMD";
+    case IDX_WIND: return "WIND";
+    case IDX_SLEEP: return "SLEEP";
+    case IDX_POWER_MODE: return "POWER_MODE";
+    case IDX_SET_TEMP: return "SET_TEMP";
+    case IDX_CURRENT_TEMP: return "CURRENT_TEMP";
+    case IDX_PIPE_TEMP: return "PIPE_TEMP";
+    case IDX_TX_BEEP: return cmd == 0x65 ? "TX_BEEP" : "BYTE23";
+    case IDX_TX_SWING: return cmd == 0x65 ? "TX_SWING" : "BYTE32";
+    case IDX_TX_TURBO_ECO: return cmd == 0x65 ? "TX_TURBO_ECO" : "BYTE33";
+    case IDX_RX_SWING_TURBO_ECO: return cmd == 0x66 ? "RX_SWING_TURBO_ECO" : "BYTE35";
+    case IDX_RX_QUIET: return cmd == 0x66 ? "RX_QUIET" : "BYTE36";
+    case IDX_RX_LED: return cmd == 0x66 ? "RX_LED" : "BYTE37";
+    case IDX_COMP_FREQ_ACTUAL: return "COMP_FREQ_ACTUAL";
+    case IDX_COMP_FREQ_SET: return "COMP_FREQ_SET";
+    case IDX_COMP_FREQ_COMMAND: return "COMP_FREQ_COMMAND";
+    case IDX_OUTDOOR_TEMP: return "OUTDOOR_TEMP";
+    case IDX_OUTDOOR_COND_TEMP: return "OUTDOOR_COND_TEMP";
+    case IDX_COMPRESSOR_EXHAUST_TEMP: return "EXHAUST_TEMP";
+    default: return nullptr;
+  }
+}
+
+void ACHIClimate::log_frame_debug_(const char *prefix, const std::vector<uint8_t> &b) const {
+  constexpr size_t CHUNK = 32;
+  for (size_t i = 0; i < b.size(); i += CHUNK) {
+    char line[CHUNK * 3 + 1];
+    char *cursor = line;
+    size_t available = sizeof(line);
+    const size_t end = std::min(b.size(), i + CHUNK);
+    for (size_t j = i; j < end && available > 1; j++) {
+      const int written = snprintf(cursor, available, "%02X%s", b[j], j + 1 == end ? "" : " ");
+      if (written <= 0 || static_cast<size_t>(written) >= available) break;
+      cursor += written;
+      available -= static_cast<size_t>(written);
+    }
+    ESP_LOGD(TAG, "%s [%03u..%03u]: %s", prefix, (unsigned) i,
+             (unsigned) (end == 0 ? 0 : end - 1), line);
+  }
+}
+
+void ACHIClimate::log_frame_summary_debug_(const char *direction,
+                                           const std::vector<uint8_t> &logical,
+                                           const std::vector<uint8_t> &wire,
+                                           bool crc_ok, uint16_t crc_sum) const {
+  const uint8_t cmd = logical.size() > IDX_CMD ? logical[IDX_CMD] : 0x00;
+  const size_t declared = logical.size() > 4 ? static_cast<size_t>(logical[4]) + 9 : 0;
+  uint16_t stored_crc = 0;
+  if (logical.size() >= 4) {
+    stored_crc = static_cast<uint16_t>((static_cast<uint16_t>(logical[logical.size() - 4]) << 8) |
+                                       logical[logical.size() - 3]);
+  }
+  ESP_LOGD(TAG,
+           "UART %s frame summary: cmd=0x%02X logical_len=%u wire_len=%u declared_len=%u "
+           "crc=%s calculated=0x%04X stored=0x%04X",
+           direction, cmd, (unsigned) logical.size(), (unsigned) wire.size(),
+           (unsigned) declared, crc_ok ? "OK" : "BAD", (unsigned) crc_sum,
+           (unsigned) stored_crc);
+}
+
+void ACHIClimate::log_frame_diff_debug_(const std::vector<uint8_t> &previous,
+                                        const std::vector<uint8_t> &current) const {
+  const uint8_t cmd = current.size() > IDX_CMD ? current[IDX_CMD] : 0x00;
+  char line[560];
+  size_t used = 0;
+  unsigned changed_count = 0;
+
+  auto flush_line = [&]() {
+    if (used == 0) return;
+    line[used] = '\0';
+    ESP_LOGD(TAG, "UART RX DIFF: %s", line);
+    used = 0;
+  };
+
+  const size_t common = std::min(previous.size(), current.size());
+  for (size_t i = 0; i < common; i++) {
+    if (previous[i] == current[i]) continue;
+    changed_count++;
+    const char *name = frame_index_name_(i, cmd);
+    char item[96];
+    const int item_len = name != nullptr
+        ? snprintf(item, sizeof(item), "[%03u %s] %02X->%02X ", (unsigned) i, name,
+                   previous[i], current[i])
+        : snprintf(item, sizeof(item), "[%03u] %02X->%02X ", (unsigned) i,
+                   previous[i], current[i]);
+    if (item_len <= 0) continue;
+    if (used + static_cast<size_t>(item_len) >= sizeof(line) - 1) flush_line();
+    const size_t copy_len = std::min(static_cast<size_t>(item_len), sizeof(line) - 1 - used);
+    memcpy(line + used, item, copy_len);
+    used += copy_len;
+  }
+
+  if (previous.size() != current.size()) {
+    char item[96];
+    const int item_len = snprintf(item, sizeof(item), "[LENGTH] %u->%u ",
+                                  (unsigned) previous.size(), (unsigned) current.size());
+    if (item_len > 0) {
+      if (used + static_cast<size_t>(item_len) >= sizeof(line) - 1) flush_line();
+      const size_t copy_len = std::min(static_cast<size_t>(item_len), sizeof(line) - 1 - used);
+      memcpy(line + used, item, copy_len);
+      used += copy_len;
+    }
+    changed_count++;
+  }
+
+  flush_line();
+  ESP_LOGD(TAG, "UART RX DIFF summary: %u changed byte(s)", changed_count);
 }
 
 // ---- Logging helper ----
