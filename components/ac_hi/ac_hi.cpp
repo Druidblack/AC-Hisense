@@ -340,7 +340,8 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
   }
 
   d_sleep_stage_ = stage;
-  sleep_restore_fan_valid_ = false;
+  // Preserve the fan snapshot captured before Sleep activation while switching
+  // between Sleep 1..4. It is needed to restore the original fan on Sleep OFF.
   pending_command_fields_ |= CMD_FIELD_SLEEP;
   accept_remote_changes_ = false;
   ha_priority_active_ = true;
@@ -496,7 +497,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     const bool fan_turbo_before_preset = d_fan_turbo_;
     const bool quiet_before_preset = d_quiet_;
 
-    if (p != climate::CLIMATE_PRESET_SLEEP) {
+    // Preserve the pre-Sleep fan snapshot only while leaving an active Sleep
+    // preset through Preset=None. Any other preset/fan choice supersedes it.
+    const bool leaving_sleep_to_none =
+        p == climate::CLIMATE_PRESET_NONE && was_sleep;
+    if (p != climate::CLIMATE_PRESET_SLEEP && !leaving_sleep_to_none) {
       sleep_restore_fan_valid_ = false;
     }
 
@@ -546,8 +551,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       // Request the first Sleep program without changing the set temperature.
       // The UI does not treat this desired value as active Sleep: only a
       // non-zero Sleep Mode Code in a later status frame can confirm it.
-      // Save the current fan state so a rejected Sleep request can be rolled
-      // back instead of leaving the indoor unit in QUIET fan mode.
+      // Save the current fan state so it can be restored both when a Sleep
+      // request is rejected and when a successfully activated Sleep is turned off.
       if (sleep_stage_ == 0) {
         sleep_restore_fan_ = fan_before_preset;
         sleep_restore_fan_turbo_ = fan_turbo_before_preset;
@@ -558,9 +563,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
                  sleep_restore_fan_turbo_ ? "YES" : "NO",
                  sleep_restore_quiet_ ? "YES" : "NO");
       } else {
-        // Sleep is already confirmed by the AC, so this is not a speculative
-        // activation and no rollback snapshot is needed.
-        sleep_restore_fan_valid_ = false;
+        // Sleep is already confirmed. Keep the original pre-Sleep fan snapshot
+        // so changing Sleep 1..4 does not lose the value needed on Sleep OFF.
       }
 
       // Send only the selected Sleep action. Do not pre-emptively change
@@ -568,7 +572,6 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       // QUIET fan state in the following status frame.
       d_sleep_stage_ = selected_sleep_stage_;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
-      sleep_restore_fan_valid_ = false;
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
         g_has_pre_turbo_target = false;
@@ -1445,23 +1448,51 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
     if (sleep_stage_ == requested_stage) {
       d_sleep_stage_ = requested_stage;
-      sleep_restore_fan_valid_ = false;
       if (requested_stage > 0) {
         selected_sleep_stage_ = requested_stage;
         update_sleep_program_select_state_();
         ESP_LOGI(TAG, "Sleep confirmed by status: requested=%s Sleep Mode Code=%u",
                  sleep_program_for_stage(requested_stage), raw_sleep);
       } else {
-        // Sleep controls the fan while active. After a confirmed OFF action,
-        // accept the fan restored by the indoor unit instead of re-sending the
-        // stale Sleep QUIET value.
-        d_fan_ = fan_;
-        d_fan_turbo_ = fan_turbo_;
-        d_quiet_ = quiet_;
-        pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
-        recalc_desired_sig_();
-        ESP_LOGI(TAG, "Sleep OFF confirmed by status: Sleep Mode Code=0; fan synchronized to %s",
-                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
+        // This indoor unit leaves the fan in QUIET after Sleep OFF. Restore the
+        // fan that was active immediately before Sleep was enabled from HA.
+        const bool have_saved_fan = sleep_restore_fan_valid_;
+        const auto saved_fan = sleep_restore_fan_;
+        const bool saved_fan_turbo = sleep_restore_fan_turbo_;
+        const bool saved_quiet = sleep_restore_quiet_;
+        sleep_restore_fan_valid_ = false;
+
+        if (have_saved_fan &&
+            (fan_ != saved_fan || fan_turbo_ != saved_fan_turbo || quiet_ != saved_quiet)) {
+          d_fan_ = saved_fan;
+          d_fan_turbo_ = saved_fan_turbo;
+          d_quiet_ = saved_quiet;
+          d_turbo_ = false;
+          d_eco_ = false;
+
+          pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+          pending_command_fields_ |= CMD_FIELD_WIND | CMD_FIELD_QUIET;
+          accept_remote_changes_ = false;
+          ha_priority_active_ = true;
+          pending_control_ = true;
+          last_control_ms_ = millis();
+          user_command_next_write_ = false;
+          beep_on_next_write_ = false;
+          recalc_desired_sig_();
+
+          ESP_LOGI(TAG,
+                   "Sleep OFF confirmed: restoring pre-Sleep fan=%s%s with a neutral one-shot command",
+                   LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)),
+                   d_fan_turbo_ ? " (Turbo)" : "");
+        } else {
+          d_fan_ = fan_;
+          d_fan_turbo_ = fan_turbo_;
+          d_quiet_ = quiet_;
+          pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
+          recalc_desired_sig_();
+          ESP_LOGI(TAG,
+                   "Sleep OFF confirmed by status: Sleep Mode Code=0; no pre-Sleep fan restore needed");
+        }
       }
     } else if (requested_stage > 0 && sleep_stage_ == 0) {
       // Preserve the proven rollback behavior. With byte-17-only activation the
@@ -1508,7 +1539,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
       // The AC stayed in another Sleep program (or rejected an OFF command).
       // Reflect the actual program and stop without fighting it.
       d_sleep_stage_ = sleep_stage_;
-      sleep_restore_fan_valid_ = false;
+      // If Sleep is still active, retain the original pre-Sleep fan snapshot.
+      // It remains valid for a later successful Sleep OFF action.
       pending_control_ = false;
       pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
       ha_priority_active_ = false;
@@ -1570,7 +1602,12 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   // Publish optional sensors (with sign conversion for outdoor temperatures)
 #ifdef USE_SENSOR
-  publish_sensor_if_changed_(set_temp_sensor_, b[IDX_SET_TEMP]);
+  // The OFF status of this indoor unit reports 26°C as a service/default value.
+  // Keep the user-facing setpoint sensor aligned with the remembered COOL/HEAT
+  // target instead of exposing that transient value.
+  const uint8_t published_setpoint =
+      power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_);
+  publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
   publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
   publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
   publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);
@@ -1691,15 +1728,18 @@ void ACHIClimate::publish_gated_state_() {
       last_active_mode_ = mode_;
     }
 
-    // Learn normal COOL/HEAT setpoints changed from the physical remote or the
-    // indoor controller. Temporary Boost/Eco/Sleep targets must not overwrite
-    // the remembered temperatures. Quiet fan mode is a normal fan selection.
-    if (!out_turbo && !out_eco && out_sleep_stage == 0) {
+    // Learn normal COOL/HEAT setpoints only while the unit is powered on.
+    // When this model is OFF it reports a service/default value of 26°C in
+    // COOL, which must never overwrite the last real cooling setpoint.
+    if (power_on_ && !out_turbo && !out_eco && out_sleep_stage == 0) {
       remember_target_for_mode_(mode_, target_c_);
     }
 
+    const uint8_t published_target =
+        power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_);
+
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
-    this->target_temperature = target_c_;
+    this->target_temperature = published_target;
     publish_fan_state_(out_fan_turbo, out_fan);
     this->swing_mode = swing_;
     if (enable_presets_) {
@@ -1714,7 +1754,7 @@ void ACHIClimate::publish_gated_state_() {
     // remote/HA changes to clear them when the indirect state no longer matches.
     d_power_on_    = power_on_;
     d_mode_        = mode_;
-    d_target_c_    = target_c_;
+    d_target_c_    = published_target;
     d_fan_         = out_fan;
     d_fan_turbo_   = out_fan_turbo;
     d_swing_       = swing_;
