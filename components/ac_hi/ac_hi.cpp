@@ -23,8 +23,8 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
   ESP_LOGI(TAG, "%s Kelon168 IR: %s (command=0x%02X)", prefix, buffer, data.command());
 }
 
-static const char *const CUSTOM_PRESET_QUIET = "Тихий";
-static const char *const CUSTOM_FAN_TURBO = "Турбо";
+static const char *const CUSTOM_PRESET_QUIET = "Quiet";
+static const char *const CUSTOM_FAN_TURBO = "Turbo";
 
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
@@ -101,6 +101,7 @@ void ACHIClimate::setup() {
   target_temperature = 24;
   fan_mode = climate::CLIMATE_FAN_AUTO;
   swing_mode = climate::CLIMATE_SWING_OFF;
+  action = climate::CLIMATE_ACTION_OFF;
   // Desired state mirrors initial
   d_power_on_     = false;
   d_mode_         = climate::CLIMATE_MODE_OFF;
@@ -246,6 +247,7 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.set_visual_max_temperature(30);
   t.set_visual_temperature_step(1.0f);
   t.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+  t.add_feature_flags(climate::CLIMATE_SUPPORTS_ACTION);
   return t;
 }
 
@@ -1133,6 +1135,26 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else swing_ = climate::CLIMATE_SWING_OFF;
 
+  // Report the real HVAC action from the confirmed compressor feedback (byte 41).
+  // The configured HVAC mode alone is not sufficient: an inverter unit can stay
+  // powered in COOL/HEAT/DRY while the compressor is stopped.
+  const bool compressor_running = b[IDX_COMP_FREQ_ACTUAL] > 0;
+  if (!power_on_) {
+    this->action = climate::CLIMATE_ACTION_OFF;
+  } else if (mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+    this->action = climate::CLIMATE_ACTION_FAN;
+  } else if (!compressor_running) {
+    this->action = climate::CLIMATE_ACTION_IDLE;
+  } else if (mode_ == climate::CLIMATE_MODE_COOL) {
+    this->action = climate::CLIMATE_ACTION_COOLING;
+  } else if (mode_ == climate::CLIMATE_MODE_HEAT) {
+    this->action = climate::CLIMATE_ACTION_HEATING;
+  } else if (mode_ == climate::CLIMATE_MODE_DRY) {
+    this->action = climate::CLIMATE_ACTION_DRYING;
+  } else {
+    this->action = climate::CLIMATE_ACTION_IDLE;
+  }
+
   // Recalculate actual signature
   recalc_actual_sig_();
 
@@ -1199,10 +1221,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
+           LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
            (unsigned) target_c_, current_temperature,
