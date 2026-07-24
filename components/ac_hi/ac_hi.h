@@ -5,7 +5,6 @@
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/components/switch/switch.h"
-#include "esphome/components/select/select.h"
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/automation.h"
 #include "kelon168_protocol.h"
@@ -63,17 +62,6 @@ class ACHIMemorySwitch : public switch_::Switch {
   ACHIClimate *parent_{nullptr};
 };
 
-// Selects which of the four Hisense Sleep programs is used by the standard
-// Climate Sleep preset. Selecting an option alone does not enable Sleep.
-class ACHISleepProgramSelect : public select::Select {
- public:
-  void set_parent(ACHIClimate *p) { parent_ = p; }
- protected:
-  void control(const std::string &value) override;
- private:
-  ACHIClimate *parent_{nullptr};
-};
-
 // Protocol constants
 static constexpr uint8_t HI_HDR0 = 0xF4;
 static constexpr uint8_t HI_HDR1 = 0xF5;
@@ -104,30 +92,11 @@ enum FrameIndex : uint8_t {
   IDX_RX_QUIET = 36,
   IDX_RX_LED = 37,
 
-  // Compressor frequency fields confirmed from transition logs:
-  // 41 = measured/actual, 42 = controller target, 43 = command sent to inverter.
-  IDX_COMP_FREQ_ACTUAL = 41,
   IDX_COMP_FREQ_SET = 42,
-  IDX_COMP_FREQ_COMMAND = 43,
+  IDX_COMP_FREQ = 43,
   IDX_OUTDOOR_TEMP = 44,
   IDX_OUTDOOR_COND_TEMP = 45,
   IDX_COMPRESSOR_EXHAUST_TEMP = 46,
-};
-
-// Command fields in the 0x65 write frame. A zero byte means "do not change"
-// for the corresponding AC setting. Normal Home Assistant commands therefore
-// queue only the fields that actually changed instead of retransmitting a full
-// climate state and accidentally clearing action-style modes such as Sleep.
-enum CommandFieldMask : uint16_t {
-  CMD_FIELD_NONE       = 0,
-  CMD_FIELD_WIND       = 1u << 0,
-  CMD_FIELD_SLEEP      = 1u << 1,
-  CMD_FIELD_POWER_MODE = 1u << 2,
-  CMD_FIELD_TEMP       = 1u << 3,
-  CMD_FIELD_SWING      = 1u << 4,
-  CMD_FIELD_TURBO_ECO  = 1u << 5,
-  CMD_FIELD_QUIET      = 1u << 6,
-  CMD_FIELD_LED        = 1u << 7,
 };
 
 // Bit masks within specific bytes
@@ -165,14 +134,8 @@ static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;
 static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;
 static constexpr size_t   RX_COMPACT_THRESHOLD = 512;
 static constexpr size_t   RX_BUFFER_RESERVE    = 2048;
-// Status responses are substantially longer than control frames. This indoor
-// unit reports byte[4] = 0x8D, i.e. 0x8D + 9 = 150 logical bytes. Other
-// firmware variants are known to use similarly long responses, so keep a
-// conservative limit that still protects the RX parser from corrupt lengths.
-static constexpr size_t   MAX_FRAME_BYTES      = 256;  // logical (unescaped) frame size
-static constexpr size_t   MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES * 2;
+static constexpr size_t   MAX_FRAME_BYTES      = 96;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
-static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x66 overlap
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
@@ -192,11 +155,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_led_switch(ACHILEDTargetSwitch *s) { led_switch_ = s; if (led_switch_) led_switch_->set_parent(this); }
   void set_sound_switch(ACHICommandSoundSwitch *s) { sound_switch_ = s; if (sound_switch_) sound_switch_->set_parent(this); }
   void set_memory_switch(ACHIMemorySwitch *s) { memory_switch_ = s; if (memory_switch_) memory_switch_->set_parent(this); }
-  void set_sleep_program_select(ACHISleepProgramSelect *s) {
-    sleep_program_select_ = s;
-    if (sleep_program_select_ != nullptr) sleep_program_select_->set_parent(this);
-  }
-  void set_sleep_program(const std::string &value);
   void set_ir_transmitter(remote_base::RemoteTransmitterBase *t) { ir_transmitter_ = t; }
   void set_ifeel_mqtt_topic(const std::string &topic) { ifeel_mqtt_topic_ = topic; }
   void set_ifeel_mqtt_payload_format(const std::string &format) {
@@ -219,10 +177,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_economy_sensor(sensor::Sensor *s) { eco_code_sensor_ = s; }
   void set_swing_ud_sensor(sensor::Sensor *s) { swing_ud_sensor_ = s; }
   void set_swing_lr_sensor(sensor::Sensor *s) { swing_lr_sensor_ = s; }
-  void set_compr_freq_actual_sensor(sensor::Sensor *s) { compressor_freq_actual_sensor_ = s; }
   void set_compr_freq_set_sensor(sensor::Sensor *s) { compressor_freq_set_sensor_ = s; }
-  void set_compr_freq_command_sensor(sensor::Sensor *s) { compressor_freq_command_sensor_ = s; }
-  // Legacy YAML key `compressor_frequency`; retained as an alias for byte 43.
   void set_compr_freq_sensor(sensor::Sensor *s) { compressor_freq_sensor_ = s; }
   void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
@@ -272,8 +227,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_kelon_mode_(climate::ClimateMode mode) const;
   void calc_and_patch_crc_(std::vector<uint8_t> &buf);
   bool validate_crc_(const std::vector<uint8_t> &buf, uint16_t *out_sum = nullptr) const;
-  std::vector<uint8_t> encode_wire_frame_(const std::vector<uint8_t> &logical) const;
-  void send_logical_frame_(const std::vector<uint8_t> &logical, const char *log_prefix);
 
   // RX parser
   void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS);
@@ -283,22 +236,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_ack_101_();
 
   // State management
-  void build_tx_from_pending_fields_(uint16_t fields);
-  void queue_retry_fields_from_state_();
+  void build_tx_from_desired_();
   void publish_gated_state_();
   void update_led_switch_state_();
   void update_sound_switch_state_();
   void update_memory_switch_state_();
-  void update_sleep_program_select_state_();
   void publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan);
-#ifdef USE_SENSOR
-  void publish_sensor_if_changed_(sensor::Sensor *sensor, float value);
-#endif
-#ifdef USE_TEXT_SENSOR
-  void publish_text_sensor_if_changed_(text_sensor::TextSensor *sensor, const char *value);
-#endif
-  void remember_target_for_mode_(climate::ClimateMode mode, uint8_t target_c);
-  uint8_t target_for_mode_(climate::ClimateMode mode, uint8_t fallback) const;
   void maybe_force_to_target_();                     // <-- добавлено объявление
   void maybe_send_pending_control_();                // (опционально, если используется)
 
@@ -333,37 +276,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool writing_lock_{false};
   uint32_t write_lock_time_{0};               // when lock was set
 
-  // A status request and a write command must never share the RS-485 bus window.
-  // While waiting for the 0x66 response, debounced 0x65 writes remain pending.
-  bool status_query_in_flight_{false};
-  uint32_t status_query_time_{0};
-
-  // Pending control from HA (debounced). pending_command_fields_ contains
-  // exactly the action fields that will be written; all other 0x65 payload
-  // bytes stay zero/neutral.
+  // Pending control from HA (debounced)
   bool pending_control_{false};
-  uint16_t pending_command_fields_{CMD_FIELD_NONE};
   uint32_t last_control_ms_{0};
-
-  // True only after a UART write containing desired Sleep was actually sent.
-  // The next status frame must report Sleep Mode Code > 0; otherwise the HA
-  // Sleep preset is cleared and no automatic retry is performed.
-  bool sleep_confirmation_pending_{false};
-  uint8_t sleep_confirmation_target_stage_{0};
-
-  // Fan state that was active immediately before an HA Sleep request. If the
-  // indoor unit rejects Sleep (Sleep Mode Code remains 0), restore this fan
-  // state with one silent normal command. The snapshot is discarded as soon
-  // as Sleep is confirmed by a non-zero status code.
-  bool sleep_restore_fan_valid_{false};
-  climate::ClimateFanMode sleep_restore_fan_{climate::CLIMATE_FAN_AUTO};
-  bool sleep_restore_fan_turbo_{false};
-  bool sleep_restore_quiet_{false};
-
-  // True only after the user explicitly changes the fan while a confirmed
-  // Sleep program is active. Without this flag, Sleep's automatic QUIET fan is
-  // authoritative and must not be overwritten by stale desired HA fan state.
-  bool sleep_fan_override_pending_{false};
 
   // Boot guard: avoids querying the indoor AC controller while it is still starting.
   uint32_t boot_ms_{0};
@@ -445,15 +360,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool quiet_{false};
   bool led_{true};
   uint8_t sleep_stage_{0};              // 0..4
-  uint8_t selected_sleep_stage_{2};     // default program used by HA Sleep preset
 
   // ----- Desired (from HA) state -----
   bool d_power_on_{false};
   uint8_t d_target_c_{24};
   climate::ClimateMode d_mode_{climate::CLIMATE_MODE_OFF};
   climate::ClimateMode last_active_mode_{climate::CLIMATE_MODE_COOL};
-  uint8_t last_cool_target_c_{24};
-  uint8_t last_heat_target_c_{24};
   climate::ClimateFanMode d_fan_{climate::CLIMATE_FAN_AUTO};
   bool d_fan_turbo_{false};
   climate::ClimateSwingMode d_swing_{climate::CLIMATE_SWING_OFF};
@@ -487,10 +399,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *eco_code_sensor_{nullptr};
   sensor::Sensor *swing_ud_sensor_{nullptr};
   sensor::Sensor *swing_lr_sensor_{nullptr};
-  sensor::Sensor *compressor_freq_actual_sensor_{nullptr};
   sensor::Sensor *compressor_freq_set_sensor_{nullptr};
-  sensor::Sensor *compressor_freq_command_sensor_{nullptr};
-  // Legacy byte-43 sensor configured through `compressor_frequency`.
   sensor::Sensor *compressor_freq_sensor_{nullptr};
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
@@ -513,7 +422,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHILEDTargetSwitch *led_switch_{nullptr};
   ACHICommandSoundSwitch *sound_switch_{nullptr};
   ACHIMemorySwitch *memory_switch_{nullptr};
-  ACHISleepProgramSelect *sleep_program_select_{nullptr};
 
   bool enable_presets_{true};
 
