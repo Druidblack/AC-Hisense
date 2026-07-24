@@ -1,16 +1,17 @@
 import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
-from esphome.components import climate, uart, sensor, switch, text_sensor, remote_base
+from esphome.components import climate, uart, sensor, switch, select, text_sensor, remote_base
 from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ICON_LIGHTBULB
 
-AUTO_LOAD = ["climate", "uart", "sensor", "switch", "text_sensor", "remote_base"]
+AUTO_LOAD = ["climate", "uart", "sensor", "switch", "select", "text_sensor", "remote_base"]
 
 ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 ACHIClimate = ac_hi_ns.class_("ACHIClimate", climate.Climate, cg.PollingComponent, uart.UARTDevice)
 ACHILEDTargetSwitch = ac_hi_ns.class_("ACHILEDTargetSwitch", switch.Switch)
 ACHICommandSoundSwitch = ac_hi_ns.class_("ACHICommandSoundSwitch", switch.Switch)
 ACHIMemorySwitch = ac_hi_ns.class_("ACHIMemorySwitch", switch.Switch)
+ACHISleepProgramSelect = ac_hi_ns.class_("ACHISleepProgramSelect", select.Select)
 ACHIIFeelAction = ac_hi_ns.class_("ACHIIFeelAction", automation.Action)
 
 # ESPHome 2025.5+ uses climate.climate_schema(...), older versions still use CLIMATE_SCHEMA.
@@ -28,6 +29,7 @@ CONF_PIPE_TEMPERATURE = "pipe_temperature"
 CONF_LED_SWITCH = "led_switch"
 CONF_SOUND_SWITCH = "sound_switch"
 CONF_MEMORY_SWITCH = "memory_switch"
+CONF_SLEEP_PROGRAM = "sleep_program"
 CONF_IR_TRANSMITTER_ID = "ir_transmitter_id"
 CONF_IFEEL_MQTT_TOPIC = "ifeel_mqtt_topic"
 CONF_IFEEL_MQTT_PAYLOAD = "ifeel_mqtt_payload"
@@ -117,6 +119,11 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         ACHIMemorySwitch,
         icon="mdi:memory",
         entity_category=ENTITY_CATEGORY_CONFIG,
+    ),
+    # Selects the program used by the standard Climate Sleep preset.
+    cv.Optional(CONF_SLEEP_PROGRAM, default={CONF_NAME: "Sleep Program"}): select.select_schema(
+        ACHISleepProgramSelect,
+        icon="mdi:sleep",
     ),
 
     # New memory diagnostics sensors (all optional)
@@ -245,6 +252,13 @@ async def to_code(config):
     if memory_sw_conf := config.get(CONF_MEMORY_SWITCH):
         memory_sw = await switch.new_switch(memory_sw_conf)
         cg.add(var.set_memory_switch(memory_sw))
+
+    if sleep_program_conf := config.get(CONF_SLEEP_PROGRAM):
+        sleep_program = await select.new_select(
+            sleep_program_conf,
+            options=["Sleep 1", "Sleep 2", "Sleep 3", "Sleep 4"],
+        )
+        cg.add(var.set_sleep_program_select(sleep_program))
 
     # New memory diagnostics sensors (optional)
     if conf := config.get(CONF_HEAP_FREE):

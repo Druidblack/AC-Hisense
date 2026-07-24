@@ -25,6 +25,28 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
 
 static const char *const CUSTOM_PRESET_QUIET = "Quiet";
 static const char *const CUSTOM_FAN_TURBO = "Turbo";
+static const char *const SLEEP_PROGRAM_1 = "Sleep 1";
+static const char *const SLEEP_PROGRAM_2 = "Sleep 2";
+static const char *const SLEEP_PROGRAM_3 = "Sleep 3";
+static const char *const SLEEP_PROGRAM_4 = "Sleep 4";
+
+static const char *sleep_program_for_stage(uint8_t stage) {
+  switch (stage) {
+    case 1: return SLEEP_PROGRAM_1;
+    case 2: return SLEEP_PROGRAM_2;
+    case 3: return SLEEP_PROGRAM_3;
+    case 4: return SLEEP_PROGRAM_4;
+    default: return SLEEP_PROGRAM_2;
+  }
+}
+
+static uint8_t sleep_stage_from_program(const std::string &program) {
+  if (program == SLEEP_PROGRAM_1) return 1;
+  if (program == SLEEP_PROGRAM_2) return 2;
+  if (program == SLEEP_PROGRAM_3) return 3;
+  if (program == SLEEP_PROGRAM_4) return 4;
+  return 0;
+}
 
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
@@ -100,6 +122,15 @@ void ACHIMemorySwitch::write_state(bool state) {
   }
 }
 
+// ---- ACHISleepProgramSelect ----
+void ACHISleepProgramSelect::control(const std::string &value) {
+  if (parent_ != nullptr) {
+    parent_->set_sleep_program(value);
+  } else {
+    publish_state(value);
+  }
+}
+
 // ---- ACHIClimate implementation ----
 
 void ACHIClimate::setup() {
@@ -148,6 +179,7 @@ void ACHIClimate::setup() {
   update_led_switch_state_();
   update_sound_switch_state_();
   update_memory_switch_state_();
+  update_sleep_program_select_state_();
 
   // Remember boot time so the first status poll is delayed after a full power restore.
   // Indoor AC boards can be noisy on UART while they are still booting; polling too early
@@ -283,6 +315,43 @@ uint8_t ACHIClimate::target_for_mode_(climate::ClimateMode mode, uint8_t fallbac
   if (mode == climate::CLIMATE_MODE_COOL) return last_cool_target_c_;
   if (mode == climate::CLIMATE_MODE_HEAT) return last_heat_target_c_;
   return fallback;
+}
+
+// ---- Sleep program select ----
+void ACHIClimate::set_sleep_program(const std::string &value) {
+  const uint8_t stage = sleep_stage_from_program(value);
+  if (stage == 0) {
+    ESP_LOGW(TAG, "Unknown Sleep program: %s", value.c_str());
+    update_sleep_program_select_state_();
+    return;
+  }
+
+  const bool changed_selection = selected_sleep_stage_ != stage;
+  selected_sleep_stage_ = stage;
+  update_sleep_program_select_state_();
+
+  // Merely choosing a program does not activate Sleep. If Sleep is already
+  // confirmed (or an activation is currently pending), send a new one-shot
+  // byte-17 action for the newly selected program.
+  const bool sleep_active_or_pending = sleep_stage_ > 0 || d_sleep_stage_ > 0 || sleep_confirmation_pending_;
+  if (!sleep_active_or_pending || !changed_selection) {
+    ESP_LOGD(TAG, "Sleep program selected for next Sleep preset: %s", value.c_str());
+    return;
+  }
+
+  d_sleep_stage_ = stage;
+  sleep_restore_fan_valid_ = false;
+  pending_command_fields_ |= CMD_FIELD_SLEEP;
+  accept_remote_changes_ = false;
+  ha_priority_active_ = true;
+  recalc_desired_sig_();
+  pending_control_ = true;
+  last_control_ms_ = millis();
+  user_command_next_write_ = true;
+  beep_on_next_write_ = command_sound_enabled_;
+
+  ESP_LOGD(TAG, "Changing active Sleep program to %s with a byte-17-only command",
+           sleep_program_for_stage(stage));
 }
 
 // ---- Control from HA ----
@@ -422,6 +491,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
+    const bool was_sleep = before_sleep_stage > 0 || sleep_stage_ > 0;
     const auto fan_before_preset = d_fan_;
     const bool fan_turbo_before_preset = d_fan_turbo_;
     const bool quiet_before_preset = d_quiet_;
@@ -493,10 +563,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         sleep_restore_fan_valid_ = false;
       }
 
-      d_sleep_stage_ = 1;
-      d_fan_turbo_ = false;
-      d_quiet_ = false;
-      d_fan_ = climate::CLIMATE_FAN_QUIET;
+      // Send only the selected Sleep action. Do not pre-emptively change
+      // Wind/Quiet: a successful indoor-unit Sleep program will report its own
+      // QUIET fan state in the following status frame.
+      d_sleep_stage_ = selected_sleep_stage_;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
       sleep_restore_fan_valid_ = false;
       if (was_turbo && g_has_pre_turbo_target) {
@@ -511,7 +581,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       }
 
       d_quiet_ = false;
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco)
+      // A Sleep OFF action must remain byte-17-only. Let the indoor unit
+      // report the fan it restores after leaving Sleep, then synchronize to it.
+      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco && !was_sleep)
         d_fan_ = climate::CLIMATE_FAN_AUTO;
     }
 
@@ -697,9 +769,11 @@ void ACHIClimate::send_write_changes_() {
 
   build_tx_from_pending_fields_(fields);
 
-  // Sleep confirmation is armed only when this exact one-shot frame contains
-  // a Sleep action. Ordinary commands keep byte 17 equal to 0x00.
-  sleep_confirmation_pending_ = (fields & CMD_FIELD_SLEEP) && d_sleep_stage_ > 0;
+  // Every explicit Sleep action, including OFF, is confirmed only by the
+  // next real Sleep Mode Code. Ordinary commands keep byte 17 equal to 0x00.
+  sleep_confirmation_pending_ = (fields & CMD_FIELD_SLEEP) != 0;
+  if (sleep_confirmation_pending_)
+    sleep_confirmation_target_stage_ = d_sleep_stage_;
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG,
@@ -1250,13 +1324,19 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     case 0x04: sleep_stage_ = 2; break;
     case 0x06: sleep_stage_ = 3; break;
     case 0x08: sleep_stage_ = 4; break;
-    case 0x01:
+    case 0x01: sleep_stage_ = 0; break;  // Sleep OFF action compatibility
     case 0x03: sleep_stage_ = 1; break;
     case 0x05: sleep_stage_ = 2; break;
-    case 0x07:
-    case 0x09: sleep_stage_ = 3; break;
-    case 0x11: sleep_stage_ = 4; break;
+    case 0x07: sleep_stage_ = 3; break;
+    case 0x09: sleep_stage_ = 4; break;
     default:   sleep_stage_ = 0; break;
+  }
+
+  if (sleep_stage_ > 0 && selected_sleep_stage_ != sleep_stage_) {
+    selected_sleep_stage_ = sleep_stage_;
+    update_sleep_program_select_state_();
+    ESP_LOGD(TAG, "Sleep Program synchronized from AC: %s (Sleep Mode Code=%u)",
+             sleep_program_for_stage(selected_sleep_stage_), raw_sleep);
   }
 
   // Once Sleep was confirmed, a later status code 0 is authoritative too.
@@ -1355,13 +1435,37 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else swing_ = climate::CLIMATE_SWING_OFF;
 
-  // The first status after a transmitted Sleep-bearing frame decides whether
-  // the request succeeded. Code 0 means the AC rejected Sleep. In that case
-  // clear the HA preset and, when the attempt forced QUIET, restore the fan
-  // state that was active immediately before the request.
+  // The first status after a byte-17 Sleep action is authoritative. A command
+  // is successful only when the reported program exactly matches the requested
+  // program. Failed commands are not retried automatically.
   if (sleep_confirmation_pending_) {
     sleep_confirmation_pending_ = false;
-    if (sleep_stage_ == 0) {
+    const uint8_t requested_stage = sleep_confirmation_target_stage_;
+    sleep_confirmation_target_stage_ = 0;
+
+    if (sleep_stage_ == requested_stage) {
+      d_sleep_stage_ = requested_stage;
+      sleep_restore_fan_valid_ = false;
+      if (requested_stage > 0) {
+        selected_sleep_stage_ = requested_stage;
+        update_sleep_program_select_state_();
+        ESP_LOGI(TAG, "Sleep confirmed by status: requested=%s Sleep Mode Code=%u",
+                 sleep_program_for_stage(requested_stage), raw_sleep);
+      } else {
+        // Sleep controls the fan while active. After a confirmed OFF action,
+        // accept the fan restored by the indoor unit instead of re-sending the
+        // stale Sleep QUIET value.
+        d_fan_ = fan_;
+        d_fan_turbo_ = fan_turbo_;
+        d_quiet_ = quiet_;
+        pending_command_fields_ &= static_cast<uint16_t>(~(CMD_FIELD_WIND | CMD_FIELD_QUIET));
+        recalc_desired_sig_();
+        ESP_LOGI(TAG, "Sleep OFF confirmed by status: Sleep Mode Code=0; fan synchronized to %s",
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
+      }
+    } else if (requested_stage > 0 && sleep_stage_ == 0) {
+      // Preserve the proven rollback behavior. With byte-17-only activation the
+      // fan normally never changes on failure, so no rollback write is needed.
       d_sleep_stage_ = 0;
 
       const bool have_fan_rollback = sleep_restore_fan_valid_;
@@ -1377,9 +1481,6 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
         d_quiet_ = rollback_quiet;
         d_turbo_ = false;
         d_eco_ = false;
-
-        // Keep all other desired climate fields intact and send one silent
-        // rollback command. Normal convergence logic confirms the result.
         accept_remote_changes_ = false;
         ha_priority_active_ = true;
         recalc_desired_sig_();
@@ -1388,22 +1489,40 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
         last_control_ms_ = millis();
         user_command_next_write_ = false;
         beep_on_next_write_ = false;
-
         ESP_LOGW(TAG,
-                 "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset and restoring previous fan=%s%s",
+                 "Sleep %s not confirmed: Sleep Mode Code=0; restoring previous fan=%s%s",
+                 sleep_program_for_stage(requested_stage),
                  LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)),
                  d_fan_turbo_ ? " (Turbo)" : "");
       } else {
         pending_control_ = false;
+        pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
         ha_priority_active_ = false;
         accept_remote_changes_ = true;
+        recalc_desired_sig_();
         ESP_LOGW(TAG,
-                 "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset (fan rollback not required)");
+                 "Sleep %s not confirmed: Sleep Mode Code=0; HA Sleep preset cleared",
+                 sleep_program_for_stage(requested_stage));
       }
     } else {
+      // The AC stayed in another Sleep program (or rejected an OFF command).
+      // Reflect the actual program and stop without fighting it.
+      d_sleep_stage_ = sleep_stage_;
       sleep_restore_fan_valid_ = false;
-      ESP_LOGI(TAG, "Sleep confirmed by status: Sleep Mode Code=%u (program %u)",
-               raw_sleep, sleep_stage_);
+      pending_control_ = false;
+      pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      if (sleep_stage_ > 0) {
+        selected_sleep_stage_ = sleep_stage_;
+        update_sleep_program_select_state_();
+      }
+      recalc_desired_sig_();
+      ESP_LOGW(TAG,
+               "Sleep command not confirmed: requested=%s, actual=%s, Sleep Mode Code=%u",
+               requested_stage > 0 ? sleep_program_for_stage(requested_stage) : "Off",
+               sleep_stage_ > 0 ? sleep_program_for_stage(sleep_stage_) : "Off",
+               raw_sleep);
     }
   }
 
@@ -1651,6 +1770,11 @@ void ACHIClimate::update_memory_switch_state_() {
   memory_switch_->publish_state(memory_mode_enabled_);
 }
 
+void ACHIClimate::update_sleep_program_select_state_() {
+  if (sleep_program_select_ == nullptr) return;
+  sleep_program_select_->publish_state(sleep_program_for_stage(selected_sleep_stage_));
+}
+
 void ACHIClimate::maybe_force_to_target_() {
   if (!ha_priority_active_) return;
 
@@ -1892,15 +2016,10 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan)
 }
 
 uint8_t ACHIClimate::encode_sleep_byte_(uint8_t stage) {
-  uint8_t code = 0;
-  switch (stage) {
-    case 1: code = 1; break;
-    case 2: code = 2; break;
-    case 3: code = 4; break;
-    case 4: code = 8; break;
-    default: code = 0; break;
-  }
-  return static_cast<uint8_t>((code << 1) | 0x01);
+  // The indoor unit reports programs as status codes 2/4/6/8, while the
+  // corresponding one-shot action values are 3/5/7/9. Stage 0 uses action 1.
+  stage = std::min<uint8_t>(stage, 4);
+  return static_cast<uint8_t>((stage << 1) | 0x01);
 }
 
 // ---- Logging helper ----
