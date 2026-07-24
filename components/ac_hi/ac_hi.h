@@ -323,7 +323,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t status_query_time_{0};
 
   // Pending control from HA (debounced). Normal climate writes keep the Sleep
-  // field neutral; Sleep itself is changed with a dedicated action frame.
+  // field neutral; Sleep itself is changed by a complete state frame with an action value in byte 17.
   bool pending_control_{false};
   bool pending_sleep_action_{false};
   uint8_t pending_sleep_stage_{0};

@@ -378,8 +378,8 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
   beep_on_next_write_ = command_sound_enabled_;
 
   ESP_LOGD(TAG,
-           "Active Sleep program changed to %s: queued dedicated Sleep action, "
-           "TX byte[16]=0x05 byte[17]=0x%02X, expected Sleep Mode Code=%u",
+           "Active Sleep program changed to %s: queued full-state Sleep action, "
+           "TX byte[17]=0x%02X, expected Sleep Mode Code=%u",
            value.c_str(), (unsigned) encode_sleep_byte_(stage),
            (unsigned) sleep_status_code_for_stage(stage));
 }
@@ -566,7 +566,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       pending_sleep_stage_ = d_sleep_stage_;
       ESP_LOGD(TAG,
                "Standard Sleep preset selected: %s, target unchanged at %u°C, "
-               "queued dedicated Sleep action byte[16]=0x05 byte[17]=0x%02X, "
+               "queued full-state Sleep action byte[17]=0x%02X, "
                "expected Sleep Mode Code=%u",
                sleep_program_for_stage(d_sleep_stage_), (unsigned) d_target_c_,
                (unsigned) encode_sleep_byte_(d_sleep_stage_),
@@ -765,35 +765,43 @@ void ACHIClimate::send_write_changes_() {
   write_lock_time_ = millis();
 }
 
-// ---- Send dedicated Sleep action ----
+// ---- Send Sleep action in a complete climate-state frame ----
 void ACHIClimate::send_sleep_action_(uint8_t stage) {
-  // Hisense Sleep is not a normal state field. The indoor controller expects
-  // the dedicated 0x65 action layout captured by the donor project:
-  //   byte[16] = 0x05 for Sleep ON/program, 0x01 for Sleep OFF
-  //   byte[17] = 0x03/0x05/0x07/0x09 for Sleep 1..4, 0x01 for OFF
-  //   byte[33] = 0x04 and byte[35] = 0x10
-  // All unrelated action bytes remain zero so current mode/temperature/swing
-  // are preserved by the indoor unit.
+  // The original working YAML does not use a short/zero-filled Sleep packet.
+  // It sends the normal 50-byte 0x65 climate frame and changes only byte 17 to
+  // the odd Sleep action value. The remaining fields must contain a coherent
+  // current/desired AC state; otherwise this indoor controller acknowledges the
+  // UART frame but leaves Sleep Mode Code at 0 (or switches an active Sleep off).
+  build_tx_from_desired_();
   std::vector<uint8_t> frame = tx_bytes_;
-  std::fill(frame.begin() + 14, frame.begin() + 46, 0x00);
-  frame[16] = stage > 0 ? 0x05 : 0x01;
-  frame[17] = stage > 0 ? encode_sleep_byte_(stage) : 0x01;
+
+  // Preserve the fan value that the indoor unit currently reports. The legacy
+  // controller changed only the Sleep byte; it did not pre-command QUIET.
+  // After accepting Sleep, the indoor unit changes Wind Mode Code to QUIET by
+  // itself. Sending QUIET and Sleep in the same request is treated by this model
+  // as an ordinary fan command and Sleep Mode Code remains 0.
+  const climate::ClimateFanMode sleep_action_fan = power_on_ ? fan_ : d_fan_;
+  const bool sleep_action_fan_turbo = power_on_ ? fan_turbo_ : d_fan_turbo_;
+  frame[IDX_WIND] = encode_fan_byte_(sleep_action_fan, sleep_action_fan_turbo);
+  frame[IDX_SLEEP] = stage > 0 ? encode_sleep_byte_(stage) : 0x01;
   frame[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
-  frame[IDX_TX_TURBO_ECO] = TxValues::TURBO_OFF;
-  frame[IDX_TX_QUIET] = TxValues::QUIET_OFF;
   calc_and_patch_crc_(frame);
 
   ESP_LOGD(TAG,
-           "Sending dedicated Sleep action: program=%s byte[16]=0x%02X byte[17]=0x%02X "
+           "Sending full-state Sleep action: program=%s preserved_wind[16]=0x%02X sleep[17]=0x%02X "
+           "power_mode[18]=0x%02X target[19]=0x%02X features[33]=0x%02X quiet[35]=0x%02X "
            "expected Sleep Mode Code=%u beep=0x%02X",
            stage > 0 ? sleep_program_for_stage(stage) : "Off",
-           frame[16], frame[17], (unsigned) sleep_status_code_for_stage(stage),
-           frame[IDX_TX_BEEP]);
+           frame[IDX_WIND], frame[IDX_SLEEP], frame[IDX_POWER_MODE], frame[IDX_SET_TEMP],
+           frame[IDX_TX_TURBO_ECO], frame[IDX_TX_QUIET],
+           (unsigned) sleep_status_code_for_stage(stage), frame[IDX_TX_BEEP]);
+  log_frame_("TX Sleep full logical frame", frame);
   send_logical_frame_(frame, "TX Sleep action");
 
   last_tx_frame_.assign(frame.begin(), frame.end());
   beep_on_next_write_ = false;
   user_command_next_write_ = false;
+  led_command_pending_ = false;
   writing_lock_ = true;
   write_lock_time_ = millis();
 }
