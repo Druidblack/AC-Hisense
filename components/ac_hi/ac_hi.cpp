@@ -24,7 +24,29 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
 }
 
 static const char *const CUSTOM_PRESET_QUIET = "Quiet";
+static const char *const CUSTOM_PRESET_SLEEP_1 = "Sleep 1";
+static const char *const CUSTOM_PRESET_SLEEP_2 = "Sleep 2";
+static const char *const CUSTOM_PRESET_SLEEP_3 = "Sleep 3";
+static const char *const CUSTOM_PRESET_SLEEP_4 = "Sleep 4";
 static const char *const CUSTOM_FAN_TURBO = "Turbo";
+
+static const char *sleep_preset_for_stage(uint8_t stage) {
+  switch (stage) {
+    case 1: return CUSTOM_PRESET_SLEEP_1;
+    case 2: return CUSTOM_PRESET_SLEEP_2;
+    case 3: return CUSTOM_PRESET_SLEEP_3;
+    case 4: return CUSTOM_PRESET_SLEEP_4;
+    default: return nullptr;
+  }
+}
+
+static uint8_t sleep_stage_from_preset(const std::string &preset) {
+  if (preset == CUSTOM_PRESET_SLEEP_1) return 1;
+  if (preset == CUSTOM_PRESET_SLEEP_2) return 2;
+  if (preset == CUSTOM_PRESET_SLEEP_3) return 3;
+  if (preset == CUSTOM_PRESET_SLEEP_4) return 4;
+  return 0;
+}
 
 // Restore the last target temperature after Turbo is turned off from HA.
 static uint8_t g_pre_turbo_target_c = 24;
@@ -106,7 +128,11 @@ void ACHIClimate::setup() {
   // Register custom presets on the Climate entity, not on ClimateTraits.
   // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
   if (enable_presets_) {
-    this->set_supported_custom_presets({CUSTOM_PRESET_QUIET});
+    this->set_supported_custom_presets({CUSTOM_PRESET_QUIET,
+                                        CUSTOM_PRESET_SLEEP_1,
+                                        CUSTOM_PRESET_SLEEP_2,
+                                        CUSTOM_PRESET_SLEEP_3,
+                                        CUSTOM_PRESET_SLEEP_4});
   }
   // Fan Turbo is exposed as a custom fan mode, not as a preset.
   // It only sends raw Wind Mode Code 18 without changing target temperature.
@@ -259,7 +285,7 @@ climate::ClimateTraits ACHIClimate::traits() {
                                climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
   if (enable_presets_) {
     t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
-                             climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
+                             climate::CLIMATE_PRESET_BOOST});
   }
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
@@ -444,17 +470,6 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         d_target_c_ = 16;
         d_fan_ = climate::CLIMATE_FAN_HIGH;
       }
-    } else if (p == climate::CLIMATE_PRESET_SLEEP) {
-      // Match the behavior observed from the remote:
-      // SLEEP uses QUIET fan, target temperature increases by 1°C,
-      // and the status frame reports sleep code 2 / 4 rather than 1.
-      if (d_target_c_ < 30) {
-        d_target_c_ += 1;
-      }
-      d_sleep_stage_ = 2;
-      d_fan_turbo_ = false;
-      d_quiet_ = false;
-      d_fan_ = climate::CLIMATE_FAN_QUIET;
     } else if (p == climate::CLIMATE_PRESET_NONE) {
       if (was_turbo && g_has_pre_turbo_target) {
         d_target_c_ = g_pre_turbo_target_c;
@@ -477,6 +492,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
+    const uint8_t requested_sleep_stage = sleep_stage_from_preset(custom);
     if (custom == CUSTOM_PRESET_QUIET) {
       d_quiet_ = true;
       d_turbo_ = false;
@@ -484,6 +500,24 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_sleep_stage_ = 0;
       d_fan_turbo_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
+      changed = true;
+    } else if (requested_sleep_stage > 0) {
+      // All four Sleep programs use the same quiet fan behavior. Only byte 17
+      // differs: stage 1/2/3/4 is encoded as 0x03/0x05/0x09/0x11.
+      // Increase the target only when entering Sleep, not when switching
+      // between Sleep programs.
+      if (d_sleep_stage_ == 0 && d_target_c_ < 30) {
+        d_target_c_ += 1;
+      }
+      d_sleep_stage_ = requested_sleep_stage;
+      d_fan_turbo_ = false;
+      d_quiet_ = false;
+      d_turbo_ = false;
+      d_eco_ = false;
+      d_fan_ = climate::CLIMATE_FAN_QUIET;
+      ESP_LOGD(TAG, "Sleep %u selected (TX byte 17 = 0x%02X)",
+               (unsigned) requested_sleep_stage,
+               (unsigned) encode_sleep_byte_(requested_sleep_stage));
       changed = true;
     }
   }
@@ -519,7 +553,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (enable_presets_) {
     if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
     else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-    else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+    else if (d_sleep_stage_ > 0) {
+      const char *sleep_preset = sleep_preset_for_stage(d_sleep_stage_);
+      if (sleep_preset != nullptr) this->set_custom_preset_(sleep_preset);
+    }
     else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
     else this->set_preset_(climate::CLIMATE_PRESET_NONE);
   }
@@ -1381,7 +1418,10 @@ void ACHIClimate::publish_gated_state_() {
     if (enable_presets_) {
       if (out_turbo) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (out_eco) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-      else if (out_sleep_stage > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (out_sleep_stage > 0) {
+        const char *sleep_preset = sleep_preset_for_stage(out_sleep_stage);
+        if (sleep_preset != nullptr) this->set_custom_preset_(sleep_preset);
+      }
       else if (out_quiet) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
@@ -1409,7 +1449,10 @@ void ACHIClimate::publish_gated_state_() {
     if (enable_presets_) {
       if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-      else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (d_sleep_stage_ > 0) {
+        const char *sleep_preset = sleep_preset_for_stage(d_sleep_stage_);
+        if (sleep_preset != nullptr) this->set_custom_preset_(sleep_preset);
+      }
       else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
