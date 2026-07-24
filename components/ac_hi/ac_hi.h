@@ -137,7 +137,11 @@ static constexpr uint8_t  MAX_FRAMES_PER_LOOP = 2;
 static constexpr uint32_t MAX_PARSE_TIME_MS   = 20;
 static constexpr size_t   RX_COMPACT_THRESHOLD = 512;
 static constexpr size_t   RX_BUFFER_RESERVE    = 2048;
-static constexpr size_t   MAX_FRAME_BYTES      = 96;   // logical (unescaped) frame size
+// Status responses are substantially longer than control frames. This indoor
+// unit reports byte[4] = 0x8D, i.e. 0x8D + 9 = 150 logical bytes. Other
+// firmware variants are known to use similarly long responses, so keep a
+// conservative limit that still protects the RX parser from corrupt lengths.
+static constexpr size_t   MAX_FRAME_BYTES      = 256;  // logical (unescaped) frame size
 static constexpr size_t   MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES * 2;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
 static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x66 overlap

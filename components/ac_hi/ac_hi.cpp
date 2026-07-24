@@ -994,6 +994,7 @@ bool ACHIClimate::extract_next_frame_(std::vector<uint8_t> &frame) {
           invalid = true;
           break;
         }
+        ESP_LOGV(TAG, "RX frame declares %u logical bytes", (unsigned) expected_logical_size);
       }
 
       if (expected_logical_size != 0 && frame.size() >= expected_logical_size) {
