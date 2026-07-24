@@ -445,13 +445,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         d_fan_ = climate::CLIMATE_FAN_HIGH;
       }
     } else if (p == climate::CLIMATE_PRESET_SLEEP) {
-      // Match the behavior observed from the remote:
-      // SLEEP uses QUIET fan, target temperature increases by 1°C,
-      // and the status frame reports sleep code 2 / 4 rather than 1.
-      if (d_target_c_ < 30) {
-        d_target_c_ += 1;
-      }
-      d_sleep_stage_ = 2;
+      // Request the first Sleep program without changing the set temperature.
+      // The UI does not treat this desired value as active Sleep: only a
+      // non-zero Sleep Mode Code in a later status frame can confirm it.
+      d_sleep_stage_ = 1;
       d_fan_turbo_ = false;
       d_quiet_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
@@ -519,7 +516,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (enable_presets_) {
     if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
     else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-    else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+    else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
     else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
     else this->set_preset_(climate::CLIMATE_PRESET_NONE);
   }
@@ -595,6 +592,10 @@ void ACHIClimate::send_query_status_() {
 // ---- Send write command ----
 void ACHIClimate::send_write_changes_() {
   build_tx_from_desired_();                // ensure tx_bytes_ reflects latest d_*
+  // A Sleep request becomes pending only after a frame containing it is
+  // actually transmitted. This prevents an older in-flight status response
+  // with Sleep Mode Code=0 from rejecting a command before it was sent.
+  sleep_confirmation_pending_ = d_sleep_stage_ > 0;
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG, "Sending write command (0x65): beep_byte[23]=0x%02X led_byte[36]=0x%02X",
@@ -1130,20 +1131,41 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     fan_turbo_ = false;
   }
 
-  // Sleep stage.
-  // Some units report the live status as direct values 0..4,
-  // while writes still use the encoded form (value<<1)|1.
+  // Sleep Mode Code is the only authoritative indication that Sleep is active.
+  // This indoor unit reports the remote programs as 2, 4, 6 and 8.
+  // Odd values are retained only as compatibility fallbacks for other revisions.
   uint8_t raw_sleep = b[IDX_SLEEP];
   switch (raw_sleep) {
     case 0x00: sleep_stage_ = 0; break;
-    case 0x01: sleep_stage_ = 1; break;
-    case 0x02: sleep_stage_ = 2; break;
+    case 0x02: sleep_stage_ = 1; break;
+    case 0x04: sleep_stage_ = 2; break;
+    case 0x06: sleep_stage_ = 3; break;
+    case 0x08: sleep_stage_ = 4; break;
+    case 0x01:
     case 0x03: sleep_stage_ = 1; break;
-    case 0x04: sleep_stage_ = 3; break;
     case 0x05: sleep_stage_ = 2; break;
+    case 0x07:
     case 0x09: sleep_stage_ = 3; break;
     case 0x11: sleep_stage_ = 4; break;
     default:   sleep_stage_ = 0; break;
+  }
+
+  // The first status after a transmitted Sleep-bearing frame decides whether
+  // the request succeeded. Code 0 means the AC rejected or cancelled Sleep.
+  // Return HA to the actual state immediately and stop automatic retries.
+  if (sleep_confirmation_pending_) {
+    sleep_confirmation_pending_ = false;
+    if (sleep_stage_ == 0) {
+      ESP_LOGW(TAG,
+               "Sleep request not confirmed: Sleep Mode Code=0; clearing HA Sleep preset and stopping retries");
+      pending_control_ = false;
+      ha_priority_active_ = false;
+      accept_remote_changes_ = true;
+      d_sleep_stage_ = 0;
+    } else {
+      ESP_LOGI(TAG, "Sleep confirmed by status: Sleep Mode Code=%u (program %u)",
+               raw_sleep, sleep_stage_);
+    }
   }
 
   // Target temperature (direct value)
@@ -1309,12 +1331,10 @@ void ACHIClimate::publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan
 void ACHIClimate::publish_gated_state_() {
   if (accept_remote_changes_) {
     // Publish actual state (from AC). Some Hisense units do not return explicit
-    // Turbo/ECO/Sleep/Quiet bits when the front display is off. They acknowledge
-    // those presets indirectly via target temperature and raw fan/wind code:
-    //   BOOST -> target 16/30 and raw wind 18
-    //   ECO   -> target 24 and raw wind 10
-    //   SLEEP -> previous target+1 and raw wind 10
-    // If the last HA-selected preset still matches that indirect state, keep it
+    // Turbo/ECO/Quiet bits when the front display is off may be acknowledged
+    // indirectly via target temperature and raw fan/wind code. Sleep is
+    // deliberately excluded: only Sleep Mode Code > 0 may expose the Sleep
+    // preset in Home Assistant. If a non-Sleep mode still matches, keep it
     // visible in HA instead of immediately publishing Preset=None on the next
     // status frame.
     bool out_turbo = turbo_;
@@ -1339,13 +1359,7 @@ void ACHIClimate::publish_gated_state_() {
         out_sleep_stage = 0;
         out_fan = d_fan_;
         out_fan_turbo = false;
-      } else if (d_sleep_stage_ > 0 && last_raw_wind_ == 10) {
-        out_turbo = false;
-        out_eco = false;
-        out_quiet = false;
-        out_sleep_stage = d_sleep_stage_;
-        out_fan = d_fan_;
-        out_fan_turbo = false;
+
       } else if (d_quiet_ && (quiet_ || fan_ == climate::CLIMATE_FAN_QUIET)) {
         out_turbo = false;
         out_eco = false;
@@ -1409,7 +1423,7 @@ void ACHIClimate::publish_gated_state_() {
     if (enable_presets_) {
       if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
-      else if (d_sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
+      else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
       else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
@@ -1529,8 +1543,8 @@ void ACHIClimate::recalc_actual_sig_() {
   // Some Hisense indoor units acknowledge special modes only indirectly in
   // status frames. For HA-priority convergence, accept those indirect states
   // without changing the normal published UI state. This stops repeated silent
-  // writes after BOOST/ECO/SLEEP while preserving the original preset display
-  // behavior from the working baseline.
+  // writes after BOOST/ECO while preserving the original preset display.
+  // Sleep is never accepted indirectly; it requires Sleep Mode Code > 0.
   if (ha_priority_active_ && d_power_on_ && power_on_ && mode_ == d_mode_) {
     if (d_fan_turbo_ && target_c_ == d_target_c_ && last_raw_wind_ == 18) {
       effective_fan_turbo = true;
@@ -1553,13 +1567,7 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_sleep_stage = 0;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
-    } else if (d_sleep_stage_ > 0 && target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
-      effective_sleep_stage = d_sleep_stage_;
-      effective_eco = false;
-      effective_turbo = false;
-      effective_quiet = false;
-      effective_fan_turbo = false;
-      effective_fan = d_fan_;
+
     } else if (d_quiet_ && fan_ == climate::CLIMATE_FAN_QUIET) {
       effective_quiet = true;
       effective_eco = false;

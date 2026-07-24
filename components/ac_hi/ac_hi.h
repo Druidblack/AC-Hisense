@@ -307,6 +307,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool pending_control_{false};
   uint32_t last_control_ms_{0};
 
+  // True only after a UART write containing desired Sleep was actually sent.
+  // The next status frame must report Sleep Mode Code > 0; otherwise the HA
+  // Sleep preset is cleared and no automatic retry is performed.
+  bool sleep_confirmation_pending_{false};
+
   // Boot guard: avoids querying the indoor AC controller while it is still starting.
   uint32_t boot_ms_{0};
 
