@@ -5,7 +5,6 @@
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/components/switch/switch.h"
-#include "esphome/components/select/select.h"
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/automation.h"
 #include "kelon168_protocol.h"
@@ -59,17 +58,6 @@ class ACHIMemorySwitch : public switch_::Switch {
   void set_parent(ACHIClimate *p) { parent_ = p; }
  protected:
   void write_state(bool state) override;
- private:
-  ACHIClimate *parent_{nullptr};
-};
-
-// Dropdown that selects which Hisense Sleep program is used by the standard
-// Climate Sleep preset. Selecting an option does not enable Sleep by itself.
-class ACHISleepProgramSelect : public select::Select {
- public:
-  void set_parent(ACHIClimate *p) { parent_ = p; }
- protected:
-  void control(const std::string &value) override;
  private:
   ACHIClimate *parent_{nullptr};
 };
@@ -176,11 +164,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_led_switch(ACHILEDTargetSwitch *s) { led_switch_ = s; if (led_switch_) led_switch_->set_parent(this); }
   void set_sound_switch(ACHICommandSoundSwitch *s) { sound_switch_ = s; if (sound_switch_) sound_switch_->set_parent(this); }
   void set_memory_switch(ACHIMemorySwitch *s) { memory_switch_ = s; if (memory_switch_) memory_switch_->set_parent(this); }
-  void set_sleep_program_select(ACHISleepProgramSelect *s) {
-    sleep_program_select_ = s;
-    if (sleep_program_select_ != nullptr) sleep_program_select_->set_parent(this);
-  }
-  void set_sleep_program(const std::string &value);
   void set_ir_transmitter(remote_base::RemoteTransmitterBase *t) { ir_transmitter_ = t; }
   void set_ifeel_mqtt_topic(const std::string &topic) { ifeel_mqtt_topic_ = topic; }
   void set_ifeel_mqtt_payload_format(const std::string &format) {
@@ -243,7 +226,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Protocol I/O
   void send_query_status_();
   void send_write_changes_();
-  void send_sleep_action_(uint8_t stage);
 
   // IR iFeel helpers
   Kelon168Data build_kelon_state_from_current_(uint8_t command) const;
@@ -262,7 +244,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // RX parser
   void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS);
-  bool extract_next_frame_(std::vector<uint8_t> &frame, std::vector<uint8_t> *wire_frame = nullptr);
+  bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
@@ -273,7 +255,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void update_led_switch_state_();
   void update_sound_switch_state_();
   void update_memory_switch_state_();
-  void update_sleep_program_select_state_();
   void publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan);
 #ifdef USE_SENSOR
   void publish_sensor_if_changed_(sensor::Sensor *sensor, float value);
@@ -307,15 +288,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint8_t encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan);
   uint8_t encode_sleep_byte_(uint8_t stage);
 
-  // Logging helpers. The DEBUG-level capture is intentionally limited to
-  // complete TX writes and RX frames whose contents changed, so a normal
-  // two-second status poll does not flood the ESPHome log.
+  // Logging helper
   void log_frame_(const char *prefix, const std::vector<uint8_t> &b) const;
-  void log_frame_debug_(const char *prefix, const std::vector<uint8_t> &b) const;
-  void log_frame_summary_debug_(const char *direction, const std::vector<uint8_t> &logical,
-                                const std::vector<uint8_t> &wire, bool crc_ok, uint16_t crc_sum) const;
-  void log_frame_diff_debug_(const std::vector<uint8_t> &previous,
-                             const std::vector<uint8_t> &current) const;
 
   // ----- Buffers and state -----
   std::vector<uint8_t> rx_;
@@ -329,11 +303,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool status_query_in_flight_{false};
   uint32_t status_query_time_{0};
 
-  // Pending control from HA (debounced). Normal climate writes keep the Sleep
-  // field neutral; Sleep itself is changed by a complete state frame with an action value in byte 17.
+  // Pending control from HA (debounced)
   bool pending_control_{false};
-  bool pending_sleep_action_{false};
-  uint8_t pending_sleep_stage_{0};
   uint32_t last_control_ms_{0};
 
   // Boot guard: avoids querying the indoor AC controller while it is still starting.
@@ -372,10 +343,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Last raw fan/wind code from status frame. Some presets are acknowledged
   // only indirectly via this code when the display is off.
   uint8_t last_raw_wind_{0};
-
-  // Last raw byte 17 from a status frame. Used to log and synchronize the
-  // Sleep Program select only when the real AC value changes.
-  uint8_t last_raw_sleep_code_{0xFF};
 
   // Base write frame (template)
   std::vector<uint8_t> tx_bytes_ = {
@@ -420,10 +387,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool quiet_{false};
   bool led_{true};
   uint8_t sleep_stage_{0};              // 0..4
-
-  // Sleep program selected in the dropdown for the next standard Sleep preset.
-  // Default 2 preserves the behavior of the previous single Sleep preset.
-  uint8_t selected_sleep_stage_{2};
 
   // ----- Desired (from HA) state -----
   bool d_power_on_{false};
@@ -491,15 +454,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHILEDTargetSwitch *led_switch_{nullptr};
   ACHICommandSoundSwitch *sound_switch_{nullptr};
   ACHIMemorySwitch *memory_switch_{nullptr};
-  ACHISleepProgramSelect *sleep_program_select_{nullptr};
 
   bool enable_presets_{true};
 
   // For debugging (optional)
   std::vector<uint8_t> last_status_frame_;
   std::vector<uint8_t> last_tx_frame_;
-  std::vector<uint8_t> last_debug_status_frame_;
-  std::vector<uint8_t> last_debug_status_wire_frame_;
 };
 
 template<typename... Ts> class ACHIIFeelAction : public Action<Ts...> {
