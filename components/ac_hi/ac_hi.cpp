@@ -719,10 +719,12 @@ void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
   }
 
   if (fields & CMD_FIELD_TURBO_ECO) {
+    // Turbo and Eco are independent action commands in byte 33.
+    // Do not combine TURBO_OFF (0x04) with Eco, because the confirmed
+    // neutral one-shot Eco actions are exactly 0x30 (ON) and 0x10 (OFF).
     tx_bytes_[IDX_TX_TURBO_ECO] = d_turbo_
         ? TxValues::TURBO_ON
-        : static_cast<uint8_t>(TxValues::TURBO_OFF +
-                               (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF));
+        : (d_eco_ ? TxValues::ECO_ON : TxValues::ECO_OFF);
   }
 
   if (fields & CMD_FIELD_QUIET)
