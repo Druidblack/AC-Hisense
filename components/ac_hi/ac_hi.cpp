@@ -1457,18 +1457,26 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     ESP_LOGD(TAG, "Sleep Mode Code returned to 0; clearing desired HA Sleep preset");
   }
 
-  // 8 °C frost-protection mode. The primary stock-firmware status extractor
-  // maps t_8heat to byte 77 bit 0. Hardware captures also show byte 66 bit 7
-  // while the mode is engaged, so accept either indicator for compatibility.
+  // Target temperature (direct value). This must be read before +8 °C
+  // detection because this indoor-unit firmware does not set either of the
+  // documented frost-protection status bits. Instead, a remote-control +8 °C
+  // command is reported as HEAT with the otherwise invalid normal setpoint 8.
+  const uint8_t raw_target_c = b[IDX_SET_TEMP];
+
+  // 8 °C frost-protection mode. Keep the documented status-bit checks for
+  // compatible models, and additionally accept HEAT + raw target 8 for this
+  // model. A normal Hisense setpoint is limited to 16–30 °C, so raw value 8 is
+  // an unambiguous action-style +8 °C indication rather than an ordinary
+  // target temperature.
   const bool heat_8c_primary = b.size() > IDX_RX_HEAT_8C &&
                                (b[IDX_RX_HEAT_8C] & 0x01) != 0;
   const bool heat_8c_companion = b.size() > IDX_RX_HEAT_8C_COMPANION &&
                                  (b[IDX_RX_HEAT_8C_COMPANION] & 0x80) != 0;
-  heat_8c_ = heat_8c_primary || heat_8c_companion;
+  const bool heat_8c_target_marker = power_on_ &&
+                                     mode_ == climate::CLIMATE_MODE_HEAT &&
+                                     raw_target_c == 8;
+  heat_8c_ = heat_8c_primary || heat_8c_companion || heat_8c_target_marker;
   if (heat_8c_) mode_ = climate::CLIMATE_MODE_HEAT;
-
-  // Target temperature (direct value)
-  const uint8_t raw_target_c = b[IDX_SET_TEMP];
   if (heat_8c_) {
     // Units may report an out-of-normal-range internal frost setpoint (5 or
     // 8 °C). Keep the remembered normal HEAT target internally and publish the
@@ -1820,7 +1828,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u), current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
@@ -1830,7 +1838,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            (unsigned) (heat_8c_ ? 8 : target_c_), heat_8c_ ? "ON" : "OFF",
            b.size() > IDX_RX_HEAT_8C ? b[IDX_RX_HEAT_8C] : 0,
            b.size() > IDX_RX_HEAT_8C_COMPANION ? b[IDX_RX_HEAT_8C_COMPANION] : 0,
-           (unsigned) raw_target_c, current_temperature,
+           (unsigned) raw_target_c, heat_8c_target_marker ? "YES" : "NO", current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
            b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
            b[IDX_COMPRESSOR_EXHAUST_TEMP]);
