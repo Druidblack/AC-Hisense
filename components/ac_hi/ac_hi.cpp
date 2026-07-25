@@ -181,6 +181,9 @@ void ACHIClimate::setup() {
   update_sound_switch_state_();
   update_memory_switch_state_();
   update_sleep_program_select_state_();
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(command_confirmation_text_, "Idle");
+#endif
 
   // Remember boot time so the first status poll is delayed after a full power restore.
   // Indoor AC boards can be noisy on UART while they are still booting; polling too early
@@ -261,6 +264,9 @@ void ACHIClimate::loop() {
   if (writing_lock_ && (millis() - write_lock_time_ > WRITE_LOCK_TIMEOUT)) {
     ESP_LOGW(TAG, "Write lock timeout, forcing unlock");
     writing_lock_ = false;
+#ifdef USE_TEXT_SENSOR
+    publish_text_sensor_if_changed_(command_confirmation_text_, "Timeout");
+#endif
   }
 
   // 7. Send a debounced control command only when neither a write ACK nor a
@@ -814,6 +820,9 @@ void ACHIClimate::send_write_changes_() {
 
   writing_lock_ = true;
   write_lock_time_ = millis();
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(command_confirmation_text_, "Pending");
+#endif
 }
 
 // ---- IR iFeel / Follow Me over Kelon168 ----
@@ -1656,6 +1665,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   if (writing_lock_ && actual_sig_ == desired_sig_) {
     writing_lock_ = false;
     ESP_LOGD(TAG, "Write confirmed by matching status (lock cleared)");
+#ifdef USE_TEXT_SENSOR
+    publish_text_sensor_if_changed_(command_confirmation_text_, "Confirmed by status");
+#endif
   }
 
   // Publish state with gating
@@ -1704,11 +1716,81 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   publish_sensor_if_changed_(compressor_exhaust_temp_sensor_,
                              static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
 
+  // Reference long-status bit map. Timer and compensation fields are kept as
+  // raw protocol values until their physical meaning is confirmed on this unit.
+  const uint8_t on_timer_hour = b[IDX_ON_TIMER_HOUR] & 0x1F;
+  const uint8_t on_timer_minute = b[IDX_ON_TIMER_MINUTE_STATUS] & 0x3F;
+  const bool on_timer_active = (b[IDX_ON_TIMER_MINUTE_STATUS] & 0x80) != 0;
+  const uint8_t off_timer_hour = b[IDX_OFF_TIMER_HOUR] & 0x1F;
+  const uint8_t off_timer_minute = b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x3F;
+  const bool off_timer_active = (b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x80) != 0;
+
+  publish_sensor_if_changed_(indoor_humidity_setting_sensor_, b[IDX_INDOOR_HUMIDITY_SETTING]);
+  publish_sensor_if_changed_(indoor_humidity_sensor_, b[IDX_INDOOR_HUMIDITY]);
+  publish_sensor_if_changed_(temperature_compensation_sensor_,
+                             b[IDX_TEMPERATURE_COMPENSATION] & 0x1F);
+  publish_sensor_if_changed_(on_timer_hour_sensor_, on_timer_hour);
+  publish_sensor_if_changed_(on_timer_minute_sensor_, on_timer_minute);
+  publish_sensor_if_changed_(on_timer_active_sensor_, on_timer_active ? 1.0f : 0.0f);
+  publish_sensor_if_changed_(off_timer_hour_sensor_, off_timer_hour);
+  publish_sensor_if_changed_(off_timer_minute_sensor_, off_timer_minute);
+  publish_sensor_if_changed_(off_timer_active_sensor_, off_timer_active ? 1.0f : 0.0f);
+
+  if (b.size() > IDX_COMMAND_STATUS) {
+    publish_sensor_if_changed_(command_received_code_sensor_,
+                               (b[IDX_COMMAND_STATUS] >> 2) & 0x0F);
+    publish_sensor_if_changed_(indoor_eeprom_sensor_,
+                               (b[IDX_COMMAND_STATUS] & 0x80) ? 1.0f : 0.0f);
+  }
+  if (b.size() > IDX_IAB) publish_sensor_if_changed_(iab_sensor_, b[IDX_IAB]);
+  if (b.size() > IDX_IBC) publish_sensor_if_changed_(ibc_sensor_, b[IDX_IBC]);
+  if (b.size() > IDX_IUV) publish_sensor_if_changed_(iuv_sensor_, b[IDX_IUV]);
+  if (b.size() > IDX_OUTDOOR_RAW_47) publish_sensor_if_changed_(outdoor_raw_47_sensor_, b[IDX_OUTDOOR_RAW_47]);
+  if (b.size() > IDX_OUTDOOR_RAW_48) publish_sensor_if_changed_(outdoor_raw_48_sensor_, b[IDX_OUTDOOR_RAW_48]);
+  if (b.size() > IDX_OUTDOOR_RAW_49) publish_sensor_if_changed_(outdoor_raw_49_sensor_, b[IDX_OUTDOOR_RAW_49]);
+  if (b.size() > IDX_OUTDOOR_DC_BUS_RAW) publish_sensor_if_changed_(outdoor_dc_bus_raw_sensor_, b[IDX_OUTDOOR_DC_BUS_RAW]);
+  if (b.size() > IDX_OUTDOOR_TELEMETRY_71) publish_sensor_if_changed_(outdoor_telemetry_71_sensor_, b[IDX_OUTDOOR_TELEMETRY_71]);
+  if (b.size() > IDX_OUTDOOR_IBC_ECHO) publish_sensor_if_changed_(outdoor_ibc_echo_sensor_, b[IDX_OUTDOOR_IBC_ECHO]);
+  if (b.size() > IDX_OUTDOOR_IAB_ECHO) publish_sensor_if_changed_(outdoor_iab_echo_sensor_, b[IDX_OUTDOOR_IAB_ECHO]);
+
 #endif
 
 #ifdef USE_TEXT_SENSOR
   publish_text_sensor_if_changed_(power_status_text_, power_on_ ? "ON" : "OFF");
+  char timer_text[16];
+  const uint8_t on_timer_hour_text = b[IDX_ON_TIMER_HOUR] & 0x1F;
+  const uint8_t on_timer_minute_text = b[IDX_ON_TIMER_MINUTE_STATUS] & 0x3F;
+  const bool on_timer_active_text = (b[IDX_ON_TIMER_MINUTE_STATUS] & 0x80) != 0;
+  const uint8_t off_timer_hour_text = b[IDX_OFF_TIMER_HOUR] & 0x1F;
+  const uint8_t off_timer_minute_text = b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x3F;
+  const bool off_timer_active_text = (b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x80) != 0;
+  if (on_timer_active_text) {
+    snprintf(timer_text, sizeof(timer_text), "%02u:%02u", on_timer_hour_text, on_timer_minute_text);
+    publish_text_sensor_if_changed_(on_timer_text_, timer_text);
+  } else {
+    publish_text_sensor_if_changed_(on_timer_text_, "Disabled");
+  }
+  if (off_timer_active_text) {
+    snprintf(timer_text, sizeof(timer_text), "%02u:%02u", off_timer_hour_text, off_timer_minute_text);
+    publish_text_sensor_if_changed_(off_timer_text_, timer_text);
+  } else {
+    publish_text_sensor_if_changed_(off_timer_text_, "Disabled");
+  }
 #endif
+
+  if (b.size() > IDX_IUV) {
+    ESP_LOGV(TAG,
+             "Extended diagnostics: humidity_set=%u humidity=%u temp_comp=%u on_timer=%s %02u:%02u off_timer=%s %02u:%02u cmd_code=%u eeprom=%u IAB=%u IBC=%u IUV=%u",
+             b[IDX_INDOOR_HUMIDITY_SETTING], b[IDX_INDOOR_HUMIDITY],
+             b[IDX_TEMPERATURE_COMPENSATION] & 0x1F,
+             (b[IDX_ON_TIMER_MINUTE_STATUS] & 0x80) ? "ON" : "OFF",
+             b[IDX_ON_TIMER_HOUR] & 0x1F, b[IDX_ON_TIMER_MINUTE_STATUS] & 0x3F,
+             (b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x80) ? "ON" : "OFF",
+             b[IDX_OFF_TIMER_HOUR] & 0x1F, b[IDX_OFF_TIMER_MINUTE_STATUS] & 0x3F,
+             (b[IDX_COMMAND_STATUS] >> 2) & 0x0F,
+             (b[IDX_COMMAND_STATUS] & 0x80) ? 1 : 0,
+             b[IDX_IAB], b[IDX_IBC], b[IDX_IUV]);
+  }
 
   ESP_LOGD(TAG,
            "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
@@ -1730,6 +1812,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 void ACHIClimate::handle_ack_101_() {
   writing_lock_ = false;
   ESP_LOGD(TAG, "Write acknowledged (lock cleared)");
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(command_confirmation_text_, "ACK 0x65");
+#endif
 
   // If there is a pending control command, it will be sent on next loop
   // (after debounce) because pending_control_ is still true.

@@ -2,7 +2,7 @@ import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
 from esphome.components import climate, uart, sensor, switch, select, text_sensor, remote_base
-from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ICON_LIGHTBULB
+from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC, ICON_LIGHTBULB
 
 AUTO_LOAD = ["climate", "uart", "sensor", "switch", "select", "text_sensor", "remote_base"]
 
@@ -58,6 +58,32 @@ CONF_OUTDOOR_TEMP = "outdoor_temperature"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
 CONF_COMPRESSOR_EXHAUST_TEMP = "compressor_exhaust_temperature"
 
+# Extended status / diagnostic fields from the long 0x66 frame
+CONF_INDOOR_HUMIDITY_SETTING = "indoor_humidity_setting"
+CONF_INDOOR_HUMIDITY = "indoor_humidity"
+CONF_TEMPERATURE_COMPENSATION = "temperature_compensation"
+CONF_ON_TIMER_HOUR = "on_timer_hour"
+CONF_ON_TIMER_MINUTE = "on_timer_minute"
+CONF_ON_TIMER_ACTIVE = "on_timer_active"
+CONF_OFF_TIMER_HOUR = "off_timer_hour"
+CONF_OFF_TIMER_MINUTE = "off_timer_minute"
+CONF_OFF_TIMER_ACTIVE = "off_timer_active"
+CONF_ON_TIMER_TEXT = "on_timer_text"
+CONF_OFF_TIMER_TEXT = "off_timer_text"
+CONF_IAB = "iab"
+CONF_IBC = "ibc"
+CONF_IUV = "iuv"
+CONF_COMMAND_RECEIVED_CODE = "command_received_code"
+CONF_INDOOR_EEPROM = "indoor_eeprom"
+CONF_COMMAND_CONFIRMATION = "command_confirmation"
+CONF_OUTDOOR_RAW_47 = "outdoor_raw_47"
+CONF_OUTDOOR_RAW_48 = "outdoor_raw_48"
+CONF_OUTDOOR_RAW_49 = "outdoor_raw_49"
+CONF_OUTDOOR_DC_BUS_RAW = "outdoor_dc_bus_raw"
+CONF_OUTDOOR_TELEMETRY_71 = "outdoor_telemetry_71"
+CONF_OUTDOOR_IBC_ECHO = "outdoor_ibc_echo"
+CONF_OUTDOOR_IAB_ECHO = "outdoor_iab_echo"
+
 # New memory diagnostics sensor keys
 CONF_HEAP_FREE = "heap_free"
 CONF_HEAP_TOTAL = "heap_total"
@@ -95,6 +121,34 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_OUTDOOR_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
+
+    # Extended 0x66 diagnostics. These are created by default so the fields can
+    # be evaluated on the real indoor/outdoor unit without additional YAML.
+    cv.Optional(CONF_INDOOR_HUMIDITY_SETTING, default={CONF_NAME: "Indoor Humidity Setting"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_INDOOR_HUMIDITY, default={CONF_NAME: "Indoor Humidity"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_TEMPERATURE_COMPENSATION, default={CONF_NAME: "Temperature Compensation Code"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_ON_TIMER_HOUR, default={CONF_NAME: "Power-on Timer Hours"}): sensor.sensor_schema(unit_of_measurement="h", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_ON_TIMER_MINUTE, default={CONF_NAME: "Power-on Timer Minutes"}): sensor.sensor_schema(unit_of_measurement="min", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_ON_TIMER_ACTIVE, default={CONF_NAME: "Power-on Timer Active"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OFF_TIMER_HOUR, default={CONF_NAME: "Power-off Timer Hours"}): sensor.sensor_schema(unit_of_measurement="h", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OFF_TIMER_MINUTE, default={CONF_NAME: "Power-off Timer Minutes"}): sensor.sensor_schema(unit_of_measurement="min", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OFF_TIMER_ACTIVE, default={CONF_NAME: "Power-off Timer Active"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_IAB, default={CONF_NAME: "Current IAB Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_IBC, default={CONF_NAME: "Current IBC Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_IUV, default={CONF_NAME: "Voltage IUV Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_COMMAND_RECEIVED_CODE, default={CONF_NAME: "Command Received Code"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_INDOOR_EEPROM, default={CONF_NAME: "Indoor EEPROM Flag"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_RAW_47, default={CONF_NAME: "Outdoor Unit Raw Byte 47"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_RAW_48, default={CONF_NAME: "Outdoor Unit Raw Byte 48"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_RAW_49, default={CONF_NAME: "Outdoor Unit Raw Byte 49"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_DC_BUS_RAW, default={CONF_NAME: "Outdoor Unit DC Bus Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_TELEMETRY_71, default={CONF_NAME: "Outdoor Unit Telemetry 71 Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_IBC_ECHO, default={CONF_NAME: "Outdoor IBC Echo Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OUTDOOR_IAB_ECHO, default={CONF_NAME: "Outdoor IAB Echo Raw"}): sensor.sensor_schema(accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+
+    cv.Optional(CONF_ON_TIMER_TEXT, default={CONF_NAME: "Power-on Timer"}): text_sensor.text_sensor_schema(entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_OFF_TIMER_TEXT, default={CONF_NAME: "Power-off Timer"}): text_sensor.text_sensor_schema(entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    cv.Optional(CONF_COMMAND_CONFIRMATION, default={CONF_NAME: "Command Confirmation"}): text_sensor.text_sensor_schema(entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
 
     # Power status is a text sensor ("ON"/"OFF")
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
@@ -227,6 +281,81 @@ async def to_code(config):
     if conf := config.get(CONF_COMPRESSOR_EXHAUST_TEMP):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_compressor_exhaust_temp_sensor(sens))
+
+    # Extended status / diagnostic sensors
+    if conf := config.get(CONF_INDOOR_HUMIDITY_SETTING):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_indoor_humidity_setting_sensor(sens))
+    if conf := config.get(CONF_INDOOR_HUMIDITY):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_indoor_humidity_sensor(sens))
+    if conf := config.get(CONF_TEMPERATURE_COMPENSATION):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_temperature_compensation_sensor(sens))
+    if conf := config.get(CONF_ON_TIMER_HOUR):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_on_timer_hour_sensor(sens))
+    if conf := config.get(CONF_ON_TIMER_MINUTE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_on_timer_minute_sensor(sens))
+    if conf := config.get(CONF_ON_TIMER_ACTIVE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_on_timer_active_sensor(sens))
+    if conf := config.get(CONF_OFF_TIMER_HOUR):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_off_timer_hour_sensor(sens))
+    if conf := config.get(CONF_OFF_TIMER_MINUTE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_off_timer_minute_sensor(sens))
+    if conf := config.get(CONF_OFF_TIMER_ACTIVE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_off_timer_active_sensor(sens))
+    if conf := config.get(CONF_IAB):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_iab_sensor(sens))
+    if conf := config.get(CONF_IBC):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_ibc_sensor(sens))
+    if conf := config.get(CONF_IUV):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_iuv_sensor(sens))
+    if conf := config.get(CONF_COMMAND_RECEIVED_CODE):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_command_received_code_sensor(sens))
+    if conf := config.get(CONF_INDOOR_EEPROM):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_indoor_eeprom_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_RAW_47):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_raw_47_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_RAW_48):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_raw_48_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_RAW_49):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_raw_49_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_DC_BUS_RAW):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_dc_bus_raw_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_TELEMETRY_71):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_telemetry_71_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_IBC_ECHO):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_ibc_echo_sensor(sens))
+    if conf := config.get(CONF_OUTDOOR_IAB_ECHO):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_outdoor_iab_echo_sensor(sens))
+
+    if conf := config.get(CONF_ON_TIMER_TEXT):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_on_timer_text(ts))
+    if conf := config.get(CONF_OFF_TIMER_TEXT):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_off_timer_text(ts))
+    if conf := config.get(CONF_COMMAND_CONFIRMATION):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_command_confirmation_text(ts))
 
     # Optional text sensor for power status
     if conf := config.get(CONF_POWER_STATUS):
