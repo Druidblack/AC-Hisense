@@ -100,11 +100,18 @@ enum FrameIndex : uint8_t {
   IDX_TX_TURBO_ECO = 33,
   IDX_TX_QUIET = 35,
   IDX_TX_LED = 36,
+  IDX_TX_HEAT_8C = 37,
 
   // Status-frame indexes.
   IDX_RX_SWING_TURBO_ECO = 35,
   IDX_RX_QUIET = 36,
   IDX_RX_LED = 37,
+
+  // 8 °C frost-protection status. The stock firmware exposes the primary
+  // t_8heat flag at byte 77 bit 0. Some revisions additionally mirror the
+  // active mode at byte 66 bit 7.
+  IDX_RX_HEAT_8C_COMPANION = 66,
+  IDX_RX_HEAT_8C = 77,
 
   // Compressor frequency fields confirmed from transition logs:
   // 41 = measured/actual, 42 = controller target, 43 = command sent to inverter.
@@ -130,6 +137,7 @@ enum CommandFieldMask : uint16_t {
   CMD_FIELD_TURBO_ECO  = 1u << 5,
   CMD_FIELD_QUIET      = 1u << 6,
   CMD_FIELD_LED        = 1u << 7,
+  CMD_FIELD_HEAT_8C    = 1u << 8,
 };
 
 // Bit masks within specific bytes
@@ -160,6 +168,8 @@ namespace TxValues {
   constexpr uint8_t LEFTRIGHT_OFF = 0b00010000;
   constexpr uint8_t LED_ON   = 0b11000000;
   constexpr uint8_t LED_OFF  = 0b01000000;
+  constexpr uint8_t HEAT_8C_ON  = 0x03;
+  constexpr uint8_t HEAT_8C_OFF = 0x01;
 }
 
 // Limits for non‑blocking operation
@@ -310,7 +320,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint32_t compute_control_signature_(bool power, climate::ClimateMode mode,
                                       climate::ClimateFanMode fan, bool fan_turbo,
                                       climate::ClimateSwingMode swing,
-                                      bool eco, bool turbo, bool quiet, bool led,
+                                      bool eco, bool turbo, bool quiet, bool heat_8c, bool led,
                                       uint8_t sleep_stage, uint8_t target_c) const;
   void recalc_desired_sig_();
   void recalc_actual_sig_();
@@ -410,6 +420,14 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // re-send the display OFF command and make the indoor unit beep.
   bool led_command_pending_{false};
 
+  // State restored when the +8 °C frost-protection preset is disabled.
+  bool heat_8c_restore_valid_{false};
+  bool heat_8c_restore_power_{false};
+  uint8_t heat_8c_restore_target_c_{24};
+  climate::ClimateMode heat_8c_restore_mode_{climate::CLIMATE_MODE_HEAT};
+  climate::ClimateFanMode heat_8c_restore_fan_{climate::CLIMATE_FAN_AUTO};
+  bool heat_8c_restore_fan_turbo_{false};
+
   // Last raw fan/wind code from status frame. Some presets are acknowledged
   // only indirectly via this code when the display is off.
   uint8_t last_raw_wind_{0};
@@ -455,6 +473,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool turbo_{false};
   bool eco_{false};
   bool quiet_{false};
+  bool heat_8c_{false};
   bool led_{true};
   uint8_t sleep_stage_{0};              // 0..4
   uint8_t selected_sleep_stage_{2};     // default program used by HA Sleep preset
@@ -472,6 +491,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool d_turbo_{false};
   bool d_eco_{false};
   bool d_quiet_{false};
+  bool d_heat_8c_{false};
   bool d_led_{true};
   uint8_t d_sleep_stage_{0};
 

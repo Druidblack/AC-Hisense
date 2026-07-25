@@ -24,6 +24,7 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
 }
 
 static const char *const CUSTOM_PRESET_QUIET = "Quiet";
+static const char *const CUSTOM_PRESET_HEAT_8C = "+8°C";
 static const char *const CUSTOM_FAN_TURBO = "Turbo";
 static const char *const SLEEP_PROGRAM_1 = "Sleep 1";
 static const char *const SLEEP_PROGRAM_2 = "Sleep 2";
@@ -138,7 +139,7 @@ void ACHIClimate::setup() {
   // Register custom presets on the Climate entity, not on ClimateTraits.
   // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
   if (enable_presets_) {
-    this->set_supported_custom_presets({CUSTOM_PRESET_QUIET});
+    this->set_supported_custom_presets({CUSTOM_PRESET_QUIET, CUSTOM_PRESET_HEAT_8C});
   }
   // Fan Turbo is exposed as a custom fan mode, not as a preset.
   // It only sends raw Wind Mode Code 18 without changing target temperature.
@@ -163,6 +164,7 @@ void ACHIClimate::setup() {
   d_turbo_        = false;
   d_eco_          = false;
   d_quiet_        = false;
+  d_heat_8c_      = false;
   d_led_          = true;
   d_sleep_stage_  = 0;
   
@@ -372,15 +374,24 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   const bool before_turbo = d_turbo_;
   const bool before_eco = d_eco_;
   const bool before_quiet = d_quiet_;
+  const bool before_heat_8c = d_heat_8c_;
   const bool before_led = d_led_;
   const uint8_t before_sleep_stage = d_sleep_stage_;
 
   if (call.get_mode().has_value()) {
     auto m = *call.get_mode();
+
+    // Selecting another HVAC mode explicitly leaves frost protection. Merely
+    // re-selecting HEAT keeps +8 °C active; Preset=None is its normal off path.
+    if (d_heat_8c_ && m != climate::CLIMATE_MODE_HEAT) {
+      d_heat_8c_ = false;
+      heat_8c_restore_valid_ = false;
+    }
+
     if (m == climate::CLIMATE_MODE_OFF) {
       // Preserve the normal setpoint of the mode being turned off. Temporary
       // Boost/Eco/Sleep targets are intentionally excluded.
-      if (d_power_on_ && !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+      if (d_power_on_ && !d_turbo_ && !d_eco_ && !d_heat_8c_ && d_sleep_stage_ == 0) {
         remember_target_for_mode_(d_mode_, d_target_c_);
       }
 
@@ -420,7 +431,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       // separately remembered target of COOL or HEAT. An explicitly supplied
       // target temperature in the same ClimateCall is processed below and wins.
       if ((!was_power_on || requested_mode != d_mode_) &&
-          !d_turbo_ && !d_eco_ && d_sleep_stage_ == 0) {
+          !d_turbo_ && !d_eco_ && !d_heat_8c_ && d_sleep_stage_ == 0) {
         if (was_power_on && requested_mode != d_mode_) {
           remember_target_for_mode_(d_mode_, d_target_c_);
         }
@@ -452,7 +463,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       // by the unit while Quiet Mode Code is still 0; that is not an explicit
       // Quiet request from HA and should fall back to AUTO when the mode changes.
       if (!call.get_fan_mode().has_value() && d_fan_ == climate::CLIMATE_FAN_QUIET &&
-          !d_quiet_ && !d_eco_ && !d_turbo_ && d_sleep_stage_ == 0) {
+          !d_quiet_ && !d_eco_ && !d_turbo_ && !d_heat_8c_ && d_sleep_stage_ == 0) {
         d_fan_ = climate::CLIMATE_FAN_AUTO;
       }
     }
@@ -462,6 +473,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_target_temperature().has_value()) {
     float t = *call.get_target_temperature();
     if (!std::isnan(t)) {
+      // A manual setpoint means normal heating/cooling, not frost protection.
+      d_heat_8c_ = false;
+      heat_8c_restore_valid_ = false;
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
       d_target_c_ = c;
@@ -478,6 +492,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
     // An explicit fan command supersedes any pending Sleep rollback snapshot.
     sleep_restore_fan_valid_ = false;
+    d_heat_8c_ = false;
+    heat_8c_restore_valid_ = false;
     d_fan_ = *call.get_fan_mode();
     d_fan_turbo_ = false;
     d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
@@ -493,6 +509,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     auto p = *call.get_preset();
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
+    bool was_heat_8c = d_heat_8c_;
     const bool was_sleep = before_sleep_stage > 0 || sleep_stage_ > 0;
     const auto fan_before_preset = d_fan_;
     const bool fan_turbo_before_preset = d_fan_turbo_;
@@ -508,7 +525,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
     d_eco_ = false;
     d_turbo_ = false;
+    d_heat_8c_ = false;
     d_sleep_stage_ = 0;
+    if (p != climate::CLIMATE_PRESET_NONE && was_heat_8c)
+      heat_8c_restore_valid_ = false;
 
     // Leaving Turbo should restore AUTO fan unless a new preset overrides it.
     if (was_turbo && p != climate::CLIMATE_PRESET_BOOST) {
@@ -589,6 +609,22 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         g_has_pre_eco_state = false;
       }
 
+      if (was_heat_8c && heat_8c_restore_valid_) {
+        d_power_on_ = heat_8c_restore_power_;
+        d_mode_ = heat_8c_restore_mode_;
+        d_target_c_ = heat_8c_restore_target_c_;
+        d_fan_ = heat_8c_restore_fan_;
+        d_fan_turbo_ = heat_8c_restore_fan_turbo_;
+        heat_8c_restore_valid_ = false;
+        if (memory_mode_enabled_ && d_power_on_ && d_mode_ != climate::CLIMATE_MODE_OFF)
+          last_active_mode_ = d_mode_;
+        ESP_LOGD(TAG, "+8°C disabled: restored power=%s mode=%s target=%u°C fan=%s",
+                 d_power_on_ ? "ON" : "OFF",
+                 LOG_STR_ARG(climate::climate_mode_to_string(d_mode_)),
+                 (unsigned) d_target_c_,
+                 LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
+      }
+
       d_quiet_ = false;
       // A Sleep OFF action must remain byte-17-only. Let the indoor unit
       // report the fan it restores after leaving Sleep, then synchronize to it.
@@ -601,8 +637,42 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
-    if (custom == CUSTOM_PRESET_QUIET) {
+    if (custom == CUSTOM_PRESET_HEAT_8C) {
+      if (!d_heat_8c_) {
+        heat_8c_restore_valid_ = true;
+        heat_8c_restore_power_ = d_power_on_;
+        heat_8c_restore_mode_ = d_mode_;
+        heat_8c_restore_target_c_ = d_target_c_;
+        heat_8c_restore_fan_ = d_fan_;
+        heat_8c_restore_fan_turbo_ = d_fan_turbo_;
+      }
+
+      const bool was_off = !d_power_on_;
+      d_power_on_ = true;
+      d_mode_ = climate::CLIMATE_MODE_HEAT;
+      d_heat_8c_ = true;
+      d_turbo_ = false;
+      d_eco_ = false;
+      d_quiet_ = false;
+      d_sleep_stage_ = 0;
+      d_fan_turbo_ = false;
+      d_fan_ = climate::CLIMATE_FAN_AUTO;
       sleep_restore_fan_valid_ = false;
+
+      if (was_off && !d_led_) {
+        d_led_ = true;
+        led_command_pending_ = true;
+      }
+      if (memory_mode_enabled_) last_active_mode_ = climate::CLIMATE_MODE_HEAT;
+
+      ESP_LOGD(TAG,
+               "+8°C requested: HEAT frost protection, command byte[37]=0x03; normal target %u°C preserved",
+               (unsigned) d_target_c_);
+      changed = true;
+    } else if (custom == CUSTOM_PRESET_QUIET) {
+      sleep_restore_fan_valid_ = false;
+      d_heat_8c_ = false;
+      heat_8c_restore_valid_ = false;
       d_quiet_ = true;
       d_turbo_ = false;
       d_eco_ = false;
@@ -618,6 +688,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     if (custom_fan == CUSTOM_FAN_TURBO) {
       sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
       sleep_restore_fan_valid_ = false;
+      d_heat_8c_ = false;
+      heat_8c_restore_valid_ = false;
       // Fan Turbo is independent from the BOOST preset: keep the current
       // temperature and mode, but send raw Wind Mode Code 18.
       d_fan_turbo_ = true;
@@ -645,6 +717,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     changed_fields |= CMD_FIELD_TURBO_ECO;
   if (d_quiet_ != before_quiet)
     changed_fields |= CMD_FIELD_QUIET;
+  if (d_heat_8c_ != before_heat_8c)
+    changed_fields |= CMD_FIELD_HEAT_8C;
   if (d_led_ != before_led || led_command_pending_)
     changed_fields |= CMD_FIELD_LED;
   if (d_sleep_stage_ != before_sleep_stage)
@@ -665,11 +739,12 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   // Publish optimistically
   this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
-  this->target_temperature = d_target_c_;
+  this->target_temperature = d_heat_8c_ ? 8 : d_target_c_;
   publish_fan_state_(d_fan_turbo_, d_fan_);
   this->swing_mode = d_swing_;
   if (enable_presets_) {
-    if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+    if (d_heat_8c_) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+    else if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
     else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
     else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
     else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
@@ -730,6 +805,13 @@ void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
   if (fields & CMD_FIELD_QUIET)
     tx_bytes_[IDX_TX_QUIET] = d_quiet_ ? TxValues::QUIET_ON : TxValues::QUIET_OFF;
 
+  if (fields & CMD_FIELD_HEAT_8C) {
+    // t_8heat occupies bits 0..1 of command byte 37. Use OR so future
+    // companion controls in the upper bits of this packed byte are preserved.
+    tx_bytes_[IDX_TX_HEAT_8C] |= d_heat_8c_ ? TxValues::HEAT_8C_ON
+                                            : TxValues::HEAT_8C_OFF;
+  }
+
   // Display is also action-style. Send it when explicitly changed, or append
   // LED_OFF once to an ordinary user command while the desired display is off.
   // A confirmed Sleep program temporarily reports the panel as OFF even when it
@@ -770,6 +852,8 @@ void ACHIClimate::queue_retry_fields_from_state_() {
       pending_command_fields_ |= CMD_FIELD_TURBO_ECO;
     if (d_quiet_ != quiet_)
       pending_command_fields_ |= CMD_FIELD_QUIET;
+    if (d_heat_8c_ != heat_8c_)
+      pending_command_fields_ |= CMD_FIELD_HEAT_8C;
   }
 }
 
@@ -799,11 +883,12 @@ void ACHIClimate::send_write_changes_() {
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG,
-           "Sending neutral one-shot write (0x65): fields=0x%02X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X beep[23]=0x%02X",
+           "Sending neutral one-shot write (0x65): fields=0x%03X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X heat8[37]=0x%02X beep[23]=0x%02X",
            (unsigned) fields, tx_bytes_[IDX_WIND], tx_bytes_[IDX_SLEEP],
            tx_bytes_[IDX_POWER_MODE], tx_bytes_[IDX_SET_TEMP],
            tx_bytes_[IDX_TX_SWING], tx_bytes_[IDX_TX_TURBO_ECO],
-           tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED], tx_bytes_[IDX_TX_BEEP]);
+           tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED],
+           tx_bytes_[IDX_TX_HEAT_8C], tx_bytes_[IDX_TX_BEEP]);
   send_logical_frame_(tx_bytes_, "TX one-shot write");
 
   last_tx_frame_.assign(tx_bytes_.begin(), tx_bytes_.end());
@@ -1372,9 +1457,28 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     ESP_LOGD(TAG, "Sleep Mode Code returned to 0; clearing desired HA Sleep preset");
   }
 
+  // 8 °C frost-protection mode. The primary stock-firmware status extractor
+  // maps t_8heat to byte 77 bit 0. Hardware captures also show byte 66 bit 7
+  // while the mode is engaged, so accept either indicator for compatibility.
+  const bool heat_8c_primary = b.size() > IDX_RX_HEAT_8C &&
+                               (b[IDX_RX_HEAT_8C] & 0x01) != 0;
+  const bool heat_8c_companion = b.size() > IDX_RX_HEAT_8C_COMPANION &&
+                                 (b[IDX_RX_HEAT_8C_COMPANION] & 0x80) != 0;
+  heat_8c_ = heat_8c_primary || heat_8c_companion;
+  if (heat_8c_) mode_ = climate::CLIMATE_MODE_HEAT;
+
   // Target temperature (direct value)
-  target_c_ = b[IDX_SET_TEMP];
-  if (target_c_ < 16 || target_c_ > 30) target_c_ = 24; // fallback
+  const uint8_t raw_target_c = b[IDX_SET_TEMP];
+  if (heat_8c_) {
+    // Units may report an out-of-normal-range internal frost setpoint (5 or
+    // 8 °C). Keep the remembered normal HEAT target internally and publish the
+    // logical +8 °C target through the preset instead of poisoning temperature
+    // memory with that special controller value.
+    target_c_ = target_for_mode_(climate::CLIMATE_MODE_HEAT, d_target_c_);
+  } else {
+    target_c_ = raw_target_c;
+    if (target_c_ < 16 || target_c_ > 30) target_c_ = 24; // fallback
+  }
 
   // Current temperatures
   current_temperature = b[IDX_CURRENT_TEMP];
@@ -1674,8 +1778,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // The OFF status of this indoor unit reports 26°C as a service/default value.
   // Keep the user-facing setpoint sensor aligned with the remembered COOL/HEAT
   // target instead of exposing that transient value.
-  const uint8_t published_setpoint =
-      power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_);
+  const uint8_t published_setpoint = heat_8c_
+      ? 8
+      : (power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_));
   publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
   publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
   publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
@@ -1715,14 +1820,17 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
            LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
-           (unsigned) target_c_, current_temperature,
+           (unsigned) (heat_8c_ ? 8 : target_c_), heat_8c_ ? "ON" : "OFF",
+           b.size() > IDX_RX_HEAT_8C ? b[IDX_RX_HEAT_8C] : 0,
+           b.size() > IDX_RX_HEAT_8C_COMPANION ? b[IDX_RX_HEAT_8C_COMPANION] : 0,
+           (unsigned) raw_target_c, current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
            b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
            b[IDX_COMPRESSOR_EXHAUST_TEMP]);
@@ -1760,6 +1868,7 @@ void ACHIClimate::publish_gated_state_() {
     bool out_turbo = turbo_;
     bool out_eco = eco_;
     bool out_quiet = quiet_;
+    bool out_heat_8c = heat_8c_;
     uint8_t out_sleep_stage = sleep_stage_;
     auto out_fan = fan_;
     bool out_fan_turbo = fan_turbo_;
@@ -1804,12 +1913,13 @@ void ACHIClimate::publish_gated_state_() {
     // Learn normal COOL/HEAT setpoints only while the unit is powered on.
     // When this model is OFF it reports a service/default value of 26°C in
     // COOL, which must never overwrite the last real cooling setpoint.
-    if (power_on_ && !out_turbo && !out_eco && out_sleep_stage == 0) {
+    if (power_on_ && !out_turbo && !out_eco && !out_heat_8c && out_sleep_stage == 0) {
       remember_target_for_mode_(mode_, target_c_);
     }
 
-    const uint8_t published_target =
-        power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_);
+    const uint8_t published_target = out_heat_8c
+        ? 8
+        : (power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_));
 
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = published_target;
@@ -1819,7 +1929,8 @@ void ACHIClimate::publish_gated_state_() {
     publish_fan_state_(out_fan_turbo || out_turbo, out_fan);
     this->swing_mode = swing_;
     if (enable_presets_) {
-      if (out_turbo) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+      if (out_heat_8c) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+      else if (out_turbo) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (out_eco) this->set_preset_(climate::CLIMATE_PRESET_ECO);
       else if (out_sleep_stage > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
       else if (out_quiet) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
@@ -1830,13 +1941,16 @@ void ACHIClimate::publish_gated_state_() {
     // remote/HA changes to clear them when the indirect state no longer matches.
     d_power_on_    = power_on_;
     d_mode_        = mode_;
-    d_target_c_    = published_target;
+    // +8 °C is an action-style frost mode, not a normal setpoint. Preserve the
+    // last normal HEAT target so Preset=None can return to it.
+    if (!out_heat_8c) d_target_c_ = published_target;
     d_fan_         = out_fan;
     d_fan_turbo_   = out_fan_turbo;
     d_swing_       = swing_;
     d_eco_         = out_eco;
     d_turbo_       = out_turbo;
     d_quiet_       = out_quiet;
+    d_heat_8c_     = out_heat_8c;
     if (!(sleep_led_restore_pending_ && !led_))
       d_led_ = led_;
     d_sleep_stage_ = out_sleep_stage;
@@ -1846,7 +1960,7 @@ void ACHIClimate::publish_gated_state_() {
     // authoritative for the fan unless the user explicitly requested another
     // fan mode; therefore show the real QUIET fan instead of stale desired AUTO.
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
-    this->target_temperature = d_target_c_;
+    this->target_temperature = d_heat_8c_ ? 8 : d_target_c_;
     if (d_turbo_) {
       // Show Turbo immediately while the BOOST command is being confirmed.
       publish_fan_state_(true, d_fan_);
@@ -1857,7 +1971,8 @@ void ACHIClimate::publish_gated_state_() {
     }
     this->swing_mode = d_swing_;
     if (enable_presets_) {
-      if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
+      if (d_heat_8c_) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+      else if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
       else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
       else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
       else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
@@ -1921,7 +2036,7 @@ void ACHIClimate::maybe_force_to_target_() {
       ESP_LOGD(TAG, "Desired/actual mismatch has no retryable one-shot fields; accepting status");
       return;
     }
-    ESP_LOGD(TAG, "Enforcing desired state with neutral one-shot fields=0x%02X",
+    ESP_LOGD(TAG, "Enforcing desired state with neutral one-shot fields=0x%03X",
              (unsigned) pending_command_fields_);
     pending_control_ = true;
     last_control_ms_ = millis();   // restart debounce
@@ -1932,7 +2047,7 @@ void ACHIClimate::maybe_force_to_target_() {
 uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMode mode,
                                                  climate::ClimateFanMode fan, bool fan_turbo,
                                                  climate::ClimateSwingMode swing,
-                                                 bool eco, bool turbo, bool quiet, bool led,
+                                                 bool eco, bool turbo, bool quiet, bool heat_8c, bool led,
                                                  uint8_t sleep_stage, uint8_t target_c) const {
   // In OFF state many indoor units keep reporting the last active mode while power is already off.
   // Normalize non-power fields so we do not get stuck in an endless enforce/write loop.
@@ -1947,9 +2062,25 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
     eco = false;
     turbo = false;
     quiet = false;
+    heat_8c = false;
     led = true;
     sleep_stage = 0;
     target_c = 24;
+  }
+
+  // +8 °C is an action-style HEAT sub-mode. Its reported internal setpoint and
+  // fan may differ by model, so normalize them while retaining the dedicated
+  // status bit as the convergence key.
+  if (heat_8c) {
+    power = true;
+    mode = climate::CLIMATE_MODE_HEAT;
+    fan = climate::CLIMATE_FAN_AUTO;
+    fan_turbo = false;
+    eco = false;
+    turbo = false;
+    quiet = false;
+    sleep_stage = 0;
+    target_c = 8;
   }
 
   // The display/LED byte behaves like an action, not a stable climate field.
@@ -1972,6 +2103,7 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
   mix(eco ? 1u : 0u);
   mix(turbo ? 1u : 0u);
   mix(quiet ? 1u : 0u);
+  mix(heat_8c ? 1u : 0u);
   mix(led ? 1u : 0u);
   mix(static_cast<uint32_t>(sleep_stage & 0x0Fu));
   mix(static_cast<uint32_t>(std::max<uint8_t>(16, std::min<uint8_t>(30, target_c))));
@@ -1980,13 +2112,15 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
 
 void ACHIClimate::recalc_desired_sig_() {
   desired_sig_ = compute_control_signature_(d_power_on_, d_mode_, d_fan_, d_fan_turbo_, d_swing_,
-                                            d_eco_, d_turbo_, d_quiet_, d_led_, d_sleep_stage_, d_target_c_);
+                                            d_eco_, d_turbo_, d_quiet_, d_heat_8c_, d_led_,
+                                            d_sleep_stage_, d_target_c_);
 }
 
 void ACHIClimate::recalc_actual_sig_() {
   bool effective_eco = eco_;
   bool effective_turbo = turbo_;
   bool effective_quiet = quiet_;
+  bool effective_heat_8c = heat_8c_;
   uint8_t effective_sleep_stage = sleep_stage_;
   auto effective_fan = fan_;
   bool effective_fan_turbo = fan_turbo_;
@@ -2013,12 +2147,14 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_eco = false;
       effective_quiet = false;
       effective_sleep_stage = 0;
+      effective_heat_8c = false;
       effective_fan = d_fan_;
     } else if (d_turbo_ && target_c_ == d_target_c_) {
       effective_turbo = true;
       effective_eco = false;
       effective_quiet = false;
       effective_sleep_stage = 0;
+      effective_heat_8c = false;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
     } else if (d_eco_ && target_c_ == d_target_c_ && fan_ == climate::CLIMATE_FAN_QUIET) {
@@ -2026,6 +2162,7 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_turbo = false;
       effective_quiet = false;
       effective_sleep_stage = 0;
+      effective_heat_8c = false;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
 
@@ -2034,6 +2171,7 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_eco = false;
       effective_turbo = false;
       effective_sleep_stage = 0;
+      effective_heat_8c = false;
       effective_fan_turbo = false;
       effective_fan = d_fan_;
     }
@@ -2041,7 +2179,7 @@ void ACHIClimate::recalc_actual_sig_() {
 
   actual_sig_ = compute_control_signature_(power_on_, mode_, effective_fan, effective_fan_turbo, swing_,
                                            effective_eco, effective_turbo, effective_quiet,
-                                           led_, effective_sleep_stage, target_c_);
+                                           effective_heat_8c, led_, effective_sleep_stage, target_c_);
 }
 
 void ACHIClimate::log_sig_diff_() const {
