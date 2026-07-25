@@ -93,12 +93,6 @@ enum FrameIndex : uint8_t {
   IDX_PIPE_TEMP = 21,
   IDX_INDOOR_HUMIDITY_SETTING = 22,
   IDX_INDOOR_HUMIDITY = 23,
-  IDX_TEMPERATURE_COMPENSATION = 26,
-  IDX_ON_TIMER_HOUR = 30,
-  IDX_ON_TIMER_MINUTE_STATUS = 31,
-  IDX_OFF_TIMER_HOUR = 32,
-  IDX_OFF_TIMER_MINUTE_STATUS = 33,
-  IDX_COMMAND_STATUS = 38,
 
   // Write-frame indexes.
   IDX_TX_BEEP = 23,
@@ -120,16 +114,6 @@ enum FrameIndex : uint8_t {
   IDX_OUTDOOR_TEMP = 44,
   IDX_OUTDOOR_COND_TEMP = 45,
   IDX_COMPRESSOR_EXHAUST_TEMP = 46,
-  IDX_OUTDOOR_RAW_47 = 47,
-  IDX_OUTDOOR_RAW_48 = 48,
-  IDX_OUTDOOR_RAW_49 = 49,
-  IDX_OUTDOOR_DC_BUS_RAW = 50,
-  IDX_IAB = 55,
-  IDX_IBC = 56,
-  IDX_IUV = 60,
-  IDX_OUTDOOR_TELEMETRY_71 = 71,
-  IDX_OUTDOOR_IBC_ECHO = 144,
-  IDX_OUTDOOR_IAB_ECHO = 145,
 };
 
 // Command fields in the 0x65 write frame. A zero byte means "do not change"
@@ -245,28 +229,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
   void set_compressor_exhaust_temp_sensor(sensor::Sensor *s) { compressor_exhaust_temp_sensor_ = s; }
-
   void set_indoor_humidity_setting_sensor(sensor::Sensor *s) { indoor_humidity_setting_sensor_ = s; }
   void set_indoor_humidity_sensor(sensor::Sensor *s) { indoor_humidity_sensor_ = s; }
-  void set_temperature_compensation_sensor(sensor::Sensor *s) { temperature_compensation_sensor_ = s; }
-  void set_on_timer_hour_sensor(sensor::Sensor *s) { on_timer_hour_sensor_ = s; }
-  void set_on_timer_minute_sensor(sensor::Sensor *s) { on_timer_minute_sensor_ = s; }
-  void set_on_timer_active_sensor(sensor::Sensor *s) { on_timer_active_sensor_ = s; }
-  void set_off_timer_hour_sensor(sensor::Sensor *s) { off_timer_hour_sensor_ = s; }
-  void set_off_timer_minute_sensor(sensor::Sensor *s) { off_timer_minute_sensor_ = s; }
-  void set_off_timer_active_sensor(sensor::Sensor *s) { off_timer_active_sensor_ = s; }
-  void set_iab_sensor(sensor::Sensor *s) { iab_sensor_ = s; }
-  void set_ibc_sensor(sensor::Sensor *s) { ibc_sensor_ = s; }
-  void set_iuv_sensor(sensor::Sensor *s) { iuv_sensor_ = s; }
-  void set_command_received_code_sensor(sensor::Sensor *s) { command_received_code_sensor_ = s; }
-  void set_indoor_eeprom_sensor(sensor::Sensor *s) { indoor_eeprom_sensor_ = s; }
-  void set_outdoor_raw_47_sensor(sensor::Sensor *s) { outdoor_raw_47_sensor_ = s; }
-  void set_outdoor_raw_48_sensor(sensor::Sensor *s) { outdoor_raw_48_sensor_ = s; }
-  void set_outdoor_raw_49_sensor(sensor::Sensor *s) { outdoor_raw_49_sensor_ = s; }
-  void set_outdoor_dc_bus_raw_sensor(sensor::Sensor *s) { outdoor_dc_bus_raw_sensor_ = s; }
-  void set_outdoor_telemetry_71_sensor(sensor::Sensor *s) { outdoor_telemetry_71_sensor_ = s; }
-  void set_outdoor_ibc_echo_sensor(sensor::Sensor *s) { outdoor_ibc_echo_sensor_ = s; }
-  void set_outdoor_iab_echo_sensor(sensor::Sensor *s) { outdoor_iab_echo_sensor_ = s; }
 
   // Memory diagnostics sensors (optional)
   void set_heap_free_sensor(sensor::Sensor *s) { heap_free_sensor_ = s; }
@@ -281,9 +245,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
-  void set_on_timer_text(text_sensor::TextSensor *t) { on_timer_text_ = t; }
-  void set_off_timer_text(text_sensor::TextSensor *t) { off_timer_text_ = t; }
-  void set_command_confirmation_text(text_sensor::TextSensor *t) { command_confirmation_text_ = t; }
 #endif
 
   void setup() override;
@@ -546,29 +507,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
   sensor::Sensor *compressor_exhaust_temp_sensor_{nullptr};
-
-  // Extended 0x66 status diagnostics
   sensor::Sensor *indoor_humidity_setting_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_sensor_{nullptr};
-  sensor::Sensor *temperature_compensation_sensor_{nullptr};
-  sensor::Sensor *on_timer_hour_sensor_{nullptr};
-  sensor::Sensor *on_timer_minute_sensor_{nullptr};
-  sensor::Sensor *on_timer_active_sensor_{nullptr};
-  sensor::Sensor *off_timer_hour_sensor_{nullptr};
-  sensor::Sensor *off_timer_minute_sensor_{nullptr};
-  sensor::Sensor *off_timer_active_sensor_{nullptr};
-  sensor::Sensor *iab_sensor_{nullptr};
-  sensor::Sensor *ibc_sensor_{nullptr};
-  sensor::Sensor *iuv_sensor_{nullptr};
-  sensor::Sensor *command_received_code_sensor_{nullptr};
-  sensor::Sensor *indoor_eeprom_sensor_{nullptr};
-  sensor::Sensor *outdoor_raw_47_sensor_{nullptr};
-  sensor::Sensor *outdoor_raw_48_sensor_{nullptr};
-  sensor::Sensor *outdoor_raw_49_sensor_{nullptr};
-  sensor::Sensor *outdoor_dc_bus_raw_sensor_{nullptr};
-  sensor::Sensor *outdoor_telemetry_71_sensor_{nullptr};
-  sensor::Sensor *outdoor_ibc_echo_sensor_{nullptr};
-  sensor::Sensor *outdoor_iab_echo_sensor_{nullptr};
 
   // Memory diagnostics
   sensor::Sensor *heap_free_sensor_{nullptr};
@@ -582,9 +522,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #endif
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *power_status_text_{nullptr};
-  text_sensor::TextSensor *on_timer_text_{nullptr};
-  text_sensor::TextSensor *off_timer_text_{nullptr};
-  text_sensor::TextSensor *command_confirmation_text_{nullptr};
 #endif
 
   ACHILEDTargetSwitch *led_switch_{nullptr};
