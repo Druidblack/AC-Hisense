@@ -28,6 +28,33 @@ namespace ac_hi {
 // Forward declarations
 class ACHIClimate;
 
+enum QueryKind : uint8_t {
+  QUERY_NONE = 0,
+  QUERY_STATUS = 1,
+  QUERY_CAPABILITIES = 2,
+};
+
+struct ACHIDeviceCapabilities {
+  bool valid{false};
+  bool cool_heat{false};
+  bool ai{false};
+  bool infinite_fan{false};
+  bool power_save{false};
+  bool fan_mute{false};
+  bool swing_dir_8{false};
+  bool swing_follow{false};
+  uint8_t power_display{0};
+  uint8_t demand_response{0};
+  bool humidity{false};
+  bool heat_8c{false};
+  bool purify{false};
+  bool ext_valid{false};
+  bool q_display{false};
+  bool enable_8heat{false};
+  bool trans_102_64{false};
+  uint8_t reply_len{0};
+};
+
 enum ACHIIFeelMqttPayloadFormat : uint8_t {
   IFEEL_MQTT_PAYLOAD_HEX = 0,
   IFEEL_MQTT_PAYLOAD_JSON = 1,
@@ -185,6 +212,8 @@ static constexpr size_t   MAX_FRAME_BYTES      = 256;  // logical (unescaped) fr
 static constexpr size_t   MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES * 2;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
 static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x66 overlap
+static constexpr uint8_t  CAPABILITIES_MAX_ATTEMPTS = 3;
+static constexpr uint32_t CAPABILITIES_RETRY_MS = 10000;
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
@@ -255,6 +284,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
+  void set_device_capabilities_text(text_sensor::TextSensor *t) { device_capabilities_text_ = t; }
 #endif
 
   void setup() override;
@@ -272,6 +302,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
  protected:
   // Protocol I/O
   void send_query_status_();
+  void send_query_capabilities_();
   void send_write_changes_();
 
   // IR iFeel helpers
@@ -294,6 +325,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
+  void parse_capabilities_102_64_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
   // State management
@@ -351,6 +383,13 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // While waiting for the 0x66 response, debounced 0x65 writes remain pending.
   bool status_query_in_flight_{false};
   uint32_t status_query_time_{0};
+  QueryKind query_kind_{QUERY_NONE};
+
+  // Read-only 0x66/subtype 0x40 ProductType discovery. Existing controls are
+  // intentionally not hidden or gated until this unit's reply is confirmed.
+  ACHIDeviceCapabilities capabilities_{};
+  uint8_t capabilities_attempts_{0};
+  uint32_t capabilities_next_attempt_ms_{0};
 
   // Pending control from HA (debounced). pending_command_fields_ contains
   // exactly the action fields that will be written; all other 0x65 payload
@@ -542,6 +581,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #endif
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *power_status_text_{nullptr};
+  text_sensor::TextSensor *device_capabilities_text_{nullptr};
 #endif
 
   ACHILEDTargetSwitch *led_switch_{nullptr};

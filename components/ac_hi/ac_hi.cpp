@@ -183,6 +183,9 @@ void ACHIClimate::setup() {
   update_sound_switch_state_();
   update_memory_switch_state_();
   update_sleep_program_select_state_();
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(device_capabilities_text_, "Waiting for 0x66/0x40");
+#endif
 
   // Remember boot time so the first status poll is delayed after a full power restore.
   // Indoor AC boards can be noisy on UART while they are still booting; polling too early
@@ -208,9 +211,17 @@ void ACHIClimate::update() {
   }
 
   if (!writing_lock_ && !pending_control_ && !status_query_in_flight_) {
-    send_query_status_();
+    const bool capability_due =
+        !capabilities_.valid && !last_status_frame_.empty() &&
+        capabilities_attempts_ < CAPABILITIES_MAX_ATTEMPTS &&
+        millis() >= capabilities_next_attempt_ms_;
+    if (capability_due) {
+      send_query_capabilities_();
+    } else {
+      send_query_status_();
+    }
   } else {
-    ESP_LOGV(TAG, "Polling skipped (write lock, pending control, or status query active)");
+    ESP_LOGV(TAG, "Polling skipped (write lock, pending control, or query active)");
   }
 }
 
@@ -254,9 +265,19 @@ void ACHIClimate::loop() {
   // 5. Release a lost status request. Until this timeout expires, a pending
   // 0x65 command is deliberately held back so it cannot collide with the 0x66 response.
   if (status_query_in_flight_ && (millis() - status_query_time_ > STATUS_QUERY_TIMEOUT)) {
-    ESP_LOGW(TAG, "Status query timeout after %lums; allowing pending control",
+    const char *kind = query_kind_ == QUERY_CAPABILITIES ? "Capabilities 0x66/0x40" : "Status 0x66/0x00";
+    ESP_LOGW(TAG, "%s query timeout after %lums; allowing pending control", kind,
              (unsigned long) STATUS_QUERY_TIMEOUT);
+    if (query_kind_ == QUERY_CAPABILITIES && !capabilities_.valid) {
+      capabilities_next_attempt_ms_ = millis() + CAPABILITIES_RETRY_MS;
+#ifdef USE_TEXT_SENSOR
+      if (capabilities_attempts_ >= CAPABILITIES_MAX_ATTEMPTS) {
+        publish_text_sensor_if_changed_(device_capabilities_text_, "No 0x66/0x40 reply");
+      }
+#endif
+    }
     status_query_in_flight_ = false;
+    query_kind_ = QUERY_NONE;
   }
 
   // 6. Handle write lock timeout
@@ -859,10 +880,35 @@ void ACHIClimate::queue_retry_fields_from_state_() {
 
 // ---- Send status query ----
 void ACHIClimate::send_query_status_() {
-  ESP_LOGD(TAG, "Sending status query (0x66)");
-  send_logical_frame_(query_, "TX query");
+  ESP_LOGD(TAG, "Sending status query (0x66/subtype 0x00)");
+  send_logical_frame_(query_, "TX status query 0x66/0x00");
   status_query_in_flight_ = true;
   status_query_time_ = millis();
+  query_kind_ = QUERY_STATUS;
+}
+
+void ACHIClimate::send_query_capabilities_() {
+  std::vector<uint8_t> query = query_;
+  if (query.size() <= 18) {
+    ESP_LOGE(TAG, "Cannot build capabilities query: status template is too short");
+    return;
+  }
+
+  // ProductType uses the normal 0x66 frame with subtype byte[14] changed to
+  // 0x40. Recompute the running-sum checksum for this exact local template.
+  query[14] = 0x40;
+  calc_and_patch_crc_(query);
+
+  capabilities_attempts_++;
+  ESP_LOGI(TAG, "Sending device capabilities query 0x66/0x40 (attempt %u/%u)",
+           (unsigned) capabilities_attempts_, (unsigned) CAPABILITIES_MAX_ATTEMPTS);
+  send_logical_frame_(query, "TX capabilities query 0x66/0x40");
+  status_query_in_flight_ = true;
+  status_query_time_ = millis();
+  query_kind_ = QUERY_CAPABILITIES;
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(device_capabilities_text_, "Querying 0x66/0x40");
+#endif
 }
 
 // ---- Send write command ----
@@ -1245,7 +1291,11 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
       if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66) {
         // The requested response arrived but was corrupt. Do not hold a user
         // command for the full query timeout; the next poll will refresh state.
+        if (query_kind_ == QUERY_CAPABILITIES && !capabilities_.valid) {
+          capabilities_next_attempt_ms_ = millis() + CAPABILITIES_RETRY_MS;
+        }
         status_query_in_flight_ = false;
+        query_kind_ = QUERY_NONE;
       }
       continue;                     // drop invalid frame
     }
@@ -1376,14 +1426,88 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
     return;
   }
   uint8_t cmd = b[IDX_CMD];
-  if (cmd == 102) {          // 0x66 – status response
+  if (cmd == 102) {          // 0x66 – status or ProductType response
     status_query_in_flight_ = false;
-    parse_status_102_(b);
+    query_kind_ = QUERY_NONE;
+    const uint8_t subtype = b.size() > 14 ? b[14] : 0x00;
+    if (subtype == 0x40) {
+      parse_capabilities_102_64_(b);
+    } else {
+      parse_status_102_(b);
+    }
   } else if (cmd == 101) {   // 0x65 – write acknowledge
     handle_ack_101_();
   } else {
     ESP_LOGV(TAG, "Unknown command 0x%02X, ignored", cmd);
   }
+}
+
+void ACHIClimate::parse_capabilities_102_64_(const std::vector<uint8_t> &b) {
+  if (b.size() <= 35 || b[IDX_CMD] != 0x66 || b[14] != 0x40) {
+    ESP_LOGW(TAG, "Invalid/short capabilities response 0x66/0x40 (%u bytes)",
+             (unsigned) b.size());
+    capabilities_next_attempt_ms_ = millis() + CAPABILITIES_RETRY_MS;
+    return;
+  }
+
+  ACHIDeviceCapabilities caps{};
+  caps.cool_heat = (b[18] & 0x80) != 0;
+  caps.power_save = (b[23] & 0x40) != 0;
+  caps.purify = (b[23] & 0x08) != 0;
+  caps.fan_mute = (b[24] & 0x40) != 0;
+  caps.infinite_fan = (b[25] & 0x08) != 0;
+  caps.heat_8c = (b[26] & 0x80) != 0;
+  caps.swing_follow = (b[26] & 0x02) != 0;
+  caps.power_display = static_cast<uint8_t>((b[27] >> 6) & 0x03);
+  caps.ai = (b[28] & 0x40) != 0;
+  caps.swing_dir_8 = (b[28] & 0x10) != 0;
+  caps.humidity = (b[32] & 0x01) != 0;
+  caps.demand_response = static_cast<uint8_t>(b[35] & 0x03);
+  caps.ext_valid = b.size() > 39;
+  if (caps.ext_valid) {
+    caps.trans_102_64 = (b[38] & 0x08) != 0;
+    caps.q_display = (b[39] & 0x40) != 0;
+    caps.enable_8heat = (b[39] & 0x04) != 0;
+  }
+  caps.reply_len = static_cast<uint8_t>(std::min<size_t>(b.size(), 255));
+  caps.valid = true;
+  capabilities_ = caps;
+
+  ESP_LOGI(TAG,
+           "Capabilities 0x66/0x40 parsed (%uB): heat=%u eco=%u quiet=%u 8heat=%u "
+           "humidity=%u purify=%u ai=%u infinite_fan=%u",
+           (unsigned) caps.reply_len, caps.cool_heat, caps.power_save, caps.fan_mute,
+           caps.heat_8c, caps.humidity, caps.purify, caps.ai, caps.infinite_fan);
+  ESP_LOGI(TAG,
+           "Capabilities: swing8=%u follow=%u display=%u demand=%u ext=%u "
+           "q_display=%u enable_8heat=%u trans_102_64=%u",
+           caps.swing_dir_8, caps.swing_follow, (unsigned) caps.power_display,
+           (unsigned) caps.demand_response, caps.ext_valid, caps.q_display,
+           caps.enable_8heat, caps.trans_102_64);
+
+#ifdef USE_TEXT_SENSOR
+  char summary[256];
+  if (caps.ext_valid) {
+    snprintf(summary, sizeof(summary),
+             "heat=%u eco=%u quiet=%u 8C=%u humidity=%u purify=%u ai=%u "
+             "fan_inf=%u swing8=%u follow=%u display=%u q_display=%u "
+             "demand=%u enable8=%u profile199=%u len=%u",
+             caps.cool_heat, caps.power_save, caps.fan_mute, caps.heat_8c,
+             caps.humidity, caps.purify, caps.ai, caps.infinite_fan,
+             caps.swing_dir_8, caps.swing_follow, (unsigned) caps.power_display,
+             caps.q_display, (unsigned) caps.demand_response, caps.enable_8heat,
+             caps.trans_102_64, (unsigned) caps.reply_len);
+  } else {
+    snprintf(summary, sizeof(summary),
+             "heat=%u eco=%u quiet=%u 8C=%u humidity=%u purify=%u ai=%u "
+             "fan_inf=%u swing8=%u follow=%u display=%u demand=%u ext=unknown len=%u",
+             caps.cool_heat, caps.power_save, caps.fan_mute, caps.heat_8c,
+             caps.humidity, caps.purify, caps.ai, caps.infinite_fan,
+             caps.swing_dir_8, caps.swing_follow, (unsigned) caps.power_display,
+             (unsigned) caps.demand_response, (unsigned) caps.reply_len);
+  }
+  publish_text_sensor_if_changed_(device_capabilities_text_, summary);
+#endif
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {

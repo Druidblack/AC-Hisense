@@ -49,6 +49,7 @@ CONF_ECONOMY = "economy"
 CONF_SWING_UD = "swing_up_down"
 CONF_SWING_LR = "swing_left_right"
 CONF_POWER_STATUS = "power_status"
+CONF_DEVICE_CAPABILITIES = "device_capabilities"
 CONF_COMP_FR_ACTUAL = "compressor_frequency_actual"
 CONF_COMP_FR_SET = "compressor_frequency_set"
 CONF_COMP_FR_COMMAND = "compressor_frequency_command"
@@ -106,6 +107,11 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
 
     # Power status is a text sensor ("ON"/"OFF")
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
+    # Compact summary of the per-unit ProductType capability reply.
+    cv.Optional(CONF_DEVICE_CAPABILITIES, default={CONF_NAME: "Device Capabilities"}): text_sensor.text_sensor_schema(
+        icon="mdi:feature-search-outline",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
 
     # Existing optional sensor and LED switch
     cv.Optional(CONF_PIPE_TEMPERATURE): sensor.sensor_schema(),
@@ -247,6 +253,10 @@ async def to_code(config):
     if conf := config.get(CONF_POWER_STATUS):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_power_status_text(ts))
+
+    if conf := config.get(CONF_DEVICE_CAPABILITIES):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_device_capabilities_text(ts))
 
     # Existing optional sensor: pipe temperature
     if pipe := config.get(CONF_PIPE_TEMPERATURE):
