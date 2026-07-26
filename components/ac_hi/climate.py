@@ -1,10 +1,10 @@
 import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
-from esphome.components import climate, uart, sensor, switch, select, text_sensor, remote_base
+from esphome.components import climate, uart, sensor, binary_sensor, switch, select, text_sensor, remote_base
 from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC, ICON_LIGHTBULB
 
-AUTO_LOAD = ["climate", "uart", "sensor", "switch", "select", "text_sensor", "remote_base"]
+AUTO_LOAD = ["climate", "uart", "sensor", "binary_sensor", "switch", "select", "text_sensor", "remote_base"]
 
 ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 ACHIClimate = ac_hi_ns.class_("ACHIClimate", climate.Climate, cg.PollingComponent, uart.UARTDevice)
@@ -50,6 +50,8 @@ CONF_SWING_UD = "swing_up_down"
 CONF_SWING_LR = "swing_left_right"
 CONF_POWER_STATUS = "power_status"
 CONF_DEVICE_CAPABILITIES = "device_capabilities"
+CONF_AC_FAULT = "ac_fault"
+CONF_AC_ACTIVE_FAULTS = "ac_active_faults"
 CONF_COMP_FR_ACTUAL = "compressor_frequency_actual"
 CONF_COMP_FR_SET = "compressor_frequency_set"
 CONF_COMP_FR_COMMAND = "compressor_frequency_command"
@@ -101,9 +103,20 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
     cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
 
-    # Indoor humidity diagnostics are created by default.
-    cv.Optional(CONF_INDOOR_HUMIDITY_SETTING, default={CONF_NAME: "Indoor Humidity Setting"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
-    cv.Optional(CONF_INDOOR_HUMIDITY, default={CONF_NAME: "Indoor Humidity"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0, entity_category=ENTITY_CATEGORY_DIAGNOSTIC),
+    # Humidity entities are normal measurement sensors. ProductType still
+    # controls their availability when the unit has no humidity hardware.
+    cv.Optional(CONF_INDOOR_HUMIDITY_SETTING, default={CONF_NAME: "Indoor Humidity Setting"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
+    cv.Optional(CONF_INDOOR_HUMIDITY, default={CONF_NAME: "Indoor Humidity"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
+
+    # Compact fault exposure from the ordinary long 0x66/0x00 status reply.
+    cv.Optional(CONF_AC_FAULT, default={CONF_NAME: "AC Fault"}): binary_sensor.binary_sensor_schema(
+        device_class="problem",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    cv.Optional(CONF_AC_ACTIVE_FAULTS, default={CONF_NAME: "AC Active Faults"}): text_sensor.text_sensor_schema(
+        icon="mdi:alert-circle-outline",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
 
     # Power status is a text sensor ("ON"/"OFF")
     cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
@@ -257,6 +270,14 @@ async def to_code(config):
     if conf := config.get(CONF_DEVICE_CAPABILITIES):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_device_capabilities_text(ts))
+
+    if conf := config.get(CONF_AC_FAULT):
+        bs = await binary_sensor.new_binary_sensor(conf)
+        cg.add(var.set_ac_fault_binary(bs))
+
+    if conf := config.get(CONF_AC_ACTIVE_FAULTS):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_ac_active_faults_text(ts))
 
     # Existing optional sensor: pipe temperature
     if pipe := config.get(CONF_PIPE_TEMPERATURE):

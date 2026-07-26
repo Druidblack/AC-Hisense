@@ -190,6 +190,7 @@ void ACHIClimate::setup() {
   update_sleep_program_select_state_();
 #ifdef USE_TEXT_SENSOR
   publish_text_sensor_if_changed_(device_capabilities_text_, "Waiting for 0x66/0x40");
+  publish_text_sensor_if_changed_(ac_active_faults_text_, "Waiting for status");
 #endif
 
   // Remember boot time so the first status poll is delayed after a full power restore.
@@ -1598,6 +1599,112 @@ void ACHIClimate::apply_capability_availability_() {
   publish_state();
 }
 
+
+void ACHIClimate::publish_fault_state_(const std::vector<uint8_t> &b) {
+  if (b.size() <= IDX_FAULT_PROTECT) {
+    ESP_LOGV(TAG, "Status frame too short for complete fault map (%u bytes)",
+             (unsigned) b.size());
+    return;
+  }
+
+  const uint8_t raw_indoor = b[IDX_FAULT_INDOOR];
+  const uint8_t raw_module = b[IDX_FAULT_MODULE];
+  const uint8_t raw_outdoor = b[IDX_FAULT_OUTDOOR];
+
+  // Byte 66 bit 7 is the active +8 C frost-protection mode flag, not a fault.
+  const uint8_t raw_protect = static_cast<uint8_t>(b[IDX_FAULT_PROTECT] & 0x7F);
+  const bool any = (raw_indoor | raw_module | raw_outdoor | raw_protect) != 0;
+  const uint32_t signature = static_cast<uint32_t>(raw_indoor) |
+                             (static_cast<uint32_t>(raw_module) << 8) |
+                             (static_cast<uint32_t>(raw_outdoor) << 16) |
+                             (static_cast<uint32_t>(raw_protect) << 24);
+
+  std::string faults;
+  bool truncated = false;
+  auto append_fault = [&](const char *label) {
+    if (truncated) return;
+    const size_t extra = faults.empty() ? 0 : 2;
+    const size_t label_len = std::char_traits<char>::length(label);
+    if (faults.size() + extra + label_len > 240) {
+      truncated = true;
+      return;
+    }
+    if (!faults.empty()) faults += "; ";
+    faults += label;
+  };
+
+  if (raw_indoor & 0x80) append_fault("Indoor temp sensor");
+  if (raw_indoor & 0x40) append_fault("Indoor coil sensor");
+  if (raw_indoor & 0x20) append_fault("Indoor humidity sensor");
+  if (raw_indoor & 0x10) append_fault("Condensate tray full");
+  if (raw_indoor & 0x08) append_fault("Indoor fan motor");
+  if (raw_indoor & 0x04) append_fault("Grille/drive");
+  if (raw_indoor & 0x02) append_fault("Zero-cross detector");
+  if (raw_indoor & 0x01) append_fault("Indoor/outdoor communication");
+
+  if (raw_module & 0x80) append_fault("Display");
+  if (raw_module & 0x40) append_fault("Keypad");
+  if (raw_module & 0x20) append_fault("Wi-Fi module");
+  if (raw_module & 0x10) append_fault("Indoor electrical module");
+  if (raw_module & 0x08) append_fault("Indoor EEPROM");
+
+  if (raw_outdoor & 0x40) append_fault("Outdoor EEPROM");
+  if (raw_outdoor & 0x20) append_fault("Outdoor coil sensor");
+  if (raw_outdoor & 0x10) append_fault("Compressor discharge sensor");
+  if (raw_outdoor & 0x08) append_fault("Outdoor temp sensor");
+
+  if (raw_protect & 0x10) append_fault("Overheat/overcool protection");
+
+  // Keep unnamed bits visible instead of incorrectly declaring the unit healthy.
+  const uint8_t unknown_module = static_cast<uint8_t>(raw_module & 0x07);
+  const uint8_t unknown_outdoor = static_cast<uint8_t>(raw_outdoor & 0x87);
+  const uint8_t unknown_protect = static_cast<uint8_t>(raw_protect & 0x6F);
+  char unknown[40];
+  if (unknown_module != 0) {
+    snprintf(unknown, sizeof(unknown), "Unknown module bits 0x%02X", unknown_module);
+    append_fault(unknown);
+  }
+  if (unknown_outdoor != 0) {
+    snprintf(unknown, sizeof(unknown), "Unknown outdoor bits 0x%02X", unknown_outdoor);
+    append_fault(unknown);
+  }
+  if (unknown_protect != 0) {
+    snprintf(unknown, sizeof(unknown), "Unknown protection bits 0x%02X", unknown_protect);
+    append_fault(unknown);
+  }
+  if (truncated && faults.size() <= 235) faults += "; ...";
+  if (!any) faults = "OK";
+  else if (faults.empty()) {
+    char raw[80];
+    snprintf(raw, sizeof(raw), "Unknown fault: 39=%02X 40=%02X 64=%02X 66=%02X",
+             raw_indoor, raw_module, raw_outdoor, raw_protect);
+    faults = raw;
+  }
+
+#ifdef USE_BINARY_SENSOR
+  if (ac_fault_binary_ != nullptr && (!fault_state_valid_ || last_fault_any_ != any))
+    ac_fault_binary_->publish_state(any);
+#endif
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(ac_active_faults_text_, faults.c_str());
+#endif
+
+  if (!fault_state_valid_ || signature != last_fault_signature_) {
+    if (any) {
+      ESP_LOGW(TAG, "AC faults: %s (raw39=%02X raw40=%02X raw64=%02X raw66=%02X)",
+               faults.c_str(), raw_indoor, raw_module, raw_outdoor, raw_protect);
+    } else if (fault_state_valid_ && last_fault_any_) {
+      ESP_LOGI(TAG, "AC faults cleared");
+    } else {
+      ESP_LOGD(TAG, "AC fault status: OK");
+    }
+  }
+
+  fault_state_valid_ = true;
+  last_fault_any_ = any;
+  last_fault_signature_ = signature;
+}
+
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   last_status_frame_.assign(b.begin(), b.end());
 
@@ -1606,6 +1713,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     ESP_LOGE(TAG, "Status frame too short (%u), cannot parse fully", (unsigned) b.size());
     return;
   }
+
+  publish_fault_state_(b);
 
   // Power
   power_on_ = (b[IDX_POWER_MODE] & POWER_MASK) != 0;

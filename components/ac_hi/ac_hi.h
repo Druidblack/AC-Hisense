@@ -16,6 +16,9 @@
 #ifdef USE_TEXT_SENSOR
   #include "esphome/components/text_sensor/text_sensor.h"
 #endif
+#ifdef USE_BINARY_SENSOR
+  #include "esphome/components/binary_sensor/binary_sensor.h"
+#endif
 
 #include <vector>
 #include <cstdint>
@@ -120,6 +123,12 @@ enum FrameIndex : uint8_t {
   IDX_PIPE_TEMP = 21,
   IDX_INDOOR_HUMIDITY_SETTING = 22,
   IDX_INDOOR_HUMIDITY = 23,
+
+  // Fault groups in the ordinary long 0x66/0x00 status reply.
+  IDX_FAULT_INDOOR = 39,
+  IDX_FAULT_MODULE = 40,
+  IDX_FAULT_OUTDOOR = 64,
+  IDX_FAULT_PROTECT = 66,
 
   // Write-frame indexes.
   IDX_TX_BEEP = 23,
@@ -282,9 +291,13 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_psram_free_sensor(sensor::Sensor *s) { psram_free_sensor_ = s; }
 #endif
 
+#ifdef USE_BINARY_SENSOR
+  void set_ac_fault_binary(binary_sensor::BinarySensor *b) { ac_fault_binary_ = b; }
+#endif
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
   void set_device_capabilities_text(text_sensor::TextSensor *t) { device_capabilities_text_ = t; }
+  void set_ac_active_faults_text(text_sensor::TextSensor *t) { ac_active_faults_text_ = t; }
 #endif
 
   void setup() override;
@@ -327,6 +340,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void parse_status_102_(const std::vector<uint8_t> &b);
   void parse_capabilities_102_64_(const std::vector<uint8_t> &b);
   void apply_capability_availability_();
+  void publish_fault_state_(const std::vector<uint8_t> &b);
   void handle_ack_101_();
 
   // State management
@@ -587,7 +601,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *power_status_text_{nullptr};
   text_sensor::TextSensor *device_capabilities_text_{nullptr};
+  text_sensor::TextSensor *ac_active_faults_text_{nullptr};
 #endif
+#ifdef USE_BINARY_SENSOR
+  binary_sensor::BinarySensor *ac_fault_binary_{nullptr};
+#endif
+
+  bool fault_state_valid_{false};
+  bool last_fault_any_{false};
+  uint32_t last_fault_signature_{0};
 
   ACHILEDTargetSwitch *led_switch_{nullptr};
   ACHICommandSoundSwitch *sound_switch_{nullptr};
