@@ -4,6 +4,9 @@
 #include <string>
 #include <Arduino.h>
 #include "esphome/core/log.h"
+#ifdef USE_API
+#include "esphome/components/api/api_server.h"
+#endif
 #ifdef USE_MQTT
 #include "esphome/components/mqtt/mqtt_client.h"
 #endif
@@ -139,6 +142,8 @@ void ACHIClimate::setup() {
   // Register custom presets on the Climate entity, not on ClimateTraits.
   // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
   if (enable_presets_) {
+    // Until ProductType is known, expose the complete compatible list. The
+    // 0x66/0x40 reply will remove unsupported custom presets and refresh HA.
     this->set_supported_custom_presets({CUSTOM_PRESET_QUIET, CUSTOM_PRESET_HEAT_8C});
   }
   // Fan Turbo is exposed as a custom fan mode, not as a preset.
@@ -294,6 +299,21 @@ void ACHIClimate::loop() {
     pending_control_ = pending_command_fields_ != CMD_FIELD_NONE;
   }
 
+#ifdef USE_API
+  // Climate traits are entity metadata. After ProductType changes the preset
+  // list, reconnect native API clients once so Home Assistant requests fresh
+  // entity information and removes unsupported presets from its selector.
+  if (capability_api_refresh_pending_ && millis() >= capability_api_refresh_at_ms_) {
+    capability_api_refresh_pending_ = false;
+    if (api::global_api_server != nullptr && api::global_api_server->is_connected()) {
+      ESP_LOGI(TAG, "Refreshing Home Assistant climate capabilities after 0x66/0x40");
+      for (const auto &client : api::global_api_server->active_clients()) {
+        if (client != nullptr) client->on_fatal_error();
+      }
+    }
+  }
+#endif
+
   // 8. Optional memory diagnostics
   publish_memory_diagnostics_();
 }
@@ -314,8 +334,15 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
                                climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
   if (enable_presets_) {
-    t.set_supported_presets({climate::CLIMATE_PRESET_NONE, climate::CLIMATE_PRESET_ECO,
-                             climate::CLIMATE_PRESET_BOOST, climate::CLIMATE_PRESET_SLEEP});
+    climate::ClimatePresetMask presets;
+    presets.insert(climate::CLIMATE_PRESET_NONE);
+    // BOOST and SLEEP do not have reliable ProductType flags in the known
+    // 0x66/0x40 map, so keep them available. ECO has a confirmed flag.
+    if (!capabilities_.valid || capabilities_.power_save)
+      presets.insert(climate::CLIMATE_PRESET_ECO);
+    presets.insert(climate::CLIMATE_PRESET_BOOST);
+    presets.insert(climate::CLIMATE_PRESET_SLEEP);
+    t.set_supported_presets(presets);
   }
   t.set_visual_min_temperature(16);
   t.set_visual_max_temperature(30);
@@ -528,6 +555,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
+    const bool preset_supported =
+        !(p == climate::CLIMATE_PRESET_ECO && capabilities_.valid && !capabilities_.power_save);
+    if (!preset_supported) {
+      ESP_LOGW(TAG, "Ignoring unsupported ECO preset (ProductType power_save=0)");
+    } else {
     bool was_turbo = d_turbo_;
     bool was_eco = d_eco_;
     bool was_heat_8c = d_heat_8c_;
@@ -654,11 +686,16 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     }
 
     changed = true;
+    }  // preset_supported
   }
 
   auto custom = call.get_custom_preset();
   if (!custom.empty()) {
     if (custom == CUSTOM_PRESET_HEAT_8C) {
+      const bool heat8_supported = !capabilities_.valid || capabilities_.heat_8c || capabilities_.enable_8heat;
+      if (!heat8_supported) {
+        ESP_LOGW(TAG, "Ignoring unsupported +8°C preset (ProductType 8heat=0 enable_8heat=0)");
+      } else {
       if (!d_heat_8c_) {
         heat_8c_restore_valid_ = true;
         heat_8c_restore_power_ = d_power_on_;
@@ -690,7 +727,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
                "+8°C requested: HEAT frost protection, command byte[37]=0x03; normal target %u°C preserved",
                (unsigned) d_target_c_);
       changed = true;
+      }  // heat8_supported
     } else if (custom == CUSTOM_PRESET_QUIET) {
+      if (capabilities_.valid && !capabilities_.fan_mute) {
+        ESP_LOGW(TAG, "Ignoring unsupported Quiet preset (ProductType fan_mute=0)");
+      } else {
       sleep_restore_fan_valid_ = false;
       d_heat_8c_ = false;
       heat_8c_restore_valid_ = false;
@@ -701,6 +742,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_fan_turbo_ = false;
       d_fan_ = climate::CLIMATE_FAN_QUIET;
       changed = true;
+      }  // Quiet supported
     }
   }
 
@@ -764,11 +806,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   publish_fan_state_(d_fan_turbo_, d_fan_);
   this->swing_mode = d_swing_;
   if (enable_presets_) {
-    if (d_heat_8c_) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+    if (d_heat_8c_ && (!capabilities_.valid || capabilities_.heat_8c || capabilities_.enable_8heat)) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
     else if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
-    else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+    else if (d_eco_ && (!capabilities_.valid || capabilities_.power_save)) this->set_preset_(climate::CLIMATE_PRESET_ECO);
     else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
-    else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+    else if (d_quiet_ && (!capabilities_.valid || capabilities_.fan_mute)) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
     else this->set_preset_(climate::CLIMATE_PRESET_NONE);
   }
   publish_state();
@@ -1472,6 +1514,7 @@ void ACHIClimate::parse_capabilities_102_64_(const std::vector<uint8_t> &b) {
   caps.reply_len = static_cast<uint8_t>(std::min<size_t>(b.size(), 255));
   caps.valid = true;
   capabilities_ = caps;
+  apply_capability_availability_();
 
   ESP_LOGI(TAG,
            "Capabilities 0x66/0x40 parsed (%uB): heat=%u eco=%u quiet=%u 8heat=%u "
@@ -1508,6 +1551,51 @@ void ACHIClimate::parse_capabilities_102_64_(const std::vector<uint8_t> &b) {
   }
   publish_text_sensor_if_changed_(device_capabilities_text_, summary);
 #endif
+}
+
+void ACHIClimate::apply_capability_availability_() {
+  if (!capabilities_.valid) return;
+
+  const bool quiet_supported = capabilities_.fan_mute;
+  const bool heat8_supported = capabilities_.heat_8c || capabilities_.enable_8heat;
+
+  if (enable_presets_) {
+    // Replacing the custom-preset vector can invalidate the active pointer, so
+    // clear it first and then restore only a supported actual preset.
+    this->clear_custom_preset_();
+    std::vector<const char *> custom_presets;
+    if (quiet_supported) custom_presets.push_back(CUSTOM_PRESET_QUIET);
+    if (heat8_supported) custom_presets.push_back(CUSTOM_PRESET_HEAT_8C);
+    this->set_supported_custom_presets(custom_presets);
+
+    if (heat_8c_ && heat8_supported) {
+      this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+    } else if (quiet_ && quiet_supported && sleep_stage_ == 0) {
+      this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+    }
+  }
+
+#ifdef USE_SENSOR
+  if (!capabilities_.humidity) {
+    // Keep both entities registered, but make them unavailable in Home
+    // Assistant instead of reporting the protocol marker 0x80 as 128%.
+    if (indoor_humidity_setting_sensor_ != nullptr)
+      indoor_humidity_setting_sensor_->publish_state(NAN);
+    if (indoor_humidity_sensor_ != nullptr)
+      indoor_humidity_sensor_->publish_state(NAN);
+  }
+#endif
+
+  const bool preset_list_changed =
+      !capabilities_.power_save || !quiet_supported || !heat8_supported;
+#ifdef USE_API
+  if (preset_list_changed) {
+    capability_api_refresh_pending_ = true;
+    capability_api_refresh_at_ms_ = millis() + 750;
+  }
+#endif
+
+  publish_state();
 }
 
 void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
@@ -1940,10 +2028,20 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   }
   publish_sensor_if_changed_(compressor_exhaust_temp_sensor_,
                              static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
-  publish_sensor_if_changed_(indoor_humidity_setting_sensor_,
-                             static_cast<float>(b[IDX_INDOOR_HUMIDITY_SETTING]));
-  publish_sensor_if_changed_(indoor_humidity_sensor_,
-                             static_cast<float>(b[IDX_INDOOR_HUMIDITY]));
+  // Humidity entities always exist, but their availability follows the
+  // ProductType reply. Before capabilities are known, leave them unavailable.
+  if (capabilities_.valid && capabilities_.humidity) {
+    const uint8_t humidity_setting = b[IDX_INDOOR_HUMIDITY_SETTING];
+    const uint8_t humidity = b[IDX_INDOOR_HUMIDITY];
+    if (humidity_setting <= 100)
+      publish_sensor_if_changed_(indoor_humidity_setting_sensor_, static_cast<float>(humidity_setting));
+    else if (indoor_humidity_setting_sensor_ != nullptr)
+      indoor_humidity_setting_sensor_->publish_state(NAN);
+    if (humidity <= 100)
+      publish_sensor_if_changed_(indoor_humidity_sensor_, static_cast<float>(humidity));
+    else if (indoor_humidity_sensor_ != nullptr)
+      indoor_humidity_sensor_->publish_state(NAN);
+  }
 
 #endif
 
@@ -2061,11 +2159,11 @@ void ACHIClimate::publish_gated_state_() {
     publish_fan_state_(out_fan_turbo || out_turbo, out_fan);
     this->swing_mode = swing_;
     if (enable_presets_) {
-      if (out_heat_8c) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+      if (out_heat_8c && (!capabilities_.valid || capabilities_.heat_8c || capabilities_.enable_8heat)) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
       else if (out_turbo) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
-      else if (out_eco) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+      else if (out_eco && (!capabilities_.valid || capabilities_.power_save)) this->set_preset_(climate::CLIMATE_PRESET_ECO);
       else if (out_sleep_stage > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
-      else if (out_quiet) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+      else if (out_quiet && (!capabilities_.valid || capabilities_.fan_mute)) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
     // Sync desired with the effective published state, not only with raw flags.
@@ -2103,11 +2201,11 @@ void ACHIClimate::publish_gated_state_() {
     }
     this->swing_mode = d_swing_;
     if (enable_presets_) {
-      if (d_heat_8c_) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
+      if (d_heat_8c_ && (!capabilities_.valid || capabilities_.heat_8c || capabilities_.enable_8heat)) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
       else if (d_turbo_) this->set_preset_(climate::CLIMATE_PRESET_BOOST);
-      else if (d_eco_) this->set_preset_(climate::CLIMATE_PRESET_ECO);
+      else if (d_eco_ && (!capabilities_.valid || capabilities_.power_save)) this->set_preset_(climate::CLIMATE_PRESET_ECO);
       else if (sleep_stage_ > 0) this->set_preset_(climate::CLIMATE_PRESET_SLEEP);
-      else if (d_quiet_) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
+      else if (d_quiet_ && (!capabilities_.valid || capabilities_.fan_mute)) this->set_custom_preset_(CUSTOM_PRESET_QUIET);
       else this->set_preset_(climate::CLIMATE_PRESET_NONE);
     }
   }

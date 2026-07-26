@@ -326,6 +326,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void handle_frame_(const std::vector<uint8_t> &frame);
   void parse_status_102_(const std::vector<uint8_t> &b);
   void parse_capabilities_102_64_(const std::vector<uint8_t> &b);
+  void apply_capability_availability_();
   void handle_ack_101_();
 
   // State management
@@ -390,6 +391,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHIDeviceCapabilities capabilities_{};
   uint8_t capabilities_attempts_{0};
   uint32_t capabilities_next_attempt_ms_{0};
+#ifdef USE_API
+  bool capability_api_refresh_pending_{false};
+  uint32_t capability_api_refresh_at_ms_{0};
+#endif
 
   // Pending control from HA (debounced). pending_command_fields_ contains
   // exactly the action fields that will be written; all other 0x65 payload
