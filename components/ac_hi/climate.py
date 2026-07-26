@@ -133,19 +133,16 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         unit_of_measurement="Hz",
         accuracy_decimals=0,
         icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
     cv.Optional(CONF_COMP_FR_SET, default={CONF_NAME: "Compressor Frequency Set"}): sensor.sensor_schema(
         unit_of_measurement="Hz",
         accuracy_decimals=0,
         icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
     cv.Optional(CONF_COMP_FR_COMMAND, default={CONF_NAME: "Compressor Frequency Command"}): sensor.sensor_schema(
         unit_of_measurement="Hz",
         accuracy_decimals=0,
         icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
     # Legacy byte-43 frequency entity is also created because existing dashboards
     # may still use it alongside the three explicitly mapped frequency sensors.
@@ -153,7 +150,6 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         unit_of_measurement="Hz",
         accuracy_decimals=0,
         icon="mdi:sine-wave",
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
     cv.Optional(CONF_OUTDOOR_TEMP, default={CONF_NAME: "Temperature Outdoor"}): sensor.sensor_schema(
         unit_of_measurement="°C",
