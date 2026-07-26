@@ -58,6 +58,16 @@ struct ACHIDeviceCapabilities {
   uint8_t reply_len{0};
 };
 
+struct ACHITimerState {
+  bool known{false};
+  bool active{false};
+  uint16_t initial_minutes{0};
+  uint16_t last_published_remaining{0xFFFF};
+  uint16_t last_event_signature{0};
+  uint32_t started_ms{0};
+  uint32_t last_event_ms{0};
+};
+
 enum ACHIIFeelMqttPayloadFormat : uint8_t {
   IFEEL_MQTT_PAYLOAD_HEX = 0,
   IFEEL_MQTT_PAYLOAD_JSON = 1,
@@ -123,6 +133,14 @@ enum FrameIndex : uint8_t {
   IDX_PIPE_TEMP = 21,
   IDX_INDOOR_HUMIDITY_SETTING = 22,
   IDX_INDOOR_HUMIDITY = 23,
+
+  // Relative onboard timers in the ordinary 0x66/0x00 status reply.
+  // ON timer: hour in byte 30 bits 7..3, minute in byte 31 bits 7..2,
+  // active flag in byte 31 bit 0. OFF timer uses bytes 32 and 33.
+  IDX_ON_TIMER_HOUR = 30,
+  IDX_ON_TIMER_MINUTE_STATUS = 31,
+  IDX_OFF_TIMER_HOUR = 32,
+  IDX_OFF_TIMER_MINUTE_STATUS = 33,
 
   // Fault groups in the ordinary long 0x66/0x00 status reply.
   IDX_FAULT_INDOOR = 39,
@@ -225,6 +243,7 @@ static constexpr uint8_t  CAPABILITIES_MAX_ATTEMPTS = 3;
 static constexpr uint32_t CAPABILITIES_RETRY_MS = 10000;
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
+static constexpr uint32_t TIMER_REPEAT_EVENT_WINDOW_MS = 15000;
 static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
 static constexpr uint16_t MAX_UART_BYTES_PER_LOOP = 128;  // keep API/Wi-Fi responsive during UART bursts
 
@@ -279,6 +298,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_compressor_exhaust_temp_sensor(sensor::Sensor *s) { compressor_exhaust_temp_sensor_ = s; }
   void set_indoor_humidity_setting_sensor(sensor::Sensor *s) { indoor_humidity_setting_sensor_ = s; }
   void set_indoor_humidity_sensor(sensor::Sensor *s) { indoor_humidity_sensor_ = s; }
+  void set_power_on_timer_remaining_sensor(sensor::Sensor *s) { power_on_timer_remaining_sensor_ = s; }
+  void set_power_off_timer_remaining_sensor(sensor::Sensor *s) { power_off_timer_remaining_sensor_ = s; }
 
   // Memory diagnostics sensors (optional)
   void set_heap_free_sensor(sensor::Sensor *s) { heap_free_sensor_ = s; }
@@ -293,11 +314,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
 #ifdef USE_BINARY_SENSOR
   void set_ac_fault_binary(binary_sensor::BinarySensor *b) { ac_fault_binary_ = b; }
+  void set_power_on_timer_active_binary(binary_sensor::BinarySensor *b) { power_on_timer_active_binary_ = b; }
+  void set_power_off_timer_active_binary(binary_sensor::BinarySensor *b) { power_off_timer_active_binary_ = b; }
 #endif
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
   void set_device_capabilities_text(text_sensor::TextSensor *t) { device_capabilities_text_ = t; }
   void set_ac_active_faults_text(text_sensor::TextSensor *t) { ac_active_faults_text_ = t; }
+  void set_power_on_timer_text(text_sensor::TextSensor *t) { power_on_timer_text_ = t; }
+  void set_power_off_timer_text(text_sensor::TextSensor *t) { power_off_timer_text_ = t; }
 #endif
 
   void setup() override;
@@ -341,6 +366,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void parse_capabilities_102_64_(const std::vector<uint8_t> &b);
   void apply_capability_availability_();
   void publish_fault_state_(const std::vector<uint8_t> &b);
+  void parse_timer_status_(const std::vector<uint8_t> &b);
+  void process_timer_event_(ACHITimerState &state, const char *name, uint8_t raw_hour,
+                            uint8_t raw_minute_status);
+  void publish_timer_state_(ACHITimerState &state, bool power_on_timer);
+  void update_timer_countdowns_();
   void handle_ack_101_();
 
   // State management
@@ -587,6 +617,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *compressor_exhaust_temp_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_setting_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_sensor_{nullptr};
+  sensor::Sensor *power_on_timer_remaining_sensor_{nullptr};
+  sensor::Sensor *power_off_timer_remaining_sensor_{nullptr};
 
   // Memory diagnostics
   sensor::Sensor *heap_free_sensor_{nullptr};
@@ -602,14 +634,21 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   text_sensor::TextSensor *power_status_text_{nullptr};
   text_sensor::TextSensor *device_capabilities_text_{nullptr};
   text_sensor::TextSensor *ac_active_faults_text_{nullptr};
+  text_sensor::TextSensor *power_on_timer_text_{nullptr};
+  text_sensor::TextSensor *power_off_timer_text_{nullptr};
 #endif
 #ifdef USE_BINARY_SENSOR
   binary_sensor::BinarySensor *ac_fault_binary_{nullptr};
+  binary_sensor::BinarySensor *power_on_timer_active_binary_{nullptr};
+  binary_sensor::BinarySensor *power_off_timer_active_binary_{nullptr};
 #endif
 
   bool fault_state_valid_{false};
   bool last_fault_any_{false};
   uint32_t last_fault_signature_{0};
+
+  ACHITimerState power_on_timer_state_{};
+  ACHITimerState power_off_timer_state_{};
 
   ACHILEDTargetSwitch *led_switch_{nullptr};
   ACHICommandSoundSwitch *sound_switch_{nullptr};

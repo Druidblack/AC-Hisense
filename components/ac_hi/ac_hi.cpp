@@ -191,6 +191,8 @@ void ACHIClimate::setup() {
 #ifdef USE_TEXT_SENSOR
   publish_text_sensor_if_changed_(device_capabilities_text_, "Waiting for 0x66/0x40");
   publish_text_sensor_if_changed_(ac_active_faults_text_, "Waiting for status");
+  publish_text_sensor_if_changed_(power_on_timer_text_, "Waiting for timer event");
+  publish_text_sensor_if_changed_(power_off_timer_text_, "Waiting for timer event");
 #endif
 
   // Remember boot time so the first status poll is delayed after a full power restore.
@@ -315,7 +317,11 @@ void ACHIClimate::loop() {
   }
 #endif
 
-  // 8. Optional memory diagnostics
+  // 8. Keep locally latched relative timers counting down. The indoor unit
+  // announces timer changes only briefly and then returns zero in these bytes.
+  update_timer_countdowns_();
+
+  // 9. Optional memory diagnostics
   publish_memory_diagnostics_();
 }
 
@@ -1600,6 +1606,120 @@ void ACHIClimate::apply_capability_availability_() {
 }
 
 
+void ACHIClimate::process_timer_event_(ACHITimerState &state, const char *name,
+                                            uint8_t raw_hour, uint8_t raw_minute_status) {
+  // The timer fields are bit-packed MSB first. This explains the verified
+  // 1-hour sample 0x0B/0x01: 0x0B >> 3 = 1 hour, 0x01 >> 2 = 0 minutes,
+  // and bit 0 = enabled.
+  const uint8_t hours = static_cast<uint8_t>((raw_hour >> 3) & 0x1F);
+  const uint8_t minutes = static_cast<uint8_t>((raw_minute_status >> 2) & 0x3F);
+  const bool enabled = (raw_minute_status & 0x01) != 0;
+  const uint16_t signature = static_cast<uint16_t>(raw_hour) << 8 | raw_minute_status;
+  const bool frame_contains_event = raw_hour != 0 || raw_minute_status != 0;
+
+  // Zeroes are ordinary status silence after the event was announced. Do not
+  // clear a latched timer merely because subsequent polls contain 00/00.
+  if (!frame_contains_event) return;
+
+  const uint32_t now = millis();
+  const uint16_t total_minutes = static_cast<uint16_t>(hours) * 60u + minutes;
+
+  // An enabled marker with zero duration is treated as an explicit clear or an
+  // already expired timer. It is safer than leaving a stale countdown active.
+  if (!enabled || total_minutes == 0 || minutes > 59) {
+    const bool changed = !state.known || state.active;
+    state.known = true;
+    state.active = false;
+    state.initial_minutes = 0;
+    state.last_published_remaining = 0xFFFF;
+    state.last_event_signature = signature;
+    state.last_event_ms = now;
+    if (changed) ESP_LOGI(TAG, "%s timer disabled (raw=%02X/%02X)", name, raw_hour, raw_minute_status);
+    return;
+  }
+
+  // The same event is normally repeated for about three status frames. Avoid
+  // restarting the countdown for those repeats, while still allowing the user
+  // to set the same duration again later.
+  const bool repeated_announcement = state.known && state.active &&
+      state.last_event_signature == signature &&
+      now - state.last_event_ms <= TIMER_REPEAT_EVENT_WINDOW_MS;
+  state.last_event_ms = now;
+  if (repeated_announcement) return;
+
+  state.known = true;
+  state.active = true;
+  state.initial_minutes = total_minutes;
+  state.started_ms = now;
+  state.last_published_remaining = 0xFFFF;
+  state.last_event_signature = signature;
+  ESP_LOGI(TAG, "%s timer captured: %02u:%02u remaining (raw=%02X/%02X)",
+           name, hours, minutes, raw_hour, raw_minute_status);
+}
+
+void ACHIClimate::publish_timer_state_(ACHITimerState &state, bool power_on_timer) {
+  if (!state.known) return;
+
+  uint16_t remaining = 0;
+  if (state.active) {
+    const uint32_t elapsed_minutes = (millis() - state.started_ms) / 60000u;
+    remaining = elapsed_minutes >= state.initial_minutes
+                    ? 0
+                    : static_cast<uint16_t>(state.initial_minutes - elapsed_minutes);
+    if (remaining == 0) {
+      state.active = false;
+      ESP_LOGI(TAG, "%s timer countdown expired locally",
+               power_on_timer ? "Power-on" : "Power-off");
+    }
+  }
+
+  if (state.last_published_remaining == remaining &&
+      !(remaining == 0 && state.last_published_remaining == 0xFFFF)) {
+    return;
+  }
+  state.last_published_remaining = remaining;
+
+#ifdef USE_SENSOR
+  sensor::Sensor *remaining_sensor = power_on_timer
+      ? power_on_timer_remaining_sensor_
+      : power_off_timer_remaining_sensor_;
+  publish_sensor_if_changed_(remaining_sensor, static_cast<float>(remaining));
+#endif
+#ifdef USE_BINARY_SENSOR
+  binary_sensor::BinarySensor *active_sensor = power_on_timer
+      ? power_on_timer_active_binary_
+      : power_off_timer_active_binary_;
+  if (active_sensor != nullptr) active_sensor->publish_state(state.active);
+#endif
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *text = power_on_timer ? power_on_timer_text_ : power_off_timer_text_;
+  if (state.active) {
+    char value[40];
+    snprintf(value, sizeof(value), "%02u:%02u remaining",
+             static_cast<unsigned>(remaining / 60), static_cast<unsigned>(remaining % 60));
+    publish_text_sensor_if_changed_(text, value);
+  } else {
+    publish_text_sensor_if_changed_(text, "Disabled");
+  }
+#endif
+}
+
+void ACHIClimate::parse_timer_status_(const std::vector<uint8_t> &b) {
+  if (b.size() <= IDX_OFF_TIMER_MINUTE_STATUS) return;
+
+  process_timer_event_(power_on_timer_state_, "Power-on",
+                       b[IDX_ON_TIMER_HOUR], b[IDX_ON_TIMER_MINUTE_STATUS]);
+  process_timer_event_(power_off_timer_state_, "Power-off",
+                       b[IDX_OFF_TIMER_HOUR], b[IDX_OFF_TIMER_MINUTE_STATUS]);
+  publish_timer_state_(power_on_timer_state_, true);
+  publish_timer_state_(power_off_timer_state_, false);
+}
+
+void ACHIClimate::update_timer_countdowns_() {
+  publish_timer_state_(power_on_timer_state_, true);
+  publish_timer_state_(power_off_timer_state_, false);
+}
+
 void ACHIClimate::publish_fault_state_(const std::vector<uint8_t> &b) {
   if (b.size() <= IDX_FAULT_PROTECT) {
     ESP_LOGV(TAG, "Status frame too short for complete fault map (%u bytes)",
@@ -1714,6 +1834,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     return;
   }
 
+  parse_timer_status_(b);
   publish_fault_state_(b);
 
   // Power

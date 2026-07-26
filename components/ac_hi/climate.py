@@ -52,6 +52,12 @@ CONF_POWER_STATUS = "power_status"
 CONF_DEVICE_CAPABILITIES = "device_capabilities"
 CONF_AC_FAULT = "ac_fault"
 CONF_AC_ACTIVE_FAULTS = "ac_active_faults"
+CONF_POWER_ON_TIMER_REMAINING = "power_on_timer_remaining"
+CONF_POWER_OFF_TIMER_REMAINING = "power_off_timer_remaining"
+CONF_POWER_ON_TIMER_ACTIVE = "power_on_timer_active"
+CONF_POWER_OFF_TIMER_ACTIVE = "power_off_timer_active"
+CONF_POWER_ON_TIMER_TEXT = "power_on_timer"
+CONF_POWER_OFF_TIMER_TEXT = "power_off_timer"
 CONF_COMP_FR_ACTUAL = "compressor_frequency_actual"
 CONF_COMP_FR_SET = "compressor_frequency_set"
 CONF_COMP_FR_COMMAND = "compressor_frequency_command"
@@ -171,6 +177,31 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     # controls their availability when the unit has no humidity hardware.
     cv.Optional(CONF_INDOOR_HUMIDITY_SETTING, default={CONF_NAME: "Indoor Humidity Setting"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
     cv.Optional(CONF_INDOOR_HUMIDITY, default={CONF_NAME: "Indoor Humidity"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
+
+    # Relative onboard timers. The status announcement is transient, so the
+    # component latches the last event and counts it down locally.
+    cv.Optional(CONF_POWER_ON_TIMER_REMAINING, default={CONF_NAME: "Power-on Timer Remaining"}): sensor.sensor_schema(
+        unit_of_measurement="min",
+        accuracy_decimals=0,
+        icon="mdi:timer-play-outline",
+    ),
+    cv.Optional(CONF_POWER_OFF_TIMER_REMAINING, default={CONF_NAME: "Power-off Timer Remaining"}): sensor.sensor_schema(
+        unit_of_measurement="min",
+        accuracy_decimals=0,
+        icon="mdi:timer-stop-outline",
+    ),
+    cv.Optional(CONF_POWER_ON_TIMER_ACTIVE, default={CONF_NAME: "Power-on Timer Active"}): binary_sensor.binary_sensor_schema(
+        icon="mdi:timer-play-outline",
+    ),
+    cv.Optional(CONF_POWER_OFF_TIMER_ACTIVE, default={CONF_NAME: "Power-off Timer Active"}): binary_sensor.binary_sensor_schema(
+        icon="mdi:timer-stop-outline",
+    ),
+    cv.Optional(CONF_POWER_ON_TIMER_TEXT, default={CONF_NAME: "Power-on Timer"}): text_sensor.text_sensor_schema(
+        icon="mdi:timer-play-outline",
+    ),
+    cv.Optional(CONF_POWER_OFF_TIMER_TEXT, default={CONF_NAME: "Power-off Timer"}): text_sensor.text_sensor_schema(
+        icon="mdi:timer-stop-outline",
+    ),
 
     # Compact fault exposure from the ordinary long 0x66/0x00 status reply.
     cv.Optional(CONF_AC_FAULT, default={CONF_NAME: "AC Fault"}): binary_sensor.binary_sensor_schema(
@@ -332,6 +363,13 @@ async def to_code(config):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_indoor_humidity_sensor(sens))
 
+    if conf := config.get(CONF_POWER_ON_TIMER_REMAINING):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_power_on_timer_remaining_sensor(sens))
+    if conf := config.get(CONF_POWER_OFF_TIMER_REMAINING):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_power_off_timer_remaining_sensor(sens))
+
     # Built-in text sensor for power status
     if conf := config.get(CONF_POWER_STATUS):
         ts = await text_sensor.new_text_sensor(conf)
@@ -348,6 +386,19 @@ async def to_code(config):
     if conf := config.get(CONF_AC_ACTIVE_FAULTS):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_ac_active_faults_text(ts))
+
+    if conf := config.get(CONF_POWER_ON_TIMER_ACTIVE):
+        bs = await binary_sensor.new_binary_sensor(conf)
+        cg.add(var.set_power_on_timer_active_binary(bs))
+    if conf := config.get(CONF_POWER_OFF_TIMER_ACTIVE):
+        bs = await binary_sensor.new_binary_sensor(conf)
+        cg.add(var.set_power_off_timer_active_binary(bs))
+    if conf := config.get(CONF_POWER_ON_TIMER_TEXT):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_power_on_timer_text(ts))
+    if conf := config.get(CONF_POWER_OFF_TIMER_TEXT):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_power_off_timer_text(ts))
 
     # Built-in pipe temperature sensor
     if pipe := config.get(CONF_PIPE_TEMPERATURE):
