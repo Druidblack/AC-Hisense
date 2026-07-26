@@ -244,6 +244,10 @@ static constexpr uint32_t CAPABILITIES_RETRY_MS = 10000;
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t TIMER_REPEAT_EVENT_WINDOW_MS = 15000;
+// Active timer announcements are repeated by the indoor unit. If ordinary
+// status replies keep arriving with 00/00 for longer than this interval, the
+// timer was cancelled from the physical remote (or expired in the unit).
+static constexpr uint32_t TIMER_STATUS_REFRESH_TIMEOUT_MS = 75000;
 static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
 static constexpr uint16_t MAX_UART_BYTES_PER_LOOP = 128;  // keep API/Wi-Fi responsive during UART bursts
 
@@ -370,6 +374,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void process_timer_event_(ACHITimerState &state, const char *name, uint8_t raw_hour,
                             uint8_t raw_minute_status);
   void publish_timer_state_(ACHITimerState &state, bool power_on_timer);
+  void clear_timer_after_silence_(ACHITimerState &state, const char *name,
+                                  uint8_t raw_hour, uint8_t raw_minute_status);
   void update_timer_countdowns_();
   void handle_ack_101_();
 

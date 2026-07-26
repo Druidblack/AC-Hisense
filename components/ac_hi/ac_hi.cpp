@@ -1657,6 +1657,28 @@ void ACHIClimate::process_timer_event_(ACHITimerState &state, const char *name,
            name, hours, minutes, raw_hour, raw_minute_status);
 }
 
+void ACHIClimate::clear_timer_after_silence_(ACHITimerState &state, const char *name,
+                                                   uint8_t raw_hour, uint8_t raw_minute_status) {
+  // 00/00 is used both as ordinary status silence and after a physical-remote
+  // cancellation, so a single zero frame cannot clear a timer. The indoor
+  // unit refreshes an active timer periodically (observed about every 32 s).
+  // If valid status frames continue but no non-zero refresh arrives for more
+  // than 75 s, consider the timer cancelled/expired in the indoor unit.
+  if (!state.known || !state.active) return;
+  if (raw_hour != 0 || raw_minute_status != 0) return;
+  if (state.last_event_ms == 0) return;
+
+  const uint32_t silent_ms = millis() - state.last_event_ms;
+  if (silent_ms <= TIMER_STATUS_REFRESH_TIMEOUT_MS) return;
+
+  state.active = false;
+  state.initial_minutes = 0;
+  state.last_published_remaining = 0xFFFF;
+  state.last_event_signature = 0;
+  ESP_LOGI(TAG, "%s timer disabled after %.1fs without a status refresh (raw=00/00)",
+           name, silent_ms / 1000.0f);
+}
+
 void ACHIClimate::publish_timer_state_(ACHITimerState &state, bool power_on_timer) {
   if (!state.known) return;
 
@@ -1707,10 +1729,17 @@ void ACHIClimate::publish_timer_state_(ACHITimerState &state, bool power_on_time
 void ACHIClimate::parse_timer_status_(const std::vector<uint8_t> &b) {
   if (b.size() <= IDX_OFF_TIMER_MINUTE_STATUS) return;
 
-  process_timer_event_(power_on_timer_state_, "Power-on",
-                       b[IDX_ON_TIMER_HOUR], b[IDX_ON_TIMER_MINUTE_STATUS]);
-  process_timer_event_(power_off_timer_state_, "Power-off",
-                       b[IDX_OFF_TIMER_HOUR], b[IDX_OFF_TIMER_MINUTE_STATUS]);
+  const uint8_t on_hour = b[IDX_ON_TIMER_HOUR];
+  const uint8_t on_minute_status = b[IDX_ON_TIMER_MINUTE_STATUS];
+  const uint8_t off_hour = b[IDX_OFF_TIMER_HOUR];
+  const uint8_t off_minute_status = b[IDX_OFF_TIMER_MINUTE_STATUS];
+
+  process_timer_event_(power_on_timer_state_, "Power-on", on_hour, on_minute_status);
+  process_timer_event_(power_off_timer_state_, "Power-off", off_hour, off_minute_status);
+
+  clear_timer_after_silence_(power_on_timer_state_, "Power-on", on_hour, on_minute_status);
+  clear_timer_after_silence_(power_off_timer_state_, "Power-off", off_hour, off_minute_status);
+
   publish_timer_state_(power_on_timer_state_, true);
   publish_timer_state_(power_off_timer_state_, false);
 }
