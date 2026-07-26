@@ -84,24 +84,92 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_IFEEL_MQTT_QOS, default=0): cv.one_of(0, 1, 2, int=True),
     cv.Optional(CONF_IFEEL_MQTT_RETAIN, default=False): cv.boolean,
 
-    # Optional sensors (existing)
-    cv.Optional(CONF_SET_TEMPERATURE): sensor.sensor_schema(),
-    cv.Optional(CONF_ROOM_TEMPERATURE): sensor.sensor_schema(),
-    cv.Optional(CONF_WIND): sensor.sensor_schema(),
-    cv.Optional(CONF_SLEEP_STAGE): sensor.sensor_schema(),
-    cv.Optional(CONF_MODE_CODE): sensor.sensor_schema(),
-    cv.Optional(CONF_QUIET): sensor.sensor_schema(),
-    cv.Optional(CONF_TURBO): sensor.sensor_schema(),
-    cv.Optional(CONF_ECONOMY): sensor.sensor_schema(),
-    cv.Optional(CONF_SWING_UD): sensor.sensor_schema(),
-    cv.Optional(CONF_SWING_LR): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR_ACTUAL): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR_SET): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR_COMMAND): sensor.sensor_schema(),
-    cv.Optional(CONF_COMP_FR): sensor.sensor_schema(),
-    cv.Optional(CONF_OUTDOOR_TEMP): sensor.sensor_schema(),
-    cv.Optional(CONF_OUTDOOR_COND_TEMP): sensor.sensor_schema(),
-    cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): sensor.sensor_schema(),
+    # Core status entities are created by default. Keeping the YAML keys
+    # optional preserves backwards compatibility: an explicitly supplied block
+    # overrides the built-in name/icon/category instead of creating a duplicate.
+    cv.Optional(CONF_SET_TEMPERATURE, default={CONF_NAME: "Temperature Set"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:thermometer-check",
+    ),
+    cv.Optional(CONF_ROOM_TEMPERATURE, default={CONF_NAME: "Temperature Current"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:home-thermometer",
+    ),
+    cv.Optional(CONF_WIND, default={CONF_NAME: "Wind Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:fan",
+    ),
+    cv.Optional(CONF_SLEEP_STAGE, default={CONF_NAME: "Sleep Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:sleep",
+    ),
+    cv.Optional(CONF_MODE_CODE, default={CONF_NAME: "AC Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:air-conditioner",
+    ),
+    cv.Optional(CONF_QUIET, default={CONF_NAME: "Quiet Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:fan-off",
+    ),
+    cv.Optional(CONF_TURBO, default={CONF_NAME: "Turbo Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:flash",
+    ),
+    cv.Optional(CONF_ECONOMY, default={CONF_NAME: "Economy Mode Code"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:leaf",
+    ),
+    cv.Optional(CONF_SWING_UD, default={CONF_NAME: "Swing Up-Down"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:unfold-more-horizontal",
+    ),
+    cv.Optional(CONF_SWING_LR, default={CONF_NAME: "Swing Left-Right"}): sensor.sensor_schema(
+        accuracy_decimals=0,
+        icon="mdi:unfold-more-vertical",
+    ),
+    cv.Optional(CONF_COMP_FR_ACTUAL, default={CONF_NAME: "Compressor Frequency Actual"}): sensor.sensor_schema(
+        unit_of_measurement="Hz",
+        accuracy_decimals=0,
+        icon="mdi:sine-wave",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    cv.Optional(CONF_COMP_FR_SET, default={CONF_NAME: "Compressor Frequency Set"}): sensor.sensor_schema(
+        unit_of_measurement="Hz",
+        accuracy_decimals=0,
+        icon="mdi:sine-wave",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    cv.Optional(CONF_COMP_FR_COMMAND, default={CONF_NAME: "Compressor Frequency Command"}): sensor.sensor_schema(
+        unit_of_measurement="Hz",
+        accuracy_decimals=0,
+        icon="mdi:sine-wave",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    # Legacy byte-43 frequency entity is also created because existing dashboards
+    # may still use it alongside the three explicitly mapped frequency sensors.
+    cv.Optional(CONF_COMP_FR, default={CONF_NAME: "Compressor Frequency"}): sensor.sensor_schema(
+        unit_of_measurement="Hz",
+        accuracy_decimals=0,
+        icon="mdi:sine-wave",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    cv.Optional(CONF_OUTDOOR_TEMP, default={CONF_NAME: "Temperature Outdoor"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:thermometer",
+    ),
+    cv.Optional(CONF_OUTDOOR_COND_TEMP, default={CONF_NAME: "Temperature Outdoor Condenser"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:thermometer",
+    ),
+    cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP, default={CONF_NAME: "Compressor Exhaust Temperature"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:thermometer",
+    ),
 
     # Humidity entities are normal measurement sensors. ProductType still
     # controls their availability when the unit has no humidity hardware.
@@ -118,17 +186,23 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
 
-    # Power status is a text sensor ("ON"/"OFF")
-    cv.Optional(CONF_POWER_STATUS): text_sensor.text_sensor_schema(),
+    # Power status is created by default as a text sensor ("ON"/"OFF").
+    cv.Optional(CONF_POWER_STATUS, default={CONF_NAME: "Power Status"}): text_sensor.text_sensor_schema(
+        icon="mdi:power",
+    ),
     # Compact summary of the per-unit ProductType capability reply.
     cv.Optional(CONF_DEVICE_CAPABILITIES, default={CONF_NAME: "Device Capabilities"}): text_sensor.text_sensor_schema(
         icon="mdi:feature-search-outline",
         entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
 
-    # Existing optional sensor and LED switch
-    cv.Optional(CONF_PIPE_TEMPERATURE): sensor.sensor_schema(),
-    cv.Optional(CONF_LED_SWITCH): switch.switch_schema(
+    # Pipe temperature and LED control are also built in by default.
+    cv.Optional(CONF_PIPE_TEMPERATURE, default={CONF_NAME: "Temperature Pipe"}): sensor.sensor_schema(
+        unit_of_measurement="°C",
+        accuracy_decimals=0,
+        icon="mdi:coolant-temperature",
+    ),
+    cv.Optional(CONF_LED_SWITCH, default={CONF_NAME: "AC LED"}): switch.switch_schema(
         ACHILEDTargetSwitch,
         icon=ICON_LIGHTBULB,
         entity_category=ENTITY_CATEGORY_CONFIG,
@@ -185,7 +259,7 @@ async def to_code(config):
     cg.add(var.set_ifeel_mqtt_qos(config[CONF_IFEEL_MQTT_QOS]))
     cg.add(var.set_ifeel_mqtt_retain(config[CONF_IFEEL_MQTT_RETAIN]))
 
-    # Optional numeric sensors (existing)
+    # Core numeric sensors (built in by default, YAML-overridable)
     if conf := config.get(CONF_SET_TEMPERATURE):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_set_temperature_sensor(sens))
@@ -262,7 +336,7 @@ async def to_code(config):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_indoor_humidity_sensor(sens))
 
-    # Optional text sensor for power status
+    # Built-in text sensor for power status
     if conf := config.get(CONF_POWER_STATUS):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_power_status_text(ts))
@@ -279,12 +353,12 @@ async def to_code(config):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_ac_active_faults_text(ts))
 
-    # Existing optional sensor: pipe temperature
+    # Built-in pipe temperature sensor
     if pipe := config.get(CONF_PIPE_TEMPERATURE):
         sens = await sensor.new_sensor(pipe)
         cg.add(var.set_pipe_sensor(sens))
 
-    # Optional LED target switch
+    # Built-in LED target switch
     if led_sw_conf := config.get(CONF_LED_SWITCH):
         led_sw = await switch.new_switch(led_sw_conf)
         cg.add(var.set_led_switch(led_sw))
