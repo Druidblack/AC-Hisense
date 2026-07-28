@@ -69,12 +69,13 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
     case 0x01: return climate::CLIMATE_MODE_HEAT;
     case 0x02: return climate::CLIMATE_MODE_COOL;
     case 0x03: return climate::CLIMATE_MODE_DRY;
-    // SMART/AUTO exposes the internally selected branch through status codes
-    // 4, 5 and 6 (fan/dry, heat and cool respectively). Home Assistant should
-    // still see one stable HVAC mode: AUTO.
+    // SMART/AUTO exposes internally selected branches through status codes:
+    // 4 = idle/fan, 5 = heat, 6 = cool, 7 = dehumidification. Home Assistant
+    // must still see one stable HVAC mode: AUTO for every SMART branch.
     case 0x04:
     case 0x05:
     case 0x06:
+    case 0x07:
       return climate::CLIMATE_MODE_AUTO;
     default:   return climate::CLIMATE_MODE_COOL;
   }
@@ -519,7 +520,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         // SMART owns its target temperature and indoor fan. Enter it with a
         // mode-only command and clear mutually exclusive manual features from
         // the desired state so they are not re-applied after the AC confirms
-        // AUTO with status code 4, 5 or 6.
+        // AUTO with status code 4, 5, 6 or 7.
         d_turbo_ = false;
         d_eco_ = false;
         d_quiet_ = false;
@@ -956,8 +957,8 @@ void ACHIClimate::queue_retry_fields_from_state_() {
     pending_command_fields_ |= CMD_FIELD_POWER_MODE;
 
   if (d_power_on_ && power_on_) {
-    // SMART/AUTO selects its own setpoint and fan. Codes 4/5/6 can therefore
-    // legitimately report 22 or 26 °C and different automatic wind codes.
+    // SMART/AUTO selects its own setpoint and fan. Codes 4/5/6/7 can therefore
+    // legitimately report changing internal targets and automatic wind codes.
     if (d_mode_ != climate::CLIMATE_MODE_AUTO && d_target_c_ != target_c_)
       pending_command_fields_ |= CMD_FIELD_TEMP;
 
@@ -1114,6 +1115,12 @@ Kelon168Data ACHIClimate::build_kelon_state_from_current_(uint8_t command) const
   const bool have_actual = !this->last_status_frame_.empty();
   const bool base_power = have_actual ? this->power_on_ : this->d_power_on_;
   auto base_mode = have_actual ? this->mode_ : this->d_mode_;
+  // SMART branch 7 was observed during dehumidification. Preserve SMART in
+  // Follow-Me/iFeel frames for every raw SMART branch (4..7); otherwise an
+  // iFeel update built from a misclassified branch can switch the unit to a
+  // normal COOL command and later provoke an unnecessary AUTO re-command.
+  if (have_actual && this->raw_mode_code_ >= 0x04 && this->raw_mode_code_ <= 0x07)
+    base_mode = climate::CLIMATE_MODE_AUTO;
   auto base_fan = have_actual ? this->fan_ : this->d_fan_;
   const bool base_fan_turbo = have_actual ? this->fan_turbo_ : this->d_fan_turbo_;
   auto base_swing = have_actual ? this->swing_ : this->d_swing_;
@@ -2283,8 +2290,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     this->action = climate::CLIMATE_ACTION_DRYING;
   } else if (mode_ == climate::CLIMATE_MODE_AUTO) {
     // SMART status code describes the branch selected by the indoor unit.
-    // Code 4 is the intermediate fan/dry branch; compressor feedback separates
-    // ventilation from dehumidification. Codes 5 and 6 are heat and cool.
+    // Code 4 is the idle/fan branch (some revisions keep it while completing a
+    // drying cycle), 5 is heat, 6 is cool and 7 is explicit dehumidification.
+    // Compressor feedback remains authoritative for whether the branch is active.
     if (!compressor_running && raw_mode_code_ == 0x04)
       this->action = climate::CLIMATE_ACTION_FAN;
     else if (!compressor_running)
@@ -2293,7 +2301,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
       this->action = climate::CLIMATE_ACTION_HEATING;
     else if (raw_mode_code_ == 0x06)
       this->action = climate::CLIMATE_ACTION_COOLING;
-    else if (raw_mode_code_ == 0x04)
+    else if (raw_mode_code_ == 0x07 || raw_mode_code_ == 0x04)
       this->action = climate::CLIMATE_ACTION_DRYING;
     else
       this->action = climate::CLIMATE_ACTION_IDLE;
@@ -2633,7 +2641,7 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
   }
 
   // SMART/AUTO owns the target temperature and indoor fan. Normalize those
-  // values so a valid AUTO status (mode code 4/5/6) converges regardless of the
+  // values so a valid AUTO status (mode code 4/5/6/7) converges regardless of the
   // internally selected 22/26 °C target or raw automatic wind code.
   if (power && mode == climate::CLIMATE_MODE_AUTO) {
     fan = climate::CLIMATE_FAN_AUTO;

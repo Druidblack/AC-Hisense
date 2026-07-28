@@ -561,8 +561,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool power_on_{false};
   uint8_t target_c_{24};                // 16..30 °C
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
-  // Raw upper-nibble status value. SMART/AUTO uses 4/5/6 to expose the
-  // internally selected fan/dry, heat and cool branches.
+  // Raw upper-nibble status value. SMART/AUTO uses 4/5/6/7 to expose the
+  // internally selected idle/fan, heat, cool and dehumidification branches.
   uint8_t raw_mode_code_{0};
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   bool fan_turbo_{false};
