@@ -69,6 +69,13 @@ static inline climate::ClimateMode decode_mode_from_nibble(uint8_t nib) {
     case 0x01: return climate::CLIMATE_MODE_HEAT;
     case 0x02: return climate::CLIMATE_MODE_COOL;
     case 0x03: return climate::CLIMATE_MODE_DRY;
+    // SMART/AUTO exposes the internally selected branch through status codes
+    // 4, 5 and 6 (fan/dry, heat and cool respectively). Home Assistant should
+    // still see one stable HVAC mode: AUTO.
+    case 0x04:
+    case 0x05:
+    case 0x06:
+      return climate::CLIMATE_MODE_AUTO;
     default:   return climate::CLIMATE_MODE_COOL;
   }
 }
@@ -79,6 +86,9 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
     case climate::CLIMATE_MODE_HEAT:     return 0x03;
     case climate::CLIMATE_MODE_COOL:     return 0x05;
     case climate::CLIMATE_MODE_DRY:      return 0x07;
+    // AUTO/SMART is command action 9, therefore byte 18 becomes 0x9C while
+    // powered on (0x90 mode action + 0x0C power bits).
+    case climate::CLIMATE_MODE_AUTO:     return 0x09;
     default:                             return 0x05;
   }
 }
@@ -333,7 +343,10 @@ climate::ClimateTraits ACHIClimate::traits() {
     climate::CLIMATE_MODE_COOL,
     climate::CLIMATE_MODE_HEAT,
     climate::CLIMATE_MODE_DRY,
-    climate::CLIMATE_MODE_FAN_ONLY
+    climate::CLIMATE_MODE_FAN_ONLY,
+    // Keep AUTO last so generic climate.turn_on retains the previous COOL
+    // fallback when the optional Memory switch is disabled.
+    climate::CLIMATE_MODE_AUTO
   });
   t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
                              climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
@@ -501,6 +514,23 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       }
 
       d_mode_ = requested_mode;
+
+      if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+        // SMART owns its target temperature and indoor fan. Enter it with a
+        // mode-only command and clear mutually exclusive manual features from
+        // the desired state so they are not re-applied after the AC confirms
+        // AUTO with status code 4, 5 or 6.
+        d_turbo_ = false;
+        d_eco_ = false;
+        d_quiet_ = false;
+        d_heat_8c_ = false;
+        heat_8c_restore_valid_ = false;
+        d_fan_turbo_ = false;
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+        g_has_pre_turbo_target = false;
+        g_has_pre_eco_state = false;
+      }
+
       if (memory_mode_enabled_) {
         last_active_mode_ = d_mode_;
       }
@@ -528,18 +558,27 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_target_temperature().has_value()) {
     float t = *call.get_target_temperature();
     if (!std::isnan(t)) {
-      // A manual setpoint means normal heating/cooling, not frost protection.
-      d_heat_8c_ = false;
-      heat_8c_restore_valid_ = false;
-      uint8_t c = static_cast<uint8_t>(std::round(t));
-      c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
-      d_target_c_ = c;
-      remember_target_for_mode_(d_mode_, c);
-      changed = true;
+      if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+        // Keep displaying the internal SMART target (22/26 °C etc.) reported
+        // by the indoor unit, but never transmit a user setpoint in AUTO.
+        ESP_LOGD(TAG, "Ignoring target-temperature command while SMART/AUTO is active");
+      } else {
+        // A manual setpoint means normal heating/cooling, not frost protection.
+        d_heat_8c_ = false;
+        heat_8c_restore_valid_ = false;
+        uint8_t c = static_cast<uint8_t>(std::round(t));
+        c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
+        d_target_c_ = c;
+        remember_target_for_mode_(d_mode_, c);
+        changed = true;
+      }
     }
   }
 
   if (call.get_fan_mode().has_value()) {
+    if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+      ESP_LOGD(TAG, "Ignoring fan-mode command while SMART/AUTO is active");
+    } else {
     // While Sleep is active, QUIET is controlled by the indoor unit itself.
     // Remember that this fan change is explicit so the next status parser does
     // not immediately replace the requested fan with Sleep's QUIET value.
@@ -553,6 +592,7 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     d_fan_turbo_ = false;
     d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
     changed = true;
+    }
   }
 
   if (call.get_swing_mode().has_value()) {
@@ -562,9 +602,13 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   if (call.get_preset().has_value()) {
     auto p = *call.get_preset();
+    const bool preset_allowed_in_mode =
+        d_mode_ != climate::CLIMATE_MODE_AUTO || p == climate::CLIMATE_PRESET_NONE;
     const bool preset_supported =
         !(p == climate::CLIMATE_PRESET_ECO && capabilities_.valid && !capabilities_.power_save);
-    if (!preset_supported) {
+    if (!preset_allowed_in_mode) {
+      ESP_LOGD(TAG, "Ignoring preset command while SMART/AUTO is active");
+    } else if (!preset_supported) {
       ESP_LOGW(TAG, "Ignoring unsupported ECO preset (ProductType power_save=0)");
     } else {
     bool was_turbo = d_turbo_;
@@ -736,7 +780,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       changed = true;
       }  // heat8_supported
     } else if (custom == CUSTOM_PRESET_QUIET) {
-      if (capabilities_.valid && !capabilities_.fan_mute) {
+      if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+        ESP_LOGD(TAG, "Ignoring Quiet preset while SMART/AUTO is active");
+      } else if (capabilities_.valid && !capabilities_.fan_mute) {
         ESP_LOGW(TAG, "Ignoring unsupported Quiet preset (ProductType fan_mute=0)");
       } else {
       sleep_restore_fan_valid_ = false;
@@ -755,7 +801,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   auto custom_fan = call.get_custom_fan_mode();
   if (!custom_fan.empty()) {
-    if (custom_fan == CUSTOM_FAN_TURBO) {
+    if (custom_fan == CUSTOM_FAN_TURBO && d_mode_ == climate::CLIMATE_MODE_AUTO) {
+      ESP_LOGD(TAG, "Ignoring custom Turbo fan while SMART/AUTO is active");
+    } else if (custom_fan == CUSTOM_FAN_TURBO) {
       sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
       sleep_restore_fan_valid_ = false;
       d_heat_8c_ = false;
@@ -779,7 +827,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     changed_fields |= CMD_FIELD_POWER_MODE;
   if (d_target_c_ != before_target)
     changed_fields |= CMD_FIELD_TEMP;
-  if (d_fan_ != before_fan || d_fan_turbo_ != before_fan_turbo)
+  if ((d_fan_ != before_fan || d_fan_turbo_ != before_fan_turbo) &&
+      d_mode_ != climate::CLIMATE_MODE_AUTO)
     changed_fields |= CMD_FIELD_WIND;
   if (d_swing_ != before_swing)
     changed_fields |= CMD_FIELD_SWING;
@@ -907,14 +956,17 @@ void ACHIClimate::queue_retry_fields_from_state_() {
     pending_command_fields_ |= CMD_FIELD_POWER_MODE;
 
   if (d_power_on_ && power_on_) {
-    if (d_target_c_ != target_c_)
+    // SMART/AUTO selects its own setpoint and fan. Codes 4/5/6 can therefore
+    // legitimately report 22 or 26 °C and different automatic wind codes.
+    if (d_mode_ != climate::CLIMATE_MODE_AUTO && d_target_c_ != target_c_)
       pending_command_fields_ |= CMD_FIELD_TEMP;
 
     // A confirmed Sleep program owns the fan and normally forces QUIET. Do not
     // fight that automatic fan value unless the user explicitly selected a fan
     // mode in Home Assistant while Sleep was active.
     const bool sleep_owns_fan = sleep_stage_ > 0 && !sleep_fan_override_pending_;
-    if (!sleep_owns_fan && (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
+    if (d_mode_ != climate::CLIMATE_MODE_AUTO && !sleep_owns_fan &&
+        (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
       pending_command_fields_ |= CMD_FIELD_WIND;
     if (d_swing_ != swing_)
       pending_command_fields_ |= CMD_FIELD_SWING;
@@ -1007,6 +1059,8 @@ uint8_t ACHIClimate::encode_kelon_mode_(climate::ClimateMode mode) const {
       return KELON168_MODE_DRY;
     case climate::CLIMATE_MODE_FAN_ONLY:
       return KELON168_MODE_FAN;
+    case climate::CLIMATE_MODE_AUTO:
+      return KELON168_MODE_AUTO;
     default:
       return KELON168_MODE_AUTO;
   }
@@ -1871,6 +1925,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   // Mode (upper nibble)
   uint8_t nib = (b[IDX_POWER_MODE] >> 4) & 0x0F;
+  raw_mode_code_ = nib;
   mode_ = decode_mode_from_nibble(nib);
 
   // Fan speed
@@ -2226,6 +2281,22 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     this->action = climate::CLIMATE_ACTION_HEATING;
   } else if (mode_ == climate::CLIMATE_MODE_DRY) {
     this->action = climate::CLIMATE_ACTION_DRYING;
+  } else if (mode_ == climate::CLIMATE_MODE_AUTO) {
+    // SMART status code describes the branch selected by the indoor unit.
+    // Code 4 is the intermediate fan/dry branch; compressor feedback separates
+    // ventilation from dehumidification. Codes 5 and 6 are heat and cool.
+    if (!compressor_running && raw_mode_code_ == 0x04)
+      this->action = climate::CLIMATE_ACTION_FAN;
+    else if (!compressor_running)
+      this->action = climate::CLIMATE_ACTION_IDLE;
+    else if (raw_mode_code_ == 0x05)
+      this->action = climate::CLIMATE_ACTION_HEATING;
+    else if (raw_mode_code_ == 0x06)
+      this->action = climate::CLIMATE_ACTION_COOLING;
+    else if (raw_mode_code_ == 0x04)
+      this->action = climate::CLIMATE_ACTION_DRYING;
+    else
+      this->action = climate::CLIMATE_ACTION_IDLE;
   } else {
     this->action = climate::CLIMATE_ACTION_IDLE;
   }
@@ -2309,10 +2380,11 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s, action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
+           (unsigned) raw_mode_code_,
            LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
@@ -2557,6 +2629,15 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
     heat_8c = false;
     led = true;
     sleep_stage = 0;
+    target_c = 24;
+  }
+
+  // SMART/AUTO owns the target temperature and indoor fan. Normalize those
+  // values so a valid AUTO status (mode code 4/5/6) converges regardless of the
+  // internally selected 22/26 °C target or raw automatic wind code.
+  if (power && mode == climate::CLIMATE_MODE_AUTO) {
+    fan = climate::CLIMATE_FAN_AUTO;
+    fan_turbo = false;
     target_c = 24;
   }
 
