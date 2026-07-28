@@ -2412,10 +2412,12 @@ void ACHIClimate::publish_gated_state_() {
 
     this->mode = power_on_ ? mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = published_target;
-    // BOOST/Turbo preset physically runs the indoor fan with raw Wind Mode Code 18.
-    // Keep the preset as BOOST, but expose the fan speed as the custom Turbo mode
-    // instead of misleadingly showing the underlying compatibility value HIGH.
-    publish_fan_state_(out_fan_turbo || out_turbo, out_fan);
+    // In COOL the BOOST preset uses the physical Turbo airflow and should be
+    // exposed as the custom Turbo fan mode. In HEAT this model keeps the fan
+    // under automatic control even though the BOOST flag is active, so do not
+    // misreport the fan as Turbo.
+    const bool boost_uses_turbo_fan = out_turbo && mode_ != climate::CLIMATE_MODE_HEAT;
+    publish_fan_state_(out_fan_turbo || boost_uses_turbo_fan, out_fan);
     this->swing_mode = swing_;
     if (enable_presets_) {
       if (out_heat_8c && (!capabilities_.valid || capabilities_.heat_8c || capabilities_.enable_8heat)) this->set_custom_preset_(CUSTOM_PRESET_HEAT_8C);
@@ -2451,8 +2453,9 @@ void ACHIClimate::publish_gated_state_() {
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
     this->target_temperature = d_heat_8c_ ? 8 : d_target_c_;
     if (d_turbo_) {
-      // Show Turbo immediately while the BOOST command is being confirmed.
-      publish_fan_state_(true, d_fan_);
+      // Show the expected fan state immediately while BOOST is being confirmed:
+      // Turbo airflow in COOL, but AUTO airflow in HEAT.
+      publish_fan_state_(d_mode_ != climate::CLIMATE_MODE_HEAT, d_fan_);
     } else if (sleep_stage_ > 0 && !sleep_fan_override_pending_) {
       publish_fan_state_(fan_turbo_, fan_);
     } else {
