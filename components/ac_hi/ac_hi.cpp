@@ -147,7 +147,44 @@ void ACHISleepProgramSelect::control(const std::string &value) {
   }
 }
 
+#ifdef USE_NUMBER
+// ---- ACHISmartTargetNumber ----
+void ACHISmartTargetNumber::control(float value) {
+  if (parent_ != nullptr) {
+    parent_->set_smart_target_temperature(value);
+  } else {
+    publish_state(value);
+  }
+}
+#endif
+
 // ---- ACHIClimate implementation ----
+
+#ifdef USE_NUMBER
+void ACHIClimate::set_smart_target_temperature(float value) {
+  const bool smart_active = d_power_on_ &&
+      (d_mode_ == climate::CLIMATE_MODE_AUTO || mode_ == climate::CLIMATE_MODE_AUTO);
+  if (!smart_active) {
+    ESP_LOGW(TAG, "SMART target ignored because AUTO is not active");
+    if (smart_target_number_ != nullptr) smart_target_number_->publish_state(NAN);
+    return;
+  }
+
+  uint8_t target = static_cast<uint8_t>(std::round(value));
+  target = std::max<uint8_t>(16, std::min<uint8_t>(30, target));
+
+  // Reuse the normal climate control path so the command remains a neutral
+  // one-shot temperature write (fields=0x008, power_mode=0x00). This does not
+  // resend 0x9C and therefore does not restart the SMART algorithm.
+  auto call = this->make_call();
+  call.set_target_temperature(static_cast<float>(target));
+  call.perform();
+
+  // Optimistic feedback is useful because the indoor unit can take several
+  // status frames to publish its accepted SMART comfort target.
+  if (smart_target_number_ != nullptr) smart_target_number_->publish_state(target);
+}
+#endif
 
 void ACHIClimate::setup() {
   // Register custom presets on the Climate entity, not on ClimateTraits.
@@ -174,6 +211,11 @@ void ACHIClimate::setup() {
   d_target_c_     = 24;
   last_cool_target_c_ = 24;
   last_heat_target_c_ = 24;
+#ifdef USE_NUMBER
+  // The dedicated SMART target is meaningful only after the indoor unit has
+  // confirmed an AUTO status code (4/5/6/7).
+  if (smart_target_number_ != nullptr) smart_target_number_->publish_state(NAN);
+#endif
   d_fan_          = climate::CLIMATE_FAN_AUTO;
   d_fan_turbo_    = false;
   d_swing_        = climate::CLIMATE_SWING_OFF;
@@ -2348,6 +2390,23 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
       ? 8
       : (power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_));
   publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
+#ifdef USE_NUMBER
+  if (smart_target_number_ != nullptr) {
+    if (power_on_ && mode_ == climate::CLIMATE_MODE_AUTO) {
+      const float smart_target = static_cast<float>(published_setpoint);
+      if (!smart_target_number_->has_state() ||
+          std::isnan(smart_target_number_->state) ||
+          smart_target_number_->state != smart_target) {
+        smart_target_number_->publish_state(smart_target);
+      }
+    } else if (!smart_target_number_->has_state() ||
+               !std::isnan(smart_target_number_->state)) {
+      // Mark the control unavailable outside SMART/AUTO so it cannot be
+      // mistaken for the remembered COOL or HEAT setpoint.
+      smart_target_number_->publish_state(NAN);
+    }
+  }
+#endif
   publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
   publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
   publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);

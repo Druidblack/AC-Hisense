@@ -6,6 +6,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/select/select.h"
+#ifdef USE_NUMBER
+  #include "esphome/components/number/number.h"
+#endif
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/automation.h"
 #include "kelon168_protocol.h"
@@ -113,6 +116,23 @@ class ACHISleepProgramSelect : public select::Select {
  private:
   ACHIClimate *parent_{nullptr};
 };
+
+#ifdef USE_NUMBER
+// Home Assistant does not expose a single setpoint control while the HVAC mode
+// is AUTO. This dedicated number keeps the real Hisense SMART target adjustable
+// without changing the reported HVAC mode or pretending the device uses a
+// two-point HEAT_COOL range.
+class ACHISmartTargetNumber : public number::Number {
+ public:
+  void set_parent(ACHIClimate *p) { parent_ = p; }
+
+ protected:
+  void control(float value) override;
+
+ private:
+  ACHIClimate *parent_{nullptr};
+};
+#endif
 
 // Protocol constants
 static constexpr uint8_t HI_HDR0 = 0xF4;
@@ -270,6 +290,15 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     if (sleep_program_select_ != nullptr) sleep_program_select_->set_parent(this);
   }
   void set_sleep_program(const std::string &value);
+#ifdef USE_NUMBER
+  void set_smart_target_number(ACHISmartTargetNumber *n) {
+    smart_target_number_ = n;
+    if (smart_target_number_ != nullptr) smart_target_number_->set_parent(this);
+  }
+  void set_smart_target_temperature(float value);
+#else
+  void set_smart_target_number(void *) {}
+#endif
   void set_ir_transmitter(remote_base::RemoteTransmitterBase *t) { ir_transmitter_ = t; }
   void set_ifeel_mqtt_topic(const std::string &topic) { ifeel_mqtt_topic_ = topic; }
   void set_ifeel_mqtt_payload_format(const std::string &format) {
@@ -604,6 +633,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint16_t last_status_crc_{0};
 
   // Optional sensors and switches
+#ifdef USE_NUMBER
+  ACHISmartTargetNumber *smart_target_number_{nullptr};
+#endif
 #ifdef USE_SENSOR
   sensor::Sensor *pipe_sensor_{nullptr};
   sensor::Sensor *set_temp_sensor_{nullptr};

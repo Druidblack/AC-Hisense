@@ -1,10 +1,10 @@
 import esphome.codegen as cg
 from esphome import automation
 import esphome.config_validation as cv
-from esphome.components import climate, uart, sensor, binary_sensor, switch, select, text_sensor, remote_base
+from esphome.components import climate, uart, sensor, binary_sensor, switch, select, text_sensor, number, remote_base
 from esphome.const import CONF_ID, CONF_UART_ID, CONF_NAME, CONF_TEMPERATURE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC, ICON_LIGHTBULB
 
-AUTO_LOAD = ["climate", "uart", "sensor", "binary_sensor", "switch", "select", "text_sensor", "remote_base"]
+AUTO_LOAD = ["climate", "uart", "sensor", "binary_sensor", "switch", "select", "text_sensor", "number", "remote_base"]
 
 ac_hi_ns = cg.esphome_ns.namespace("ac_hi")
 ACHIClimate = ac_hi_ns.class_("ACHIClimate", climate.Climate, cg.PollingComponent, uart.UARTDevice)
@@ -12,6 +12,7 @@ ACHILEDTargetSwitch = ac_hi_ns.class_("ACHILEDTargetSwitch", switch.Switch)
 ACHICommandSoundSwitch = ac_hi_ns.class_("ACHICommandSoundSwitch", switch.Switch)
 ACHIMemorySwitch = ac_hi_ns.class_("ACHIMemorySwitch", switch.Switch)
 ACHISleepProgramSelect = ac_hi_ns.class_("ACHISleepProgramSelect", select.Select)
+ACHISmartTargetNumber = ac_hi_ns.class_("ACHISmartTargetNumber", number.Number)
 ACHIIFeelAction = ac_hi_ns.class_("ACHIIFeelAction", automation.Action)
 
 # ESPHome 2025.5+ uses climate.climate_schema(...), older versions still use CLIMATE_SCHEMA.
@@ -30,6 +31,7 @@ CONF_LED_SWITCH = "led_switch"
 CONF_SOUND_SWITCH = "sound_switch"
 CONF_MEMORY_SWITCH = "memory_switch"
 CONF_SLEEP_PROGRAM = "sleep_program"
+CONF_SMART_TARGET_TEMPERATURE = "smart_target_temperature"
 CONF_IR_TRANSMITTER_ID = "ir_transmitter_id"
 CONF_IFEEL_MQTT_TOPIC = "ifeel_mqtt_topic"
 CONF_IFEEL_MQTT_PAYLOAD = "ifeel_mqtt_payload"
@@ -253,6 +255,15 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         ACHISleepProgramSelect,
         icon="mdi:sleep",
     ),
+    # Home Assistant intentionally hides a single target-temperature control in
+    # HVAC AUTO mode. Expose the Hisense SMART comfort target as a dedicated
+    # number entity so it remains adjustable without misrepresenting SMART as
+    # HEAT_COOL or forcing a two-point temperature range.
+    cv.Optional(CONF_SMART_TARGET_TEMPERATURE, default={CONF_NAME: "SMART Target Temperature"}): number.number_schema(
+        ACHISmartTargetNumber,
+        unit_of_measurement="°C",
+        icon="mdi:thermometer-auto",
+    ),
 
     # New memory diagnostics sensors (all optional)
     cv.Optional(CONF_HEAP_FREE): sensor.sensor_schema(),
@@ -426,6 +437,12 @@ async def to_code(config):
             options=["Sleep 1", "Sleep 2", "Sleep 3", "Sleep 4"],
         )
         cg.add(var.set_sleep_program_select(sleep_program))
+
+    if smart_target_conf := config.get(CONF_SMART_TARGET_TEMPERATURE):
+        smart_target = await number.new_number(
+            smart_target_conf, min_value=16, max_value=30, step=1
+        )
+        cg.add(var.set_smart_target_number(smart_target))
 
     # New memory diagnostics sensors (optional)
     if conf := config.get(CONF_HEAP_FREE):
