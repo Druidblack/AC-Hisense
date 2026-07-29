@@ -559,18 +559,25 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_target_temperature().has_value()) {
     float t = *call.get_target_temperature();
     if (!std::isnan(t)) {
-      if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
-        // Keep displaying the internal SMART target (22/26 °C etc.) reported
-        // by the indoor unit, but never transmit a user setpoint in AUTO.
-        ESP_LOGD(TAG, "Ignoring target-temperature command while SMART/AUTO is active");
-      } else {
-        // A manual setpoint means normal heating/cooling, not frost protection.
-        d_heat_8c_ = false;
-        heat_8c_restore_valid_ = false;
-        uint8_t c = static_cast<uint8_t>(std::round(t));
-        c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
+      // Hisense inverter models allow the SMART comfort temperature to be
+      // adjusted while AUTO remains active. The UART command still carries the
+      // ordinary absolute temperature byte; the indoor unit translates it into
+      // the SMART comfort correction and continues selecting branches 4/5/6/7.
+      // Send this as a one-shot field only. Convergence intentionally ignores
+      // AUTO target changes so the component never fights later SMART decisions.
+      d_heat_8c_ = false;
+      heat_8c_restore_valid_ = false;
+      uint8_t c = static_cast<uint8_t>(std::round(t));
+      c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
+      if (c != d_target_c_) {
         d_target_c_ = c;
-        remember_target_for_mode_(d_mode_, c);
+        if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+          ESP_LOGD(TAG,
+                   "SMART/AUTO target adjustment requested: %u°C (one-shot, mode remains AUTO)",
+                   (unsigned) c);
+        } else {
+          remember_target_for_mode_(d_mode_, c);
+        }
         changed = true;
       }
     }
@@ -957,8 +964,9 @@ void ACHIClimate::queue_retry_fields_from_state_() {
     pending_command_fields_ |= CMD_FIELD_POWER_MODE;
 
   if (d_power_on_ && power_on_) {
-    // SMART/AUTO selects its own setpoint and fan. Codes 4/5/6/7 can therefore
-    // legitimately report changing internal targets and automatic wind codes.
+    // A user temperature adjustment in SMART/AUTO is deliberately one-shot.
+    // Do not retry it: after accepting the command, the indoor unit may change
+    // the reported target again while switching between SMART branches 4/5/6/7.
     if (d_mode_ != climate::CLIMATE_MODE_AUTO && d_target_c_ != target_c_)
       pending_command_fields_ |= CMD_FIELD_TEMP;
 
@@ -2640,9 +2648,10 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
     target_c = 24;
   }
 
-  // SMART/AUTO owns the target temperature and indoor fan. Normalize those
-  // values so a valid AUTO status (mode code 4/5/6/7) converges regardless of the
-  // internally selected 22/26 °C target or raw automatic wind code.
+  // SMART/AUTO owns subsequent target changes and the indoor fan. A target
+  // adjustment from Home Assistant is sent once, then these values are normalized
+  // so valid AUTO status (codes 4/5/6/7) cannot trigger an enforcement loop when
+  // the indoor unit later changes its SMART branch or calculated temperature.
   if (power && mode == climate::CLIMATE_MODE_AUTO) {
     fan = climate::CLIMATE_FAN_AUTO;
     fan_turbo = false;
