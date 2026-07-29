@@ -1864,11 +1864,13 @@ void ACHIClimate::publish_fault_state_(const std::vector<uint8_t> &b) {
   if (raw_outdoor & 0x08) append_fault("Outdoor temp sensor");
 
   if (raw_protect & 0x10) append_fault("Overheat/overcool protection");
+  if (raw_protect & 0x02)
+    append_fault("High compressor discharge temperature protection");
 
   // Keep unnamed bits visible instead of incorrectly declaring the unit healthy.
   const uint8_t unknown_module = static_cast<uint8_t>(raw_module & 0x07);
   const uint8_t unknown_outdoor = static_cast<uint8_t>(raw_outdoor & 0x87);
-  const uint8_t unknown_protect = static_cast<uint8_t>(raw_protect & 0x6F);
+  const uint8_t unknown_protect = static_cast<uint8_t>(raw_protect & 0x6D);
   char unknown[40];
   if (unknown_module != 0) {
     snprintf(unknown, sizeof(unknown), "Unknown module bits 0x%02X", unknown_module);
