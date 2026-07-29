@@ -2531,19 +2531,7 @@ void ACHIClimate::publish_gated_state_() {
     // authoritative for the fan unless the user explicitly requested another
     // fan mode; therefore show the real QUIET fan instead of stale desired AUTO.
     this->mode = d_power_on_ ? d_mode_ : climate::CLIMATE_MODE_OFF;
-
-    // SMART/AUTO chooses and reports its own internal target (for example 22°C
-    // for the heating branch or 26°C for the cooling/fan branch). Even while a
-    // Home Assistant command is still being confirmed, publish the latest
-    // target received from the indoor unit on the climate target-temperature
-    // scale instead of the stale desired value retained from the previous mode.
-    const bool actual_auto_target_available =
-        d_power_on_ && d_mode_ == climate::CLIMATE_MODE_AUTO && power_on_ &&
-        mode_ == climate::CLIMATE_MODE_AUTO && raw_mode_code_ >= 0x04 &&
-        raw_mode_code_ <= 0x07;
-    this->target_temperature = d_heat_8c_
-        ? 8
-        : (actual_auto_target_available ? target_c_ : d_target_c_);
+    this->target_temperature = d_heat_8c_ ? 8 : d_target_c_;
     if (d_turbo_) {
       // Show the expected fan state immediately while BOOST is being confirmed:
       // Turbo airflow in COOL, but AUTO airflow in HEAT.
