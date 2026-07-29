@@ -165,24 +165,31 @@ void ACHIClimate::set_smart_target_temperature(float value) {
   const bool smart_active = d_power_on_ &&
       (d_mode_ == climate::CLIMATE_MODE_AUTO || mode_ == climate::CLIMATE_MODE_AUTO);
   if (!smart_active) {
-    ESP_LOGW(TAG, "SMART target ignored because AUTO is not active");
+    ESP_LOGW(TAG, "SMART adjustment ignored because AUTO is not active");
     if (smart_target_number_ != nullptr) smart_target_number_->publish_state(NAN);
     return;
   }
 
-  uint8_t target = static_cast<uint8_t>(std::round(value));
-  target = std::max<uint8_t>(16, std::min<uint8_t>(30, target));
+  int8_t adjustment = static_cast<int8_t>(std::round(value));
+  adjustment = std::max<int8_t>(-7, std::min<int8_t>(7, adjustment));
+  d_smart_adjustment_ = adjustment;
+  smart_adjustment_confirmation_pending_ = true;
+  smart_adjustment_requested_ms_ = millis();
 
-  // Reuse the normal climate control path so the command remains a neutral
-  // one-shot temperature write (fields=0x008, power_mode=0x00). This does not
-  // resend 0x9C and therefore does not restart the SMART algorithm.
-  auto call = this->make_call();
-  call.set_target_temperature(static_cast<float>(target));
-  call.perform();
+  // SMART does not accept byte 19 as an absolute setpoint. It uses the
+  // Auto/Dry compensation field at byte 34. Queue only that field, keeping
+  // power_mode, normal temperature and fan bytes neutral.
+  pending_command_fields_ |= CMD_FIELD_SMART_ADJUST;
+  pending_control_ = true;
+  last_control_ms_ = millis();
+  user_command_next_write_ = true;
+  beep_on_next_write_ = command_sound_enabled_;
 
-  // Optimistic feedback is useful because the indoor unit can take several
-  // status frames to publish its accepted SMART comfort target.
-  if (smart_target_number_ != nullptr) smart_target_number_->publish_state(target);
+  ESP_LOGD(TAG,
+           "SMART/AUTO comfort adjustment requested: %+d°C (relative, mode remains AUTO)",
+           static_cast<int>(adjustment));
+  if (smart_target_number_ != nullptr)
+    smart_target_number_->publish_state(static_cast<float>(adjustment));
 }
 #endif
 
@@ -212,8 +219,8 @@ void ACHIClimate::setup() {
   last_cool_target_c_ = 24;
   last_heat_target_c_ = 24;
 #ifdef USE_NUMBER
-  // The dedicated SMART target is meaningful only after the indoor unit has
-  // confirmed an AUTO status code (4/5/6/7).
+  // The dedicated SMART adjustment is meaningful only after the indoor unit
+  // has confirmed an AUTO status code (4/5/6/7).
   if (smart_target_number_ != nullptr) smart_target_number_->publish_state(NAN);
 #endif
   d_fan_          = climate::CLIMATE_FAN_AUTO;
@@ -601,25 +608,19 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_target_temperature().has_value()) {
     float t = *call.get_target_temperature();
     if (!std::isnan(t)) {
-      // Hisense inverter models allow the SMART comfort temperature to be
-      // adjusted while AUTO remains active. The UART command still carries the
-      // ordinary absolute temperature byte; the indoor unit translates it into
-      // the SMART comfort correction and continues selecting branches 4/5/6/7.
-      // Send this as a one-shot field only. Convergence intentionally ignores
-      // AUTO target changes so the component never fights later SMART decisions.
       d_heat_8c_ = false;
       heat_8c_restore_valid_ = false;
       uint8_t c = static_cast<uint8_t>(std::round(t));
       c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
-      if (c != d_target_c_) {
+      if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
+        // Compatibility for direct climate.set_temperature service calls: map
+        // an absolute requested value to the relative offset from the SMART
+        // branch target currently reported by the indoor unit.
+        const int8_t offset = static_cast<int8_t>(c) - static_cast<int8_t>(target_c_);
+        set_smart_target_temperature(static_cast<float>(offset));
+      } else if (c != d_target_c_) {
         d_target_c_ = c;
-        if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
-          ESP_LOGD(TAG,
-                   "SMART/AUTO target adjustment requested: %u°C (one-shot, mode remains AUTO)",
-                   (unsigned) c);
-        } else {
-          remember_target_for_mode_(d_mode_, c);
-        }
+        remember_target_for_mode_(d_mode_, c);
         changed = true;
       }
     }
@@ -947,6 +948,9 @@ void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
   if (fields & CMD_FIELD_TEMP)
     tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
 
+  if (fields & CMD_FIELD_SMART_ADJUST)
+    tx_bytes_[IDX_AUTO_DRY_COMPENSATION] = encode_smart_adjustment_(d_smart_adjustment_);
+
   if (fields & CMD_FIELD_WIND)
     tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
 
@@ -1081,11 +1085,11 @@ void ACHIClimate::send_write_changes_() {
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG,
-           "Sending neutral one-shot write (0x65): fields=0x%03X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X heat8[37]=0x%02X beep[23]=0x%02X",
+           "Sending neutral one-shot write (0x65): fields=0x%03X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X smart_adjust[34]=0x%02X quiet[35]=0x%02X led[36]=0x%02X heat8[37]=0x%02X beep[23]=0x%02X",
            (unsigned) fields, tx_bytes_[IDX_WIND], tx_bytes_[IDX_SLEEP],
            tx_bytes_[IDX_POWER_MODE], tx_bytes_[IDX_SET_TEMP],
            tx_bytes_[IDX_TX_SWING], tx_bytes_[IDX_TX_TURBO_ECO],
-           tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED],
+           tx_bytes_[IDX_AUTO_DRY_COMPENSATION], tx_bytes_[IDX_TX_QUIET], tx_bytes_[IDX_TX_LED],
            tx_bytes_[IDX_TX_HEAT_8C], tx_bytes_[IDX_TX_BEEP]);
   send_logical_frame_(tx_bytes_, "TX one-shot write");
 
@@ -2046,6 +2050,27 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // command is reported as HEAT with the otherwise invalid normal setpoint 8.
   const uint8_t raw_target_c = b[IDX_SET_TEMP];
 
+  // Auto/Dry compensation is a signed-magnitude nibble in status byte 34:
+  // bit 3 is the sign and bits 0..2 are the magnitude (0..7).
+  const uint8_t raw_smart_adjustment_nibble =
+      static_cast<uint8_t>((b[IDX_AUTO_DRY_COMPENSATION] >> 4) & 0x0F);
+  smart_adjustment_ = decode_smart_adjustment_(b[IDX_AUTO_DRY_COMPENSATION]);
+  if (smart_adjustment_confirmation_pending_) {
+    if (smart_adjustment_ == d_smart_adjustment_) {
+      smart_adjustment_confirmation_pending_ = false;
+      ESP_LOGI(TAG, "SMART/AUTO comfort adjustment confirmed: %+d°C (raw=0x%X)",
+               static_cast<int>(smart_adjustment_),
+               static_cast<unsigned>(raw_smart_adjustment_nibble));
+    } else if (millis() - smart_adjustment_requested_ms_ >= SMART_ADJUST_CONFIRM_TIMEOUT_MS) {
+      smart_adjustment_confirmation_pending_ = false;
+      d_smart_adjustment_ = smart_adjustment_;
+      ESP_LOGW(TAG,
+               "SMART/AUTO comfort adjustment was not confirmed; AC reports %+d°C (raw=0x%X)",
+               static_cast<int>(smart_adjustment_),
+               static_cast<unsigned>(raw_smart_adjustment_nibble));
+    }
+  }
+
   // 8 °C frost-protection mode. Keep the documented status-bit checks for
   // compatible models, and additionally accept HEAT + raw target 8 for this
   // model. A normal Hisense setpoint is limited to 16–30 °C, so raw value 8 is
@@ -2393,17 +2418,23 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #ifdef USE_NUMBER
   if (smart_target_number_ != nullptr) {
     if (power_on_ && mode_ == climate::CLIMATE_MODE_AUTO) {
-      const float smart_target = static_cast<float>(published_setpoint);
+      // While awaiting confirmation, keep the optimistic requested offset on
+      // screen. A status frame that still contains the old value may arrive
+      // between the UI action and the debounced 0x65 write.
+      const float displayed_adjustment = static_cast<float>(
+          smart_adjustment_confirmation_pending_ ? d_smart_adjustment_ : smart_adjustment_);
       if (!smart_target_number_->has_state() ||
           std::isnan(smart_target_number_->state) ||
-          smart_target_number_->state != smart_target) {
-        smart_target_number_->publish_state(smart_target);
+          smart_target_number_->state != displayed_adjustment) {
+        smart_target_number_->publish_state(displayed_adjustment);
       }
-    } else if (!smart_target_number_->has_state() ||
-               !std::isnan(smart_target_number_->state)) {
-      // Mark the control unavailable outside SMART/AUTO so it cannot be
-      // mistaken for the remembered COOL or HEAT setpoint.
-      smart_target_number_->publish_state(NAN);
+    } else {
+      smart_adjustment_confirmation_pending_ = false;
+      if (!smart_target_number_->has_state() ||
+          !std::isnan(smart_target_number_->state)) {
+        // Mark the relative adjustment unavailable outside SMART/AUTO.
+        smart_target_number_->publish_state(NAN);
+      }
     }
   }
 #endif
@@ -2455,7 +2486,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, smart_adjust=%+d°C(raw=0x%X), heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
@@ -2463,7 +2494,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
-           (unsigned) (heat_8c_ ? 8 : target_c_), heat_8c_ ? "ON" : "OFF",
+           (unsigned) (heat_8c_ ? 8 : target_c_), static_cast<int>(smart_adjustment_),
+           static_cast<unsigned>(raw_smart_adjustment_nibble), heat_8c_ ? "ON" : "OFF",
            b.size() > IDX_RX_HEAT_8C ? b[IDX_RX_HEAT_8C] : 0,
            b.size() > IDX_RX_HEAT_8C_COMPANION ? b[IDX_RX_HEAT_8C_COMPANION] : 0,
            (unsigned) raw_target_c, heat_8c_target_marker ? "YES" : "NO", current_temperature,

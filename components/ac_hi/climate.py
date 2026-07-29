@@ -255,14 +255,13 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         ACHISleepProgramSelect,
         icon="mdi:sleep",
     ),
-    # Home Assistant intentionally hides a single target-temperature control in
-    # HVAC AUTO mode. Expose the Hisense SMART comfort target as a dedicated
-    # number entity so it remains adjustable without misrepresenting SMART as
-    # HEAT_COOL or forcing a two-point temperature range.
-    cv.Optional(CONF_SMART_TARGET_TEMPERATURE, default={CONF_NAME: "SMART Target Temperature"}): number.number_schema(
+    # SMART uses a relative comfort correction, not the ordinary absolute
+    # target-temperature byte. Keep the legacy YAML key for compatibility, but
+    # expose the correct -7..+7 adjustment semantics in Home Assistant.
+    cv.Optional(CONF_SMART_TARGET_TEMPERATURE, default={CONF_NAME: "SMART Temperature Adjustment"}): number.number_schema(
         ACHISmartTargetNumber,
         unit_of_measurement="°C",
-        icon="mdi:thermometer-auto",
+        icon="mdi:thermometer-chevron-up",
     ),
 
     # New memory diagnostics sensors (all optional)
@@ -440,7 +439,7 @@ async def to_code(config):
 
     if smart_target_conf := config.get(CONF_SMART_TARGET_TEMPERATURE):
         smart_target = await number.new_number(
-            smart_target_conf, min_value=16, max_value=30, step=1
+            smart_target_conf, min_value=-7, max_value=7, step=1
         )
         cg.add(var.set_smart_target_number(smart_target))
 
