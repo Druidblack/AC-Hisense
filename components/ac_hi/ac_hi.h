@@ -6,9 +6,6 @@
 #include "esphome/core/hal.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/select/select.h"
-#ifdef USE_NUMBER
-  #include "esphome/components/number/number.h"
-#endif
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/automation.h"
 #include "kelon168_protocol.h"
@@ -117,23 +114,6 @@ class ACHISleepProgramSelect : public select::Select {
   ACHIClimate *parent_{nullptr};
 };
 
-#ifdef USE_NUMBER
-// Home Assistant does not expose a single setpoint control while the HVAC mode
-// is AUTO. This dedicated number keeps the real Hisense SMART target adjustable
-// without changing the reported HVAC mode or pretending the device uses a
-// two-point HEAT_COOL range.
-class ACHISmartTargetNumber : public number::Number {
- public:
-  void set_parent(ACHIClimate *p) { parent_ = p; }
-
- protected:
-  void control(float value) override;
-
- private:
-  ACHIClimate *parent_{nullptr};
-};
-#endif
-
 // Protocol constants
 static constexpr uint8_t HI_HDR0 = 0xF4;
 static constexpr uint8_t HI_HDR1 = 0xF5;
@@ -161,11 +141,6 @@ enum FrameIndex : uint8_t {
   IDX_ON_TIMER_MINUTE_STATUS = 31,
   IDX_OFF_TIMER_HOUR = 32,
   IDX_OFF_TIMER_MINUTE_STATUS = 33,
-
-  // SMART/AUTO and DRY use a signed comfort/dehumidification adjustment in
-  // the upper nibble of status byte 34. The corresponding 0x65 command uses
-  // the same logical signed-magnitude value followed by its write-enable bit.
-  IDX_AUTO_DRY_COMPENSATION = 34,
 
   // Fault groups in the ordinary long 0x66/0x00 status reply.
   IDX_FAULT_INDOOR = 39,
@@ -217,7 +192,6 @@ enum CommandFieldMask : uint16_t {
   CMD_FIELD_QUIET      = 1u << 6,
   CMD_FIELD_LED        = 1u << 7,
   CMD_FIELD_HEAT_8C    = 1u << 8,
-  CMD_FIELD_SMART_ADJUST = 1u << 9,
 };
 
 // Bit masks within specific bytes
@@ -268,7 +242,6 @@ static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x
 static constexpr uint8_t  CAPABILITIES_MAX_ATTEMPTS = 3;
 static constexpr uint32_t CAPABILITIES_RETRY_MS = 10000;
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
-static constexpr uint32_t SMART_ADJUST_CONFIRM_TIMEOUT_MS = 8000;
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t TIMER_REPEAT_EVENT_WINDOW_MS = 15000;
 // Active timer announcements are repeated by the indoor unit. If ordinary
@@ -297,18 +270,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
     if (sleep_program_select_ != nullptr) sleep_program_select_->set_parent(this);
   }
   void set_sleep_program(const std::string &value);
-#ifdef USE_NUMBER
-  void set_smart_target_number(ACHISmartTargetNumber *n) {
-    smart_target_number_ = n;
-    if (smart_target_number_ != nullptr) smart_target_number_->set_parent(this);
-  }
-  // The UI entity keeps its historic setter name for configuration
-  // compatibility, but its value is a relative SMART comfort adjustment
-  // from -7 to +7 rather than an absolute temperature.
-  void set_smart_target_temperature(float value);
-#else
-  void set_smart_target_number(void *) {}
-#endif
   void set_ir_transmitter(remote_base::RemoteTransmitterBase *t) { ir_transmitter_ = t; }
   void set_ifeel_mqtt_topic(const std::string &topic) { ifeel_mqtt_topic_ = topic; }
   void set_ifeel_mqtt_payload_format(const std::string &format) {
@@ -454,18 +415,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Field encoders (TX)
   uint8_t encode_temp_(uint8_t c) {
     return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
-  }
-  uint8_t encode_smart_adjustment_(int8_t adjustment) {
-    const int8_t clamped = std::max<int8_t>(-7, std::min<int8_t>(7, adjustment));
-    const uint8_t magnitude = static_cast<uint8_t>(clamped < 0 ? -clamped : clamped) & 0x07;
-    const uint8_t signed_magnitude = clamped < 0 ? static_cast<uint8_t>(0x08 | magnitude) : magnitude;
-    // Write payload convention: logical value shifted left, bit 0 enables it.
-    return static_cast<uint8_t>((signed_magnitude << 1) | 0x01);
-  }
-  int8_t decode_smart_adjustment_(uint8_t status_byte) const {
-    const uint8_t signed_magnitude = static_cast<uint8_t>((status_byte >> 4) & 0x0F);
-    const int8_t magnitude = static_cast<int8_t>(signed_magnitude & 0x07);
-    return (signed_magnitude & 0x08) != 0 ? static_cast<int8_t>(-magnitude) : magnitude;
   }
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
   uint8_t encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan);
@@ -615,7 +564,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Raw upper-nibble status value. SMART/AUTO uses 4/5/6/7 to expose the
   // internally selected idle/fan, heat, cool and dehumidification branches.
   uint8_t raw_mode_code_{0};
-  int8_t smart_adjustment_{0};          // confirmed AUTO/DRY comfort offset -7..+7
   climate::ClimateFanMode fan_{climate::CLIMATE_FAN_AUTO};
   bool fan_turbo_{false};
   climate::ClimateSwingMode swing_{climate::CLIMATE_SWING_OFF};
@@ -634,9 +582,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   climate::ClimateMode last_active_mode_{climate::CLIMATE_MODE_COOL};
   uint8_t last_cool_target_c_{24};
   uint8_t last_heat_target_c_{24};
-  int8_t d_smart_adjustment_{0};        // most recent user-requested offset
-  bool smart_adjustment_confirmation_pending_{false};
-  uint32_t smart_adjustment_requested_ms_{0};
   climate::ClimateFanMode d_fan_{climate::CLIMATE_FAN_AUTO};
   bool d_fan_turbo_{false};
   climate::ClimateSwingMode d_swing_{climate::CLIMATE_SWING_OFF};
@@ -659,9 +604,6 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   uint16_t last_status_crc_{0};
 
   // Optional sensors and switches
-#ifdef USE_NUMBER
-  ACHISmartTargetNumber *smart_target_number_{nullptr};
-#endif
 #ifdef USE_SENSOR
   sensor::Sensor *pipe_sensor_{nullptr};
   sensor::Sensor *set_temp_sensor_{nullptr};
