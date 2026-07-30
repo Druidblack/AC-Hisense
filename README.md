@@ -1,6 +1,7 @@
 # ESPHome component for AC manufactured by Hisense (RS-485 interface) Replacement of the AEH-W4G1 module and others.
 
-![primer](https://github.com/user-attachments/assets/1ad2cd3d-0561-4a50-bdaf-25f950640be8)
+<img width="600" height="832" alt="1" src="https://github.com/user-attachments/assets/d6eaaa42-0256-4919-adac-d81741b7d802" />
+<img width="591" height="829" alt="11" src="https://github.com/user-attachments/assets/1372d4d7-ebd6-4e26-86b3-24a78268c279" />
 
 This custom component provides full climate control for air conditioners manufactured by Hisense and its OEM brands (Ballu, etc.) that use the RS-485 protocol. It has been tested on:
 
@@ -15,6 +16,8 @@ This custom component provides full climate control for air conditioners manufac
 ❄️  **Ballu iGreen Pro DC BSAGI-18HN8_V4**
 
 ❄️  **Ballu Platinum DC BSEI-09HN8_V3**
+
+❄️  **Hisense Free Match Multi Split 4AMW81U4RJC**
 
 and should work with many other models.
 
@@ -187,20 +190,18 @@ For flashing the native module (AEH-W4G1)
 ```
 
 ## Entities provided
-
-<img width="991" height="803" alt="image" src="https://github.com/user-attachments/assets/4980e7cc-d490-44fc-9df1-1b265cea544a" />
-
-<img width="1075" height="992" alt="image" src="https://github.com/user-attachments/assets/0924cce2-2d55-4f90-9843-5b9d3fd2f9ec" />
-
+<img width="412" height="411" alt="22" src="https://github.com/user-attachments/assets/8fad5a88-fb8d-411f-b24c-99a231ceedea" />
+<img width="277" height="952" alt="2" src="https://github.com/user-attachments/assets/966420c5-864d-4781-aad5-31595a1a0833" />
+<img width="425" height="709" alt="3" src="https://github.com/user-attachments/assets/ea6627f0-071d-4b82-b2b6-72e0b8f64186" />
 
 
 
 ### Climate (`climate`)
 
--   Modes: `OFF`, `COOL`, `HEAT`, `DRY`, `FAN_ONLY` (auto mode is not supported by the AC)
+-   Modes: `OFF`, `COOL`, `HEAT`, `DRY`, `FAN_ONLY` (auto mode is not supported by the AC, auto mode is implemented by enabling smart mode)
 -   Fan speeds: `AUTO`, `QUIET`, `LOW`, `MEDIUM`, `HIGH`, `TURBO`
 -   Swing modes: `OFF`, `VERTICAL`, `HORIZONTAL`, `BOTH`
--   Presets (if `enable_presets: true`): `ECO`, `BOOST` (turbo), `SLEEP`, `QUIET`
+-   Presets (if `enable_presets: true`): `ECO`, `BOOST` (turbo), `SLEEP`, `QUIET`, `+8 °C`
 -   Target temperature range: 16–30°C in steps of 1°C
 -   Current temperature is read from the AC and displayed
 
