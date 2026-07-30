@@ -133,6 +133,8 @@ enum FrameIndex : uint8_t {
   IDX_PIPE_TEMP = 21,
   IDX_INDOOR_HUMIDITY_SETTING = 22,
   IDX_INDOOR_HUMIDITY = 23,
+  // Display temperature unit reported by the indoor unit. Bit 1: 0=C, 1=F.
+  IDX_TEMP_UNIT = 26,
 
   // Relative onboard timers in the ordinary 0x66/0x00 status reply.
   // ON timer: hour in byte 30 bits 7..3, minute in byte 31 bits 7..2,
@@ -413,9 +415,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void publish_memory_diagnostics_();
 
   // Field encoders (TX)
-  uint8_t encode_temp_(uint8_t c) {
-    return static_cast<uint8_t>(((std::max<uint8_t>(16, std::min<uint8_t>(30, c))) << 1) | 0x01);
-  }
+  uint8_t encode_temp_(uint8_t c) const;
   uint8_t encode_mode_hi_nibble_(climate::ClimateMode m);
   uint8_t encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan);
   uint8_t encode_sleep_byte_(uint8_t stage);
@@ -559,7 +559,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // ----- Actual (parsed from AC) state -----
   bool power_on_{false};
-  uint8_t target_c_{24};                // 16..30 °C
+  uint8_t target_c_{24};                // 16..30 °C (ESPHome internal unit)
+  bool temp_unit_f_{false};              // display/wire unit reported in status byte 26 bit 1
+  bool temp_unit_known_{false};
   climate::ClimateMode mode_{climate::CLIMATE_MODE_OFF};
   // Raw upper-nibble status value. SMART/AUTO uses 4/5/6/7 to expose the
   // internally selected idle/fan, heat, cool and dehumidification branches.

@@ -94,6 +94,23 @@ static inline uint8_t encode_nibble_from_mode(climate::ClimateMode m) {
   }
 }
 
+// The indoor unit reports bytes 19 (setpoint) and 20 (room temperature) in
+// its selected display unit. Conversion is rounded to the nearest whole degree
+// because the protocol carries only integer display values.
+static inline int8_t fahrenheit_to_celsius_(int value_f) {
+  const int numerator = (value_f - 32) * 5;
+  int value_c = numerator >= 0 ? (numerator + 4) / 9 : (numerator - 4) / 9;
+  value_c = std::max(-128, std::min(127, value_c));
+  return static_cast<int8_t>(value_c);
+}
+
+static inline int8_t celsius_to_fahrenheit_(int value_c) {
+  const int numerator = value_c * 9;
+  int value_f = (numerator >= 0 ? (numerator + 2) / 5 : (numerator - 2) / 5) + 32;
+  value_f = std::max(-128, std::min(127, value_f));
+  return static_cast<int8_t>(value_f);
+}
+
 #ifdef USE_SENSOR
 void ACHIClimate::publish_sensor_if_changed_(sensor::Sensor *sensor, float value) {
   if (sensor != nullptr && (!sensor->has_state() || sensor->get_raw_state() != value)) {
@@ -881,6 +898,14 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
   ESP_LOGD(TAG, "Control: new desired state registered, command_sound=%s, will send after %lums debounce",
            command_sound_enabled_ ? "ON" : "OFF", (unsigned long) CONTROL_DEBOUNCE_MS);
+}
+
+uint8_t ACHIClimate::encode_temp_(uint8_t c) const {
+  const uint8_t clamped_c = std::max<uint8_t>(16, std::min<uint8_t>(30, c));
+  const uint8_t wire_value = this->temp_unit_f_
+      ? static_cast<uint8_t>(celsius_to_fahrenheit_(clamped_c))
+      : clamped_c;
+  return static_cast<uint8_t>((wire_value << 1) | 0x01);
 }
 
 // ---- Build a one-shot neutral TX frame ----
@@ -1992,39 +2017,50 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     ESP_LOGD(TAG, "Sleep Mode Code returned to 0; clearing desired HA Sleep preset");
   }
 
-  // Target temperature (direct value). This must be read before +8 °C
-  // detection because this indoor-unit firmware does not set either of the
-  // documented frost-protection status bits. Instead, a remote-control +8 °C
-  // command is reported as HEAT with the otherwise invalid normal setpoint 8.
-  const uint8_t raw_target_c = b[IDX_SET_TEMP];
+  // The indoor unit reports the setpoint and room temperature in the display
+  // unit selected on the panel/remote. Byte 26 bit 1 is authoritative:
+  // 0 = Celsius, 1 = Fahrenheit. ESPHome and Home Assistant keep all internal
+  // climate values in Celsius, so convert only these two status fields.
+  const bool previous_temp_unit_f = temp_unit_f_;
+  temp_unit_f_ = (b[IDX_TEMP_UNIT] & 0x02) != 0;
+  temp_unit_known_ = true;
+  if (previous_temp_unit_f != temp_unit_f_) {
+    ESP_LOGI(TAG, "AC temperature display unit changed to %s", temp_unit_f_ ? "Fahrenheit" : "Celsius");
+  }
 
-  // 8 °C frost-protection mode. Keep the documented status-bit checks for
-  // compatible models, and additionally accept HEAT + raw target 8 for this
-  // model. A normal Hisense setpoint is limited to 16–30 °C, so raw value 8 is
-  // an unambiguous action-style +8 °C indication rather than an ordinary
-  // target temperature.
+  const uint8_t raw_target_wire = b[IDX_SET_TEMP];
+  const uint8_t raw_current_wire = b[IDX_CURRENT_TEMP];
+  const int16_t decoded_target_c = temp_unit_f_
+      ? static_cast<int16_t>(fahrenheit_to_celsius_(raw_target_wire))
+      : static_cast<int16_t>(raw_target_wire);
+  const int16_t decoded_current_c = temp_unit_f_
+      ? static_cast<int16_t>(fahrenheit_to_celsius_(raw_current_wire))
+      : static_cast<int16_t>(raw_current_wire);
+
+  // 8 °C frost-protection mode. In Fahrenheit the same special target is
+  // reported as 46 °F, which decodes back to 8 °C before this check.
   const bool heat_8c_primary = b.size() > IDX_RX_HEAT_8C &&
                                (b[IDX_RX_HEAT_8C] & 0x01) != 0;
   const bool heat_8c_companion = b.size() > IDX_RX_HEAT_8C_COMPANION &&
                                  (b[IDX_RX_HEAT_8C_COMPANION] & 0x80) != 0;
   const bool heat_8c_target_marker = power_on_ &&
                                      mode_ == climate::CLIMATE_MODE_HEAT &&
-                                     raw_target_c == 8;
+                                     decoded_target_c == 8;
   heat_8c_ = heat_8c_primary || heat_8c_companion || heat_8c_target_marker;
   if (heat_8c_) mode_ = climate::CLIMATE_MODE_HEAT;
   if (heat_8c_) {
-    // Units may report an out-of-normal-range internal frost setpoint (5 or
-    // 8 °C). Keep the remembered normal HEAT target internally and publish the
-    // logical +8 °C target through the preset instead of poisoning temperature
-    // memory with that special controller value.
+    // Keep the remembered normal HEAT target internally and publish the logical
+    // +8 °C target through the preset instead of poisoning temperature memory.
     target_c_ = target_for_mode_(climate::CLIMATE_MODE_HEAT, d_target_c_);
+  } else if (decoded_target_c >= 16 && decoded_target_c <= 30) {
+    target_c_ = static_cast<uint8_t>(decoded_target_c);
   } else {
-    target_c_ = raw_target_c;
-    if (target_c_ < 16 || target_c_ > 30) target_c_ = 24; // fallback
+    ESP_LOGW(TAG, "Ignoring invalid setpoint %u °%c (decoded %d °C)",
+             raw_target_wire, temp_unit_f_ ? 'F' : 'C', decoded_target_c);
+    target_c_ = 24;
   }
 
-  // Current temperatures
-  current_temperature = b[IDX_CURRENT_TEMP];
+  current_temperature = static_cast<float>(decoded_current_c);
 
 #ifdef USE_SENSOR
   publish_sensor_if_changed_(pipe_sensor_, b[IDX_PIPE_TEMP]);
@@ -2340,9 +2376,9 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // target instead of exposing that transient value.
   const uint8_t published_setpoint = heat_8c_
       ? 8
-      : (power_on_ ? b[IDX_SET_TEMP] : target_for_mode_(mode_, d_target_c_));
+      : (power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_));
   publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
-  publish_sensor_if_changed_(room_temp_sensor_, b[IDX_CURRENT_TEMP]);
+  publish_sensor_if_changed_(room_temp_sensor_, current_temperature);
   publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
   publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);
   publish_sensor_if_changed_(mode_code_sensor_, (b[IDX_POWER_MODE] >> 4) & 0x0F);
@@ -2390,7 +2426,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u target_marker=%s), current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, unit=%c, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u%c target_marker=%s), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
@@ -2398,10 +2434,10 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
-           (unsigned) (heat_8c_ ? 8 : target_c_), heat_8c_ ? "ON" : "OFF",
+           (unsigned) (heat_8c_ ? 8 : target_c_), temp_unit_f_ ? 'F' : 'C', heat_8c_ ? "ON" : "OFF",
            b.size() > IDX_RX_HEAT_8C ? b[IDX_RX_HEAT_8C] : 0,
            b.size() > IDX_RX_HEAT_8C_COMPANION ? b[IDX_RX_HEAT_8C_COMPANION] : 0,
-           (unsigned) raw_target_c, heat_8c_target_marker ? "YES" : "NO", current_temperature,
+           (unsigned) raw_target_wire, temp_unit_f_ ? 'F' : 'C', heat_8c_target_marker ? "YES" : "NO", current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
            b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
            b[IDX_COMPRESSOR_EXHAUST_TEMP]);
