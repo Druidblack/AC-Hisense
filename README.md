@@ -84,6 +84,7 @@ climate:
     uart_id: ac_uart
     update_interval: 2s
     enable_presets: true
+    # enable_humidity: false  # uncomment to hide humidity sensors on units without humidity hardware
 
 ```
 
