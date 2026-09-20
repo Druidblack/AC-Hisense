@@ -29,10 +29,10 @@ static void log_kelon168_data(const char *prefix, const Kelon168Data &data) {
 static const char *const CUSTOM_PRESET_QUIET = "Quiet";
 static const char *const CUSTOM_PRESET_HEAT_8C = "+8°C";
 static const char *const CUSTOM_FAN_TURBO = "Turbo";
-static const char *const SLEEP_PROGRAM_1 = "Sleep 1";
-static const char *const SLEEP_PROGRAM_2 = "Sleep 2";
-static const char *const SLEEP_PROGRAM_3 = "Sleep 3";
-static const char *const SLEEP_PROGRAM_4 = "Sleep 4";
+static const char *const SLEEP_PROGRAM_1 = "Sleep 1 — Hold";
+static const char *const SLEEP_PROGRAM_2 = "Sleep 2 — Standard";
+static const char *const SLEEP_PROGRAM_3 = "Sleep 3 — Wake Cool";
+static const char *const SLEEP_PROGRAM_4 = "Sleep 4 — Steady";
 static constexpr uint32_t SLEEP_LED_RESTORE_TIMEOUT_MS = 10000;
 
 static const char *sleep_program_for_stage(uint8_t stage) {
@@ -46,10 +46,10 @@ static const char *sleep_program_for_stage(uint8_t stage) {
 }
 
 static uint8_t sleep_stage_from_program(const std::string &program) {
-  if (program == SLEEP_PROGRAM_1) return 1;
-  if (program == SLEEP_PROGRAM_2) return 2;
-  if (program == SLEEP_PROGRAM_3) return 3;
-  if (program == SLEEP_PROGRAM_4) return 4;
+  if (program == SLEEP_PROGRAM_1 || program == "Sleep 1") return 1;
+  if (program == SLEEP_PROGRAM_2 || program == "Sleep 2") return 2;
+  if (program == SLEEP_PROGRAM_3 || program == "Sleep 3") return 3;
+  if (program == SLEEP_PROGRAM_4 || program == "Sleep 4") return 4;
   return 0;
 }
 
@@ -2372,9 +2372,10 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   ESP_LOGV(TAG,
            "Extended status: compressor_actual=%uHz compressor_set=%uHz compressor_command=%uHz "
-           "exhaust=%u°C raw_b22=0x%02X raw_b23=0x%02X raw_b47=0x%02X raw_b48=%u/%d",
+           "discharge=%d°C condenser=%d°C raw_b22=0x%02X raw_b23=0x%02X raw_b47=0x%02X raw_b48=%u/%d",
            b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
-           b[IDX_COMPRESSOR_EXHAUST_TEMP], b[22], b[23], b[47],
+           static_cast<int8_t>(b[IDX_COMPRESSOR_DISCHARGE_TEMP]),
+           static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]), b[22], b[23], b[47],
            b[48], static_cast<int8_t>(b[48]));
 
   // Publish optional sensors (with sign conversion for outdoor temperatures)
@@ -2419,8 +2420,10 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
     int8_t t = static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]);
     publish_sensor_if_changed_(outdoor_cond_temp_sensor_, static_cast<float>(t));
   }
-  publish_sensor_if_changed_(compressor_exhaust_temp_sensor_,
-                             static_cast<float>(b[IDX_COMPRESSOR_EXHAUST_TEMP]));
+  if (compressor_discharge_temp_sensor_ != nullptr) {
+    int8_t t = static_cast<int8_t>(b[IDX_COMPRESSOR_DISCHARGE_TEMP]);
+    publish_sensor_if_changed_(compressor_discharge_temp_sensor_, static_cast<float>(t));
+  }
   // Humidity entities always exist, but their availability follows the
   // ProductType reply. Before capabilities are known, leave them unavailable.
   if (capabilities_.valid && capabilities_.humidity) {
@@ -2444,7 +2447,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
 
   ESP_LOGD(TAG,
            "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, unit=%c, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u%c target_marker=%s), current=%.1f°C, outdoor=%d°C, "
-           "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, exhaust=%u°C",
+           "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, discharge=%d°C, condenser=%d°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
            (unsigned) raw_mode_code_,
@@ -2457,7 +2460,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            (unsigned) raw_target_wire, temp_unit_f_ ? 'F' : 'C', heat_8c_target_marker ? "YES" : "NO", current_temperature,
            static_cast<int8_t>(b[IDX_OUTDOOR_TEMP]),
            b[IDX_COMP_FREQ_ACTUAL], b[IDX_COMP_FREQ_SET], b[IDX_COMP_FREQ_COMMAND],
-           b[IDX_COMPRESSOR_EXHAUST_TEMP]);
+           static_cast<int8_t>(b[IDX_COMPRESSOR_DISCHARGE_TEMP]),
+           static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]));
 
   // If HA has priority, check convergence and possibly enforce
   maybe_force_to_target_();

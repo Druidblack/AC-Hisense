@@ -176,8 +176,8 @@ enum FrameIndex : uint8_t {
   IDX_COMP_FREQ_SET = 42,
   IDX_COMP_FREQ_COMMAND = 43,
   IDX_OUTDOOR_TEMP = 44,
-  IDX_OUTDOOR_COND_TEMP = 45,
-  IDX_COMPRESSOR_EXHAUST_TEMP = 46,
+  IDX_COMPRESSOR_DISCHARGE_TEMP = 45,
+  IDX_OUTDOOR_COND_TEMP = 46,
 };
 
 // Command fields in the 0x65 write frame. A zero byte means "do not change"
@@ -311,7 +311,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_voltage_sensor(sensor::Sensor *s) { voltage_sensor_ = s; }
   void set_current_sensor(sensor::Sensor *s) { current_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
-  void set_compressor_exhaust_temp_sensor(sensor::Sensor *s) { compressor_exhaust_temp_sensor_ = s; }
+  void set_compressor_discharge_temp_sensor(sensor::Sensor *s) { compressor_discharge_temp_sensor_ = s; }
   void set_indoor_humidity_setting_sensor(sensor::Sensor *s) { indoor_humidity_setting_sensor_ = s; }
   void set_indoor_humidity_sensor(sensor::Sensor *s) { indoor_humidity_sensor_ = s; }
   void set_power_on_timer_remaining_sensor(sensor::Sensor *s) { power_on_timer_remaining_sensor_ = s; }
@@ -648,7 +648,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   sensor::Sensor *voltage_sensor_{nullptr};
   sensor::Sensor *current_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
-  sensor::Sensor *compressor_exhaust_temp_sensor_{nullptr};
+  sensor::Sensor *compressor_discharge_temp_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_setting_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_sensor_{nullptr};
   sensor::Sensor *power_on_timer_remaining_sensor_{nullptr};

@@ -29,6 +29,7 @@ else:
     }
 
 CONF_ENABLE_PRESETS = "enable_presets"
+CONF_ENABLE_HUMIDITY = "enable_humidity"
 CONF_PIPE_TEMPERATURE = "pipe_temperature"
 CONF_LED_SWITCH = "led_switch"
 CONF_SOUND_SWITCH = "sound_switch"
@@ -72,6 +73,8 @@ CONF_POWER = "power"
 CONF_VOLTAGE = "voltage"
 CONF_CURRENT = "current"
 CONF_OUTDOOR_COND_TEMP = "outdoor_condenser_temperature"
+CONF_COMPRESSOR_DISCHARGE_TEMP = "compressor_discharge_temperature"
+# Legacy YAML spelling; both this alias and the new key read discharge temperature (byte 45).
 CONF_COMPRESSOR_EXHAUST_TEMP = "compressor_exhaust_temperature"
 
 # Indoor humidity fields from the long 0x66 status frame
@@ -88,9 +91,27 @@ CONF_HEAP_FRAGMENTATION = "heap_fragmentation"
 CONF_PSRAM_TOTAL = "psram_total"
 CONF_PSRAM_FREE = "psram_free"
 
-CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
+# Use one default discharge entity, but respect explicitly configured legacy YAML
+# without creating a second, duplicate temperature sensor.
+DISCHARGE_SENSOR_SCHEMA = sensor.sensor_schema(
+    unit_of_measurement="°C", accuracy_decimals=0, icon="mdi:thermometer",
+)
+
+
+def _ensure_discharge_sensor(config):
+    if CONF_COMPRESSOR_DISCHARGE_TEMP in config and CONF_COMPRESSOR_EXHAUST_TEMP in config:
+        raise cv.Invalid("Choose compressor_discharge_temperature or legacy compressor_exhaust_temperature, not both")
+    if CONF_COMPRESSOR_DISCHARGE_TEMP not in config and CONF_COMPRESSOR_EXHAUST_TEMP not in config:
+        config[CONF_COMPRESSOR_DISCHARGE_TEMP] = DISCHARGE_SENSOR_SCHEMA(
+            {CONF_NAME: "Compressor Discharge Temperature"}
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(BASE_CLIMATE_SCHEMA.extend({
     **BASE_CLIMATE_EXTRA,
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
+    cv.Optional(CONF_ENABLE_HUMIDITY, default=True): cv.boolean,
     # RS-485 direction control for transceivers without auto-direction
     cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
     cv.Optional(CONF_DE_PIN): pins.gpio_output_pin_schema,
@@ -188,14 +209,12 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
         accuracy_decimals=0,
         icon="mdi:thermometer",
     ),
-    cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP, default={CONF_NAME: "Compressor Exhaust Temperature"}): sensor.sensor_schema(
-        unit_of_measurement="°C",
-        accuracy_decimals=0,
-        icon="mdi:thermometer",
-    ),
+    cv.Optional(CONF_COMPRESSOR_DISCHARGE_TEMP): DISCHARGE_SENSOR_SCHEMA,
+    # Legacy alias for an existing configuration; maps to byte 45 after correction.
+    cv.Optional(CONF_COMPRESSOR_EXHAUST_TEMP): DISCHARGE_SENSOR_SCHEMA,
 
-    # Humidity entities are normal measurement sensors. ProductType still
-    # controls their availability when the unit has no humidity hardware.
+    # Created by default. Set enable_humidity: false to omit both entities;
+    # ProductType still controls their availability on supported devices.
     cv.Optional(CONF_INDOOR_HUMIDITY_SETTING, default={CONF_NAME: "Indoor Humidity Setting"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
     cv.Optional(CONF_INDOOR_HUMIDITY, default={CONF_NAME: "Indoor Humidity"}): sensor.sensor_schema(unit_of_measurement="%", device_class="humidity", accuracy_decimals=0),
 
@@ -285,7 +304,7 @@ CONFIG_SCHEMA = BASE_CLIMATE_SCHEMA.extend({
     cv.Optional(CONF_PSRAM_TOTAL): sensor.sensor_schema(),
     cv.Optional(CONF_PSRAM_FREE): sensor.sensor_schema(),
 
-}).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("5s"))
+}).extend(uart.UART_DEVICE_SCHEMA).extend(cv.polling_component_schema("5s")), _ensure_discharge_sensor)
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
@@ -385,16 +404,19 @@ async def to_code(config):
         sens = await sensor.new_sensor(conf)
         cg.add(var.set_outdoor_cond_temp_sensor(sens))
 
-    if conf := config.get(CONF_COMPRESSOR_EXHAUST_TEMP):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_compressor_exhaust_temp_sensor(sens))
+    # New key or backward-compatible YAML spelling; both expose corrected byte 45.
+    for key in (CONF_COMPRESSOR_DISCHARGE_TEMP, CONF_COMPRESSOR_EXHAUST_TEMP):
+        if conf := config.get(key):
+            sens = await sensor.new_sensor(conf)
+            cg.add(var.set_compressor_discharge_temp_sensor(sens))
 
-    if conf := config.get(CONF_INDOOR_HUMIDITY_SETTING):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_indoor_humidity_setting_sensor(sens))
-    if conf := config.get(CONF_INDOOR_HUMIDITY):
-        sens = await sensor.new_sensor(conf)
-        cg.add(var.set_indoor_humidity_sensor(sens))
+    if config[CONF_ENABLE_HUMIDITY]:
+        if conf := config.get(CONF_INDOOR_HUMIDITY_SETTING):
+            sens = await sensor.new_sensor(conf)
+            cg.add(var.set_indoor_humidity_setting_sensor(sens))
+        if conf := config.get(CONF_INDOOR_HUMIDITY):
+            sens = await sensor.new_sensor(conf)
+            cg.add(var.set_indoor_humidity_sensor(sens))
 
     if conf := config.get(CONF_POWER_ON_TIMER_REMAINING):
         sens = await sensor.new_sensor(conf)
@@ -456,7 +478,7 @@ async def to_code(config):
     if sleep_program_conf := config.get(CONF_SLEEP_PROGRAM):
         sleep_program = await select.new_select(
             sleep_program_conf,
-            options=["Sleep 1", "Sleep 2", "Sleep 3", "Sleep 4"],
+            options=["Sleep 1 — Hold", "Sleep 2 — Standard", "Sleep 3 — Wake Cool", "Sleep 4 — Steady"],
         )
         cg.add(var.set_sleep_program_select(sleep_program))
 
