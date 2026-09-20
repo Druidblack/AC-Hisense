@@ -167,6 +167,12 @@ void ACHISleepProgramSelect::control(const std::string &value) {
 // ---- ACHIClimate implementation ----
 
 void ACHIClimate::setup() {
+  for (GPIOPin *p : {flow_control_pin_, de_pin_, re_pin_}) {
+    if (p != nullptr) {
+      p->setup();
+      p->digital_write(false);  // receive
+    }
+  }
   // Register custom presets on the Climate entity, not on ClimateTraits.
   // ClimateTraits::set_supported_custom_presets() is deprecated and will be removed in ESPHome 2026.11.0.
   if (enable_presets_) {
@@ -1402,8 +1408,10 @@ void ACHIClimate::send_logical_frame_(const std::vector<uint8_t> &logical, const
              (unsigned) logical.size(), (unsigned) wire.size());
     log_frame_("TX wire", wire);
   }
+  rs485_tx_(true);
   for (auto b : wire) write_byte(b);
   flush();
+  rs485_tx_(false);
 }
 
 // ---- RX frame parsing ----
@@ -2379,6 +2387,15 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
       : (power_on_ ? target_c_ : target_for_mode_(mode_, d_target_c_));
   publish_sensor_if_changed_(set_temp_sensor_, published_setpoint);
   publish_sensor_if_changed_(room_temp_sensor_, current_temperature);
+  // Electrical data carried by the long (150-byte) status frame of some indoor units:
+  // byte 50 = mains voltage (V), bytes 55-56 = input power (W, big-endian),
+  // byte 60 = input current (A, integer). Units that reply with the short frame
+  // never reach this branch and the sensors simply stay unknown.
+  if (b.size() > 60) {
+    publish_sensor_if_changed_(voltage_sensor_, static_cast<float>(b[50] | (b[51] << 8)));
+    publish_sensor_if_changed_(power_sensor_, static_cast<float>((b[55] << 8) | b[56]));
+    publish_sensor_if_changed_(current_sensor_, static_cast<float>(b[60]));
+  }
   publish_sensor_if_changed_(wind_code_sensor_, b[IDX_WIND]);
   publish_sensor_if_changed_(sleep_code_sensor_, b[IDX_SLEEP]);
   publish_sensor_if_changed_(mode_code_sensor_, (b[IDX_POWER_MODE] >> 4) & 0x0F);

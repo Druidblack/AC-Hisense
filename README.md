@@ -37,6 +37,16 @@ The component exposes a standard Home Assistant Climate entity, along with a set
 
 > ⚠️ The AC uses 5V logic levels on its RS‑485 port. Make sure your transceiver is 3.3V‑tolerant if you power the ESP from 3.3V.
 
+Transceivers with automatic direction switching (TXD/RXD only) need no extra wiring. A bare MAX485 (DI/DE/RE/RO pins) needs the driver enabled while transmitting: wire DE and RE together to one GPIO and set `flow_control_pin`, or keep them separate and set `de_pin` and `re_pin`. The component drives the pin(s) HIGH for the duration of each frame and LOW otherwise.
+
+```yaml
+climate:
+  - platform: ac_hi
+    # ...
+    flow_control_pin: GPIO21   # DE + RE bridged
+    # or: de_pin: GPIO21 / re_pin: GPIO17
+```
+
 <img width="1055" height="1053" alt="image" src="https://github.com/user-attachments/assets/933c420f-395c-4ee8-a7df-6d1056cbf31e" />
 
 
@@ -75,6 +85,40 @@ climate:
     update_interval: 2s
     enable_presets: true
 
+```
+
+### Electrical sensors (power, voltage, current)
+
+`power` (W), `voltage` (V) and `current` (A) sensors are created by default, like the other status sensors, and are populated only when the indoor unit sends the long status frame (see the protocol section below). The current reported by the AC is an integer, so a finer value can be derived as power / voltage with a template sensor. For the Home Assistant Energy dashboard combine `power` with `total_daily_energy`; add a `heartbeat` filter so the energy keeps integrating while the power value is constant:
+
+```yaml
+time:
+  - platform: homeassistant
+
+climate:
+  - platform: ac_hi
+    # ...
+    power:
+      name: "Power"
+      id: ac_power
+      filters:
+        - heartbeat: 30s
+    voltage:
+      name: "Voltage"
+    current:
+      name: "Current (raw)"
+
+sensor:
+  - platform: total_daily_energy
+    name: "Energy Daily"
+    power_id: ac_power
+    method: trapezoid
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
 ```
 
 configuration for the iFeel function (uses mqtt, an external IR transmitter, and any thermometer from home assistant)
@@ -300,6 +344,12 @@ When the AC receives a short query (0x66 frame), it responds with a long status 
 | 43 | Compressor actual frequency | Hz |
 | 44 | Outdoor air temperature | °C (signed int8\_t) |
 | 45 | Outdoor condenser temperature | °C (signed int8\_t) |
+| 50 | Mains voltage | V (byte 51 is always 0, so possibly uint16 LE). Long status frame only |
+| 55–56 | Input power | W, **uint16 big-endian** (55 = high byte, 56 = low byte). Long status frame only |
+| 60 | Input current | A, integer (rounded). Long status frame only |
+| 144–145 | Copy of the input power | uint16 little-endian, same value as bytes 55–56 |
+
+Some indoor units answer the status query with a **150-byte frame** (byte 4 = 0x8D). Bytes 50, 55–56 and 60 of that frame carry the electrical data that the original Wi‑Fi module exposes to the cloud as voltage / power (verified on a Hisense split with the AEH‑W4G1 module: 20 Hz → 110 W / 0 A, 46 Hz → 1740 W / 8 A at 226 V; power / voltage matches the current byte). Units that reply with the short frame do not have these fields and the related sensors stay unknown.
 
 ### Write command (command 0x65)
 

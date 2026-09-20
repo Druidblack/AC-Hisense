@@ -4,6 +4,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/gpio.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/select/select.h"
 #include "esphome/components/remote_base/remote_base.h"
@@ -259,6 +260,12 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Configuration
   void set_enable_presets(bool v) { enable_presets_ = v; }
+  // Optional RS-485 half-duplex direction control for transceivers without
+  // automatic direction switching (e.g. bare MAX485): either a single
+  // flow_control_pin wired to DE+RE, or separate de_pin / re_pin.
+  void set_flow_control_pin(GPIOPin *pin) { flow_control_pin_ = pin; }
+  void set_de_pin(GPIOPin *pin) { de_pin_ = pin; }
+  void set_re_pin(GPIOPin *pin) { re_pin_ = pin; }
 #ifdef USE_SENSOR
   void set_pipe_sensor(sensor::Sensor *s) { pipe_sensor_ = s; }
 #else
@@ -300,6 +307,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Legacy YAML key `compressor_frequency`; retained as an alias for byte 43.
   void set_compr_freq_sensor(sensor::Sensor *s) { compressor_freq_sensor_ = s; }
   void set_outdoor_temp_sensor(sensor::Sensor *s) { outdoor_temp_sensor_ = s; }
+  void set_power_sensor(sensor::Sensor *s) { power_sensor_ = s; }
+  void set_voltage_sensor(sensor::Sensor *s) { voltage_sensor_ = s; }
+  void set_current_sensor(sensor::Sensor *s) { current_sensor_ = s; }
   void set_outdoor_cond_temp_sensor(sensor::Sensor *s) { outdoor_cond_temp_sensor_ = s; }
   void set_compressor_exhaust_temp_sensor(sensor::Sensor *s) { compressor_exhaust_temp_sensor_ = s; }
   void set_indoor_humidity_setting_sensor(sensor::Sensor *s) { indoor_humidity_setting_sensor_ = s; }
@@ -427,6 +437,16 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   std::vector<uint8_t> rx_;
   size_t rx_start_{0};
 
+  GPIOPin *flow_control_pin_{nullptr};
+  GPIOPin *de_pin_{nullptr};
+  GPIOPin *re_pin_{nullptr};
+  // HIGH while transmitting, LOW otherwise. /RE is active low, so driving it
+  // HIGH during TX also mutes the receiver and avoids echoing our own frame.
+  void rs485_tx_(bool tx) {
+    if (flow_control_pin_ != nullptr) flow_control_pin_->digital_write(tx);
+    if (de_pin_ != nullptr) de_pin_->digital_write(tx);
+    if (re_pin_ != nullptr) re_pin_->digital_write(tx);
+  }
   bool writing_lock_{false};
   uint32_t write_lock_time_{0};               // when lock was set
 
@@ -624,6 +644,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Legacy byte-43 sensor configured through `compressor_frequency`.
   sensor::Sensor *compressor_freq_sensor_{nullptr};
   sensor::Sensor *outdoor_temp_sensor_{nullptr};
+  sensor::Sensor *power_sensor_{nullptr};
+  sensor::Sensor *voltage_sensor_{nullptr};
+  sensor::Sensor *current_sensor_{nullptr};
   sensor::Sensor *outdoor_cond_temp_sensor_{nullptr};
   sensor::Sensor *compressor_exhaust_temp_sensor_{nullptr};
   sensor::Sensor *indoor_humidity_setting_sensor_{nullptr};
