@@ -250,6 +250,31 @@ For flashing the native module (AEH-W4G1)
 -   Target temperature range: 16–30°C in steps of 1°C
 -   Current temperature is read from the AC and displayed
 
+### Sleep programs
+
+The `SLEEP` preset activates one of four pre-programmed temperature adjustment curves built into the indoor unit. The AC automatically adjusts the target temperature and reduces fan speed overnight. Sleep ends automatically after ~8 hours.
+
+In **cooling mode**, the programs behave as follows (offsets relative to your set temperature):
+
+| Program | Temperature curve (cooling) |
+|---------|-------------|
+| Sleep 1 — Hold | +2°C over the first 2 hours, then holds |
+| Sleep 2 — Standard | +2°C over 2 hours, then drops back: −1°C at ~6h, −1°C at ~7h |
+| Sleep 3 — Wake Cool | +1°C after 1h, +2°C after 2h, then drops: −2°C at ~6h, −1°C at ~7h |
+| Sleep 4 — Steady | Maintains your set temperature all night (no curve) |
+
+Hisense describes these as targeting different comfort preferences (Sleep 2 is the default). Sleep 4 is effectively "fixed temperature + quiet fan."
+
+> **Note:** Exact curves may vary by model. The above is documented in Hisense service manuals ([source](https://hisense.es/wp-content/uploads/2017/08/manual-AST-24UW4SDBTG10-1.pdf)).
+
+**How it works:**
+- Selecting `SLEEP` preset in HA sends the chosen program code to the AC
+- The AC takes over fan speed (drops to quiet) and adjusts the setpoint according to the program's built-in curve
+- After ~8 hours the AC returns to normal operation
+- The `Sleep Program` select entity picks which program is used the next time you activate Sleep
+- The `sleep_stage` sensor reports the currently active program (0 = off, 1–4 = active program)
+
+
 ### Sensors (optional)
 
 Most sensors publish raw values received from the AC:
