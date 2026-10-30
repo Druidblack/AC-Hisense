@@ -54,9 +54,9 @@ struct Kelon168Data {
 
 class Kelon168Protocol : public remote_base::RemoteProtocol<Kelon168Data> {
  public:
-  void encode(remote_base::RemoteTransmitData *dst, const Kelon168Data &data) override;
-  optional<Kelon168Data> decode(remote_base::RemoteReceiveData src) override;
-  void dump(const Kelon168Data &data) override;
+  void encode(remote_base::RemoteTransmitData *dst, const Kelon168Data &data);
+  optional<Kelon168Data> decode(remote_base::RemoteReceiveData src);
+  void dump(const Kelon168Data &data);
 
   static Kelon168Data make_default();
   static bool valid_checksum(const Kelon168Data &data);
