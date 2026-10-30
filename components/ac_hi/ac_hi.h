@@ -36,6 +36,8 @@ enum QueryKind : uint8_t {
   QUERY_NONE = 0,
   QUERY_STATUS = 1,
   QUERY_CAPABILITIES = 2,
+  QUERY_DEVTYPE = 3,
+  QUERY_VERSION = 4,
 };
 
 struct ACHIDeviceCapabilities {
@@ -242,8 +244,16 @@ static constexpr size_t   MAX_FRAME_BYTES      = 256;  // logical (unescaped) fr
 static constexpr size_t   MAX_WIRE_FRAME_BYTES = MAX_FRAME_BYTES * 2;
 static constexpr uint32_t WRITE_LOCK_TIMEOUT   = 5000;   // ms
 static constexpr uint32_t STATUS_QUERY_TIMEOUT = 1500;   // ms; prevents 0x65/0x66 overlap
+// Let the indoor unit settle before verifying a full 0x65 write response via 0x66.
+static constexpr uint32_t WRITE_ACK_VERIFY_DELAY_MS = 250;
 static constexpr uint8_t  CAPABILITIES_MAX_ATTEMPTS = 3;
 static constexpr uint32_t CAPABILITIES_RETRY_MS = 10000;
+// Best-effort 0x0A/0x04 discovery: never block normal status polling indefinitely.
+static constexpr uint8_t DEVTYPE_MAX_ATTEMPTS = 3;
+static constexpr uint32_t DEVTYPE_RETRY_MS = 10000;
+// Factory W4G2 0x07/0x01 version discovery is diagnostic only.
+static constexpr uint8_t VERSION_MAX_ATTEMPTS = 3;
+static constexpr uint32_t VERSION_RETRY_MS = 10000;
 static constexpr uint32_t CONTROL_DEBOUNCE_MS  = 200;    // ms
 static constexpr uint32_t MEM_PUBLISH_INTERVAL_MS = 5000; // for memory diagnostics
 static constexpr uint32_t TIMER_REPEAT_EVENT_WINDOW_MS = 15000;
@@ -251,7 +261,13 @@ static constexpr uint32_t TIMER_REPEAT_EVENT_WINDOW_MS = 15000;
 // status replies keep arriving with 00/00 for longer than this interval, the
 // timer was cancelled from the physical remote (or expired in the unit).
 static constexpr uint32_t TIMER_STATUS_REFRESH_TIMEOUT_MS = 75000;
-static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // delay first AC query after boot
+// Startup: bounded early status probes. A confirmed CRC-valid 0x66/0x00
+// reply releases the initial guard. No reply => keep the original 10 s
+// fallback and normal periodic polling. No busy wait or UART flood.
+static constexpr uint32_t STARTUP_POLL_DELAY_MS = 10000;  // legacy/fallback delay
+static constexpr uint32_t STARTUP_FIRST_PROBE_MS = 2000;
+static constexpr uint32_t STARTUP_PROBE_INTERVAL_MS = 3000;
+static constexpr uint8_t STARTUP_MAX_EARLY_PROBES = 3;
 static constexpr uint16_t MAX_UART_BYTES_PER_LOOP = 128;  // keep API/Wi-Fi responsive during UART bursts
 
 class ACHIClimate : public climate::Climate, public PollingComponent, public uart::UARTDevice {
@@ -260,6 +276,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Configuration
   void set_enable_presets(bool v) { enable_presets_ = v; }
+  // Set false to restore the exact pre-stage-4 fixed 10-second startup guard.
+  void set_adaptive_startup(bool v) { adaptive_startup_ = v; }
+  // Stage 5: parse full write-response snapshots, then verify with a 0x66 poll.
+  // False preserves the original ACK-only handling and normal polling cadence.
+  void set_ack_state_sync(bool v) { ack_state_sync_ = v; }
   // Optional RS-485 half-duplex direction control for transceivers without
   // automatic direction switching (e.g. bare MAX485): either a single
   // flow_control_pin wired to DE+RE, or separate de_pin / re_pin.
@@ -336,6 +357,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #ifdef USE_TEXT_SENSOR
   void set_power_status_text(text_sensor::TextSensor *t) { power_status_text_ = t; }
   void set_device_capabilities_text(text_sensor::TextSensor *t) { device_capabilities_text_ = t; }
+  void set_device_type_text(text_sensor::TextSensor *t) { device_type_text_ = t; }
+  void set_ac_software_version_text(text_sensor::TextSensor *t) { ac_software_version_text_ = t; }
+  void set_ac_protocol_version_text(text_sensor::TextSensor *t) { ac_protocol_version_text_ = t; }
   void set_ac_active_faults_text(text_sensor::TextSensor *t) { ac_active_faults_text_ = t; }
   void set_power_on_timer_text(text_sensor::TextSensor *t) { power_on_timer_text_ = t; }
   void set_power_off_timer_text(text_sensor::TextSensor *t) { power_off_timer_text_ = t; }
@@ -357,6 +381,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Protocol I/O
   void send_query_status_();
   void send_query_capabilities_();
+  void send_query_devtype_();
+  void send_query_version_();
   void send_write_changes_();
 
   // IR iFeel helpers
@@ -378,8 +404,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void try_parse_frames_from_buffer_(uint32_t budget_ms = MAX_PARSE_TIME_MS);
   bool extract_next_frame_(std::vector<uint8_t> &frame);
   void handle_frame_(const std::vector<uint8_t> &frame);
-  void parse_status_102_(const std::vector<uint8_t> &b);
+  void parse_status_102_(const std::vector<uint8_t> &b, bool from_write_ack = false);
   void parse_capabilities_102_64_(const std::vector<uint8_t> &b);
+  void parse_devtype_10_04_(const std::vector<uint8_t> &b);
+  void parse_version_07_01_(const std::vector<uint8_t> &b);
   void apply_capability_availability_();
   void publish_fault_state_(const std::vector<uint8_t> &b);
   void parse_timer_status_(const std::vector<uint8_t> &b);
@@ -389,7 +417,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void clear_timer_after_silence_(ACHITimerState &state, const char *name,
                                   uint8_t raw_hour, uint8_t raw_minute_status);
   void update_timer_countdowns_();
-  void handle_ack_101_();
+  void handle_ack_101_(const std::vector<uint8_t> &b);
 
   // State management
   void build_tx_from_pending_fields_(uint16_t fields);
@@ -460,6 +488,14 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHIDeviceCapabilities capabilities_{};
   uint8_t capabilities_attempts_{0};
   uint32_t capabilities_next_attempt_ms_{0};
+  // Device identification is diagnostic only. Failed discovery must not
+  // suppress the already-working status/capabilities/control traffic.
+  bool devtype_done_{false};
+  uint8_t devtype_attempts_{0};
+  uint32_t devtype_next_attempt_ms_{0};
+  bool version_done_{false};
+  uint8_t version_attempts_{0};
+  uint32_t version_next_attempt_ms_{0};
 #ifdef USE_API
   bool capability_api_refresh_pending_{false};
   uint32_t capability_api_refresh_at_ms_{0};
@@ -471,6 +507,11 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   bool pending_control_{false};
   uint16_t pending_command_fields_{CMD_FIELD_NONE};
   uint32_t last_control_ms_{0};
+  // A validated 0x65 response can contain a short snapshot of AC state.
+  // Verify it with the authoritative 0x66 response as soon as the bus is free.
+  bool ack_state_sync_{true};
+  bool post_write_status_pending_{false};
+  uint32_t write_ack_received_ms_{0};
 
   // True only after a UART write containing desired Sleep was actually sent.
   // The next status frame must report Sleep Mode Code > 0; otherwise the HA
@@ -500,8 +541,14 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // authoritative and must not be overwritten by stale desired HA fan state.
   bool sleep_fan_override_pending_{false};
 
-  // Boot guard: avoids querying the indoor AC controller while it is still starting.
+  // Adaptive startup only affects first discovery of a valid status reply.
+  // After 10 seconds we fall back to the unchanged periodic polling policy.
   uint32_t boot_ms_{0};
+  bool adaptive_startup_{true};
+  bool startup_ready_{false};
+  bool startup_fallback_logged_{false};
+  uint8_t startup_early_probe_attempts_{0};
+  uint32_t startup_next_probe_ms_{0};
 
   // Audible beep is requested only for real user commands when command sound is enabled.
   // Automatic HA-priority re-sends stay silent to avoid repeated beeping.
@@ -666,6 +713,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *power_status_text_{nullptr};
   text_sensor::TextSensor *device_capabilities_text_{nullptr};
+  text_sensor::TextSensor *device_type_text_{nullptr};
+  text_sensor::TextSensor *ac_software_version_text_{nullptr};
+  text_sensor::TextSensor *ac_protocol_version_text_{nullptr};
   text_sensor::TextSensor *ac_active_faults_text_{nullptr};
   text_sensor::TextSensor *power_on_timer_text_{nullptr};
   text_sensor::TextSensor *power_off_timer_text_{nullptr};

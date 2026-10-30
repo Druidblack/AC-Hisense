@@ -233,41 +233,77 @@ void ACHIClimate::setup() {
   update_sleep_program_select_state_();
 #ifdef USE_TEXT_SENSOR
   publish_text_sensor_if_changed_(device_capabilities_text_, "Waiting for 0x66/0x40");
+  publish_text_sensor_if_changed_(device_type_text_, "Not queried");
+  publish_text_sensor_if_changed_(ac_software_version_text_, "Not queried");
+  publish_text_sensor_if_changed_(ac_protocol_version_text_, "Not queried");
   publish_text_sensor_if_changed_(ac_active_faults_text_, "Waiting for status");
   publish_text_sensor_if_changed_(power_on_timer_text_, "Waiting for timer event");
   publish_text_sensor_if_changed_(power_off_timer_text_, "Waiting for timer event");
 #endif
 
-  // Remember boot time so the first status poll is delayed after a full power restore.
-  // Indoor AC boards can be noisy on UART while they are still booting; polling too early
-  // may flood the component and starve ESPHome API/Wi-Fi.
+  // Mark boot time before starting the bounded startup discovery window.
+  // One short status request at a time; all UART RX parsing remains time-bounded.
   boot_ms_ = millis();
+  startup_next_probe_ms_ = boot_ms_ + STARTUP_FIRST_PROBE_MS;
 
   // Pre‑reserve buffers to avoid reallocations
   rx_.reserve(RX_BUFFER_RESERVE);
   last_status_frame_.reserve(MAX_FRAME_BYTES);
   last_tx_frame_.reserve(MAX_FRAME_BYTES);
 
-  ESP_LOGI(TAG, "Setup complete; first AC status query will be delayed by %u ms",
-           (unsigned) STARTUP_POLL_DELAY_MS);
+  if (adaptive_startup_) {
+    ESP_LOGI(TAG, "Setup complete; adaptive startup: first status probe at %u ms, "
+                  "up to %u early probes, normal polling after %u ms if no reply",
+             (unsigned) STARTUP_FIRST_PROBE_MS, (unsigned) STARTUP_MAX_EARLY_PROBES,
+             (unsigned) STARTUP_POLL_DELAY_MS);
+  } else {
+    ESP_LOGI(TAG, "Setup complete; adaptive startup disabled; first AC status query "
+                  "delayed by %u ms", (unsigned) STARTUP_POLL_DELAY_MS);
+  }
 }
 
 void ACHIClimate::update() {
-  // Give the indoor AC controller time to boot after a complete power loss.
-  // Without this guard, the ESP can query the UART while the AC board is still
-  // starting and producing incomplete/noisy frames.
-  if (millis() - boot_ms_ < STARTUP_POLL_DELAY_MS) {
-    ESP_LOGD(TAG, "Startup delay: skipping status query");
+  // Before first valid AC status, early probes are scheduled from loop().
+  // The regular PollingComponent must not race them or introduce additional
+  // requests within the original 10 s startup guard. After 10 s the previous
+  // polling algorithm resumes even if the AC has not responded yet.
+  if (millis() - boot_ms_ < STARTUP_POLL_DELAY_MS &&
+      (!adaptive_startup_ || !startup_ready_)) {
+    ESP_LOGV(TAG, "Startup discovery in progress; periodic poll deferred");
     return;
   }
 
   if (!writing_lock_ && !pending_control_ && !status_query_in_flight_) {
+    // Give a just-received 0x65 snapshot priority over optional discovery.
+    // Do not send the verification query until the brief settle period passes.
+    if (post_write_status_pending_) {
+      if (millis() - write_ack_received_ms_ >= WRITE_ACK_VERIFY_DELAY_MS) {
+        send_query_status_();
+      }
+      return;
+    }
     const bool capability_due =
         !capabilities_.valid && !last_status_frame_.empty() &&
         capabilities_attempts_ < CAPABILITIES_MAX_ATTEMPTS &&
         millis() >= capabilities_next_attempt_ms_;
+    // Keep the proven startup sequence: status and capabilities first.
+    // Device-type and version queries are one-time diagnostics after
+    // normal communication is already established, not startup prerequisites.
+    const bool devtype_due =
+        !devtype_done_ && !last_status_frame_.empty() &&
+        (capabilities_.valid || capabilities_attempts_ >= CAPABILITIES_MAX_ATTEMPTS) &&
+        devtype_attempts_ < DEVTYPE_MAX_ATTEMPTS &&
+        millis() >= devtype_next_attempt_ms_;
+    const bool version_due =
+        !version_done_ && devtype_done_ && !last_status_frame_.empty() &&
+        version_attempts_ < VERSION_MAX_ATTEMPTS &&
+        millis() >= version_next_attempt_ms_;
     if (capability_due) {
       send_query_capabilities_();
+    } else if (devtype_due) {
+      send_query_devtype_();
+    } else if (version_due) {
+      send_query_version_();
     } else {
       send_query_status_();
     }
@@ -316,7 +352,10 @@ void ACHIClimate::loop() {
   // 5. Release a lost status request. Until this timeout expires, a pending
   // 0x65 command is deliberately held back so it cannot collide with the 0x66 response.
   if (status_query_in_flight_ && (millis() - status_query_time_ > STATUS_QUERY_TIMEOUT)) {
-    const char *kind = query_kind_ == QUERY_CAPABILITIES ? "Capabilities 0x66/0x40" : "Status 0x66/0x00";
+    const char *kind = query_kind_ == QUERY_CAPABILITIES ? "Capabilities 0x66/0x40"
+                       : query_kind_ == QUERY_DEVTYPE ? "DevType 0x0A/0x04"
+                       : query_kind_ == QUERY_VERSION ? "Version 0x07/0x01"
+                       : "Status 0x66/0x00";
     ESP_LOGW(TAG, "%s query timeout after %lums; allowing pending control", kind,
              (unsigned long) STATUS_QUERY_TIMEOUT);
     if (query_kind_ == QUERY_CAPABILITIES && !capabilities_.valid) {
@@ -326,6 +365,27 @@ void ACHIClimate::loop() {
         publish_text_sensor_if_changed_(device_capabilities_text_, "No 0x66/0x40 reply");
       }
 #endif
+    } else if (query_kind_ == QUERY_DEVTYPE) {
+      if (devtype_attempts_ >= DEVTYPE_MAX_ATTEMPTS) {
+        devtype_done_ = true;  // Leave RS-485 control unaffected.
+        ESP_LOGW(TAG, "DevType discovery unavailable; continuing normal polling");
+#ifdef USE_TEXT_SENSOR
+        publish_text_sensor_if_changed_(device_type_text_, "No DevType response");
+#endif
+      } else {
+        devtype_next_attempt_ms_ = millis() + DEVTYPE_RETRY_MS;
+      }
+    } else if (query_kind_ == QUERY_VERSION) {
+      if (version_attempts_ >= VERSION_MAX_ATTEMPTS) {
+        version_done_ = true;  // Version is optional; do not affect RS-485 control.
+        ESP_LOGW(TAG, "Version discovery unavailable; continuing normal polling");
+#ifdef USE_TEXT_SENSOR
+        publish_text_sensor_if_changed_(ac_software_version_text_, "No version response");
+        publish_text_sensor_if_changed_(ac_protocol_version_text_, "No version response");
+#endif
+      } else {
+        version_next_attempt_ms_ = millis() + VERSION_RETRY_MS;
+      }
     }
     status_query_in_flight_ = false;
     query_kind_ = QUERY_NONE;
@@ -345,6 +405,15 @@ void ACHIClimate::loop() {
     pending_control_ = pending_command_fields_ != CMD_FIELD_NONE;
   }
 
+  // Verify the state sent inside a full 0x65 reply without waiting for the
+  // next configurable update_interval. Never collide with queued commands,
+  // an in-flight discovery/status query, or a new write acknowledgement.
+  if (post_write_status_pending_ && !writing_lock_ && !status_query_in_flight_ &&
+      !pending_control_ && available() == 0 &&
+      millis() - write_ack_received_ms_ >= WRITE_ACK_VERIFY_DELAY_MS) {
+    send_query_status_();
+  }
+
 #ifdef USE_API
   // Climate traits are entity metadata. After ProductType changes the preset
   // list, reconnect native API clients once so Home Assistant requests fresh
@@ -359,6 +428,33 @@ void ACHIClimate::loop() {
     }
   }
 #endif
+
+  // Bounded early readiness checks (Stage 4). These run in loop(), not
+  // update(), so a slow user-configured update_interval does not postpone the
+  // first probe. Respect in-flight queries, write ACKs and pending HA commands.
+  // Each failed request is released by the existing 1.5 s query timeout.
+  const uint32_t startup_elapsed_ms = millis() - boot_ms_;
+  if (adaptive_startup_ && !startup_ready_ &&
+      startup_elapsed_ms >= STARTUP_POLL_DELAY_MS && !startup_fallback_logged_) {
+    startup_fallback_logged_ = true;
+    ESP_LOGI(TAG, "No valid AC status during early startup; falling back to "
+                  "regular status polling after %lu ms", (unsigned long) startup_elapsed_ms);
+  }
+  if (adaptive_startup_ && !startup_ready_ &&
+      startup_elapsed_ms >= STARTUP_FIRST_PROBE_MS &&
+      startup_elapsed_ms < STARTUP_POLL_DELAY_MS &&
+      startup_early_probe_attempts_ < STARTUP_MAX_EARLY_PROBES &&
+      millis() >= startup_next_probe_ms_ &&
+      !status_query_in_flight_ && !writing_lock_ && !pending_control_ &&
+      available() == 0) {
+    ++startup_early_probe_attempts_;
+    startup_next_probe_ms_ = millis() + STARTUP_PROBE_INTERVAL_MS;
+    ESP_LOGI(TAG, "Startup status probe %u/%u at %lu ms",
+             (unsigned) startup_early_probe_attempts_,
+             (unsigned) STARTUP_MAX_EARLY_PROBES,
+             (unsigned long) startup_elapsed_ms);
+    send_query_status_();
+  }
 
   // 8. Keep locally latched relative timers counting down. The indoor unit
   // announces timer changes only briefly and then returns zero in these bytes.
@@ -1022,6 +1118,7 @@ void ACHIClimate::queue_retry_fields_from_state_() {
 
 // ---- Send status query ----
 void ACHIClimate::send_query_status_() {
+  post_write_status_pending_ = false; // Any actual status poll satisfies verification.
   ESP_LOGD(TAG, "Sending status query (0x66/subtype 0x00)");
   send_logical_frame_(query_, "TX status query 0x66/0x00");
   status_query_in_flight_ = true;
@@ -1030,15 +1127,14 @@ void ACHIClimate::send_query_status_() {
 }
 
 void ACHIClimate::send_query_capabilities_() {
-  std::vector<uint8_t> query = query_;
-  if (query.size() <= 18) {
-    ESP_LOGE(TAG, "Cannot build capabilities query: status template is too short");
-    return;
-  }
-
-  // ProductType uses the normal 0x66 frame with subtype byte[14] changed to
-  // 0x40. Recompute the running-sum checksum for this exact local template.
-  query[14] = 0x40;
+  // W4G2 ProductType (0x66/0x40) uses a 20-byte request (length field 0x0B),
+  // unlike the 21-byte status request (0x66/0x00, length field 0x0C).
+  // Keep a separate template so status polling cannot change accidentally.
+  std::vector<uint8_t> query = {
+      0xF4, 0xF5, 0x00, 0x40, 0x0B, 0x00, 0x00, 0x01, 0x01,
+      0xFE, 0x01, 0x00, 0x00, 0x66, 0x40, 0x00,
+      0x00, 0x00, 0xF4, 0xFB  // CRC high/low patched below
+  };
   calc_and_patch_crc_(query);
 
   capabilities_attempts_++;
@@ -1050,6 +1146,53 @@ void ACHIClimate::send_query_capabilities_() {
   query_kind_ = QUERY_CAPABILITIES;
 #ifdef USE_TEXT_SENSOR
   publish_text_sensor_if_changed_(device_capabilities_text_, "Querying 0x66/0x40");
+#endif
+}
+
+// ---- Best-effort device identification (factory W4G2 DevTypeCMD) ----
+void ACHIClimate::send_query_devtype_() {
+  // 20-byte logical request from the factory W4G2 capture. Unlike the
+  // 0x66 queries, its addressing bytes [7..8] are both zero.
+  std::vector<uint8_t> query = {
+      0xF4, 0xF5, 0x00, 0x40, 0x0B, 0x00, 0x00, 0x00, 0x00,
+      0xFE, 0x01, 0x00, 0x00, 0x0A, 0x04, 0x00,
+      0x00, 0x00, 0xF4, 0xFB  // CRC high/low patched below
+  };
+  calc_and_patch_crc_(query);
+
+  ++devtype_attempts_;
+  ESP_LOGI(TAG, "Sending DevType query 0x0A/0x04 (attempt %u/%u)",
+           (unsigned) devtype_attempts_, (unsigned) DEVTYPE_MAX_ATTEMPTS);
+  send_logical_frame_(query, "TX DevType query 0x0A/0x04");
+  status_query_in_flight_ = true;
+  status_query_time_ = millis();
+  query_kind_ = QUERY_DEVTYPE;
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(device_type_text_, "Querying DevType");
+#endif
+}
+
+// ---- Best-effort firmware and protocol version (factory W4G2 VerCMD) ----
+void ACHIClimate::send_query_version_() {
+  // Logical request copied from factory W4G2 capture:
+  // F4 F5 00 40 0B 00 00 01 01 FE 01 00 00 07 01 00 01 54 F4 FB.
+  std::vector<uint8_t> query = {
+      0xF4, 0xF5, 0x00, 0x40, 0x0B, 0x00, 0x00, 0x01, 0x01,
+      0xFE, 0x01, 0x00, 0x00, 0x07, 0x01, 0x00,
+      0x00, 0x00, 0xF4, 0xFB  // CRC high/low patched below
+  };
+  calc_and_patch_crc_(query);
+
+  ++version_attempts_;
+  ESP_LOGI(TAG, "Sending version query 0x07/0x01 (attempt %u/%u)",
+           (unsigned) version_attempts_, (unsigned) VERSION_MAX_ATTEMPTS);
+  send_logical_frame_(query, "TX version query 0x07/0x01");
+  status_query_in_flight_ = true;
+  status_query_time_ = millis();
+  query_kind_ = QUERY_VERSION;
+#ifdef USE_TEXT_SENSOR
+  publish_text_sensor_if_changed_(ac_software_version_text_, "Querying version");
+  publish_text_sensor_if_changed_(ac_protocol_version_text_, "Querying version");
 #endif
 }
 
@@ -1440,7 +1583,7 @@ void ACHIClimate::try_parse_frames_from_buffer_(uint32_t budget_ms) {
     uint16_t sum = 0;
     if (!validate_crc_(frame, &sum)) {
       ESP_LOGW(TAG, "CRC mismatch, ignoring frame");
-      if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66) {
+      if (frame.size() > IDX_CMD && frame[IDX_CMD] == 0x66 && query_kind_ != QUERY_DEVTYPE) {
         // The requested response arrived but was corrupt. Do not hold a user
         // command for the full query timeout; the next poll will refresh state.
         if (query_kind_ == QUERY_CAPABILITIES && !capabilities_.valid) {
@@ -1579,19 +1722,87 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
   }
   uint8_t cmd = b[IDX_CMD];
   if (cmd == 102) {          // 0x66 – status or ProductType response
-    status_query_in_flight_ = false;
-    query_kind_ = QUERY_NONE;
+    // An unsolicited status frame must not cancel pending discovery queries.
+    if (query_kind_ != QUERY_DEVTYPE && query_kind_ != QUERY_VERSION) {
+      status_query_in_flight_ = false;
+      query_kind_ = QUERY_NONE;
+    }
     const uint8_t subtype = b.size() > 14 ? b[14] : 0x00;
     if (subtype == 0x40) {
       parse_capabilities_102_64_(b);
     } else {
       parse_status_102_(b);
     }
-  } else if (cmd == 101) {   // 0x65 – write acknowledge
-    handle_ack_101_();
+  } else if (cmd == 0x0A && b[14] == 0x04) {
+    parse_devtype_10_04_(b);
+  } else if (cmd == 0x07 && b[14] == 0x01) {
+    parse_version_07_01_(b);
+  } else if (cmd == 101) {   // 0x65 – write acknowledgement / state snapshot
+    handle_ack_101_(b);
   } else {
     ESP_LOGV(TAG, "Unknown command 0x%02X, ignored", cmd);
   }
+}
+
+void ACHIClimate::parse_devtype_10_04_(const std::vector<uint8_t> &b) {
+  // Captured factory reply: F4 F5 01 40 0D 01 00 FE 01 00 00 01 00
+  //                         0A 04 01 01 01 01 60 F4 FB
+  // Byte 15 is the response/ACK flag. Bytes 17-18 are the two device-type
+  // values logged by the factory W4G2 as "dev type 1 1"; byte 16 is retained
+  // in the raw debug log until its precise meaning is confirmed.
+  if (query_kind_ != QUERY_DEVTYPE) {
+    ESP_LOGD(TAG, "Unsolicited DevType reply ignored");
+    return;
+  }
+  if (b.size() < 22 || b[2] != 0x01 || b[15] != 0x01) {
+    ESP_LOGW(TAG, "DevType reply invalid/negative (size=%u, result=%02X)",
+             (unsigned) b.size(), (unsigned) (b.size() > 15 ? b[15] : 0));
+    // Let the usual timeout perform bounded retry or fallback.
+    return;
+  }
+  devtype_done_ = true;
+  status_query_in_flight_ = false;
+  query_kind_ = QUERY_NONE;
+  ESP_LOGI(TAG, "DevType detected: type=%u, subtype=%u (raw flags=%02X %02X)",
+           (unsigned) b[17], (unsigned) b[18], (unsigned) b[15], (unsigned) b[16]);
+#ifdef USE_TEXT_SENSOR
+  char value[32];
+  snprintf(value, sizeof(value), "%u / %u", (unsigned) b[17], (unsigned) b[18]);
+  publish_text_sensor_if_changed_(device_type_text_, value);
+#endif
+}
+
+void ACHIClimate::parse_version_07_01_(const std::vector<uint8_t> &b) {
+  // Factory W4G2 response (24 bytes):
+  // F4 F5 01 40 0F 01 00 FE 01 01 01 01 00 07 01 01
+  // 01 10 02 16 01 85 F4 FB
+  // After response byte 15 (=0x01), bytes 16-17 and 18-19 are
+  // big-endian 16-bit software and protocol versions respectively.
+  // CRC is already validated by try_parse_frames_from_buffer_().
+  if (query_kind_ != QUERY_VERSION) {
+    ESP_LOGD(TAG, "Unsolicited version reply ignored");
+    return;
+  }
+  if (b.size() < 24 || b[2] != 0x01 || b[15] != 0x01) {
+    ESP_LOGW(TAG, "Version reply invalid/negative (size=%u, result=%02X)",
+             (unsigned) b.size(), (unsigned) (b.size() > 15 ? b[15] : 0));
+    // Leave pending query in flight so the bounded timeout handles retries.
+    return;
+  }
+  const uint16_t software_version = (static_cast<uint16_t>(b[16]) << 8) | b[17];
+  const uint16_t protocol_version = (static_cast<uint16_t>(b[18]) << 8) | b[19];
+  version_done_ = true;
+  status_query_in_flight_ = false;
+  query_kind_ = QUERY_NONE;
+  ESP_LOGI(TAG, "AC software version: %u; protocol version: %u",
+           (unsigned) software_version, (unsigned) protocol_version);
+#ifdef USE_TEXT_SENSOR
+  char value[16];
+  snprintf(value, sizeof(value), "%u", (unsigned) software_version);
+  publish_text_sensor_if_changed_(ac_software_version_text_, value);
+  snprintf(value, sizeof(value), "%u", (unsigned) protocol_version);
+  publish_text_sensor_if_changed_(ac_protocol_version_text_, value);
+#endif
 }
 
 void ACHIClimate::parse_capabilities_102_64_(const std::vector<uint8_t> &b) {
@@ -1959,17 +2170,30 @@ void ACHIClimate::publish_fault_state_(const std::vector<uint8_t> &b) {
   last_fault_signature_ = signature;
 }
 
-void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
-  last_status_frame_.assign(b.begin(), b.end());
-
-  // Ensure we have all expected bytes
+void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_write_ack) {
+  // Only a CRC-validated, sufficiently long status response from the AC may
+  // end the startup guard. Short/corrupted frames cannot assert readiness.
   if (b.size() < 49) {
     ESP_LOGE(TAG, "Status frame too short (%u), cannot parse fully", (unsigned) b.size());
     return;
   }
+  // 0x65 contains the same leading climate-state fields, but is shorter than
+  // the full 0x66 status. Keep authoritative full-status caches untouched.
+  if (!from_write_ack)
+    last_status_frame_.assign(b.begin(), b.end());
+  if (!from_write_ack && !startup_ready_ && b[2] == 0x01 && b[14] == 0x00) {
+    startup_ready_ = true;
+    ESP_LOGI(TAG, "First valid AC status after %lu ms (%u early startup probes)",
+             (unsigned long) (millis() - boot_ms_),
+             (unsigned) startup_early_probe_attempts_);
+  }
 
-  parse_timer_status_(b);
-  publish_fault_state_(b);
+  // Timer/fault telemetry is defined for the full 0x66 response. The write
+  // snapshot is deliberately not permitted to update those subsystems.
+  if (!from_write_ack) {
+    parse_timer_status_(b);
+    publish_fault_state_(b);
+  }
 
   // Power
   power_on_ = (b[IDX_POWER_MODE] & POWER_MASK) != 0;
@@ -2027,7 +2251,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // Clear the desired preset instead of trying to reconstruct it with ordinary
   // climate writes. A newly transmitted Sleep request is handled separately
   // below by sleep_confirmation_pending_.
-  if (!sleep_confirmation_pending_ && d_sleep_stage_ > 0 && sleep_stage_ == 0) {
+  if (!from_write_ack && !sleep_confirmation_pending_ && d_sleep_stage_ > 0 && sleep_stage_ == 0) {
     d_sleep_stage_ = 0;
     pending_command_fields_ &= static_cast<uint16_t>(~CMD_FIELD_SLEEP);
     recalc_desired_sig_();
@@ -2090,7 +2314,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   quiet_ = (b[IDX_RX_QUIET] & QUIET_MASK) != 0;   // byte 36 in status frame
   led_   = (b[IDX_RX_LED] & LED_MASK) != 0;       // byte 37 in status frame
 
-  if (sleep_led_restore_pending_) {
+  if (sleep_led_restore_pending_ && !from_write_ack) {
     if (led_) {
       sleep_led_restore_pending_ = false;
       d_led_ = true;
@@ -2183,7 +2407,8 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // The first status after a byte-17 Sleep action is authoritative. A command
   // is successful only when the reported program exactly matches the requested
   // program. Failed commands are not retried automatically.
-  if (sleep_confirmation_pending_) {
+  // Sleep commands still require the next authoritative 0x66 status frame.
+  if (sleep_confirmation_pending_ && !from_write_ack) {
     sleep_confirmation_pending_ = false;
     const uint8_t requested_stage = sleep_confirmation_target_stage_;
     sleep_confirmation_target_stage_ = 0;
@@ -2401,7 +2626,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   // byte 50 = mains voltage (V), bytes 55-56 = input power (W, big-endian),
   // byte 60 = input current (A, integer). Units that reply with the short frame
   // never reach this branch and the sensors simply stay unknown.
-  if (b.size() > 60) {
+  if (!from_write_ack && b.size() > 60) {
     publish_sensor_if_changed_(voltage_sensor_, static_cast<float>(b[50] | (b[51] << 8)));
     publish_sensor_if_changed_(power_sensor_, static_cast<float>((b[55] << 8) | b[56]));
     publish_sensor_if_changed_(current_sensor_, static_cast<float>(b[60]));
@@ -2435,7 +2660,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
   }
   // Humidity entities always exist, but their availability follows the
   // ProductType reply. Before capabilities are known, leave them unavailable.
-  if (capabilities_.valid && capabilities_.humidity) {
+  if (!from_write_ack && capabilities_.valid && capabilities_.humidity) {
     const uint8_t humidity_setting = b[IDX_INDOOR_HUMIDITY_SETTING];
     const uint8_t humidity = b[IDX_INDOOR_HUMIDITY];
     if (humidity_setting <= 100)
@@ -2472,16 +2697,52 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b) {
            static_cast<int8_t>(b[IDX_COMPRESSOR_DISCHARGE_TEMP]),
            static_cast<int8_t>(b[IDX_OUTDOOR_COND_TEMP]));
 
-  // If HA has priority, check convergence and possibly enforce
-  maybe_force_to_target_();
+  // Do not initiate retries or lift HA priority based on a potentially
+  // transient 0x65 snapshot. The immediately scheduled 0x66 verifies it.
+  if (!from_write_ack)
+    maybe_force_to_target_();
 }
 
-void ACHIClimate::handle_ack_101_() {
+void ACHIClimate::handle_ack_101_(const std::vector<uint8_t> &b) {
+  // CRC is checked before handle_frame_(). Only an actual response to our
+  // outstanding write may release the lock; an echoed TX frame or a stale
+  // duplicate 0x65 reply must never be mistaken for a new acknowledgement.
+  if (b.size() < 20 || b[2] != 0x01 || b[14] != 0x00 || b[15] != 0x01) {
+    ESP_LOGW(TAG, "Invalid/negative 0x65 write acknowledgement (size=%u, result=0x%02X)",
+             (unsigned) b.size(), (unsigned) (b.size() > 15 ? b[15] : 0));
+    return; // Existing write timeout and 0x66 status fallback remain active.
+  }
+  if (!writing_lock_) {
+    ESP_LOGV(TAG, "Ignoring unsolicited/duplicate 0x65 response");
+    return;
+  }
+
   writing_lock_ = false;
   ESP_LOGD(TAG, "Write acknowledged (lock cleared)");
 
-  // If there is a pending control command, it will be sent on next loop
-  // (after debounce) because pending_control_ is still true.
+  if (!ack_state_sync_) return;  // Preserve Stage 4 behavior when disabled.
+
+  // Factory W4G2 returns a 132-byte 0x65 frame with the same leading state
+  // fields as 0x66. Require the full region used by the state parser, not
+  // just a short ACK or an arbitrary length/firmware variant. CRC and logical
+  // length have already been validated by the frame extractor.
+  if (b.size() != 132 || b[4] != 0x7B) {
+    ESP_LOGD(TAG, "Unknown/short 0x65 ACK (%u bytes): waiting for normal status poll",
+             (unsigned) b.size());
+    return;
+  }
+  ESP_LOGD(TAG, "0x65 ACK contains state snapshot (%u bytes); verifying with 0x66",
+           (unsigned) b.size());
+  // Sleep, fan restoration and display restoration have extra one-shot
+  // semantics; let a full status frame decide them rather than an ACK.
+  if (sleep_confirmation_pending_ || sleep_fan_override_pending_ ||
+      sleep_led_restore_pending_ || sleep_stage_ > 0 || d_sleep_stage_ > 0) {
+    ESP_LOGD(TAG, "0x65 snapshot: Sleep-related transition; deferring state parsing to 0x66");
+  } else {
+    parse_status_102_(b, true);
+  }
+  write_ack_received_ms_ = millis();
+  post_write_status_pending_ = true;
 }
 
 // ---- Gating and convergence ----

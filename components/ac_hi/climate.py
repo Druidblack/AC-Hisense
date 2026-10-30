@@ -29,6 +29,8 @@ else:
     }
 
 CONF_ENABLE_PRESETS = "enable_presets"
+CONF_ADAPTIVE_STARTUP = "adaptive_startup"
+CONF_ACK_STATE_SYNC = "ack_state_sync"
 CONF_ENABLE_HUMIDITY = "enable_humidity"
 CONF_PIPE_TEMPERATURE = "pipe_temperature"
 CONF_LED_SWITCH = "led_switch"
@@ -55,6 +57,9 @@ CONF_SWING_UD = "swing_up_down"
 CONF_SWING_LR = "swing_left_right"
 CONF_POWER_STATUS = "power_status"
 CONF_DEVICE_CAPABILITIES = "device_capabilities"
+CONF_DEVICE_TYPE = "device_type"
+CONF_SOFTWARE_VERSION = "software_version"
+CONF_PROTOCOL_VERSION = "protocol_version"
 CONF_AC_FAULT = "ac_fault"
 CONF_AC_ACTIVE_FAULTS = "ac_active_faults"
 CONF_POWER_ON_TIMER_REMAINING = "power_on_timer_remaining"
@@ -111,6 +116,8 @@ def _ensure_discharge_sensor(config):
 CONFIG_SCHEMA = cv.All(BASE_CLIMATE_SCHEMA.extend({
     **BASE_CLIMATE_EXTRA,
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
+    cv.Optional(CONF_ADAPTIVE_STARTUP, default=True): cv.boolean,
+    cv.Optional(CONF_ACK_STATE_SYNC, default=True): cv.boolean,
     cv.Optional(CONF_ENABLE_HUMIDITY, default=True): cv.boolean,
     # RS-485 direction control for transceivers without auto-direction
     cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
@@ -262,6 +269,20 @@ CONFIG_SCHEMA = cv.All(BASE_CLIMATE_SCHEMA.extend({
         icon="mdi:feature-search-outline",
         entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     ),
+    # Identifies the indoor controller via the factory DevType command (0x0A/0x04).
+    cv.Optional(CONF_DEVICE_TYPE, default={CONF_NAME: "AC Device Type"}): text_sensor.text_sensor_schema(
+        icon="mdi:identifier",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    # Firmware and protocol version are read from factory VerCMD (0x07/0x01).
+    cv.Optional(CONF_SOFTWARE_VERSION, default={CONF_NAME: "AC Software Version"}): text_sensor.text_sensor_schema(
+        icon="mdi:chip",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
+    cv.Optional(CONF_PROTOCOL_VERSION, default={CONF_NAME: "AC Protocol Version"}): text_sensor.text_sensor_schema(
+        icon="mdi:serial-port",
+        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    ),
 
     # Pipe temperature and LED control are also built in by default.
     cv.Optional(CONF_PIPE_TEMPERATURE, default={CONF_NAME: "Temperature Pipe"}): sensor.sensor_schema(
@@ -315,6 +336,8 @@ async def to_code(config):
     cg.add(var.set_uart_parent(uart_comp))
 
     cg.add(var.set_enable_presets(config[CONF_ENABLE_PRESETS]))
+    cg.add(var.set_adaptive_startup(config[CONF_ADAPTIVE_STARTUP]))
+    cg.add(var.set_ack_state_sync(config[CONF_ACK_STATE_SYNC]))
 
     for key, setter in ((CONF_FLOW_CONTROL_PIN, "set_flow_control_pin"),
                         (CONF_DE_PIN, "set_de_pin"), (CONF_RE_PIN, "set_re_pin")):
@@ -433,6 +456,18 @@ async def to_code(config):
     if conf := config.get(CONF_DEVICE_CAPABILITIES):
         ts = await text_sensor.new_text_sensor(conf)
         cg.add(var.set_device_capabilities_text(ts))
+
+    if conf := config.get(CONF_DEVICE_TYPE):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_device_type_text(ts))
+
+    if conf := config.get(CONF_SOFTWARE_VERSION):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_ac_software_version_text(ts))
+
+    if conf := config.get(CONF_PROTOCOL_VERSION):
+        ts = await text_sensor.new_text_sensor(conf)
+        cg.add(var.set_ac_protocol_version_text(ts))
 
     if conf := config.get(CONF_AC_FAULT):
         bs = await binary_sensor.new_binary_sensor(conf)
