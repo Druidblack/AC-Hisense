@@ -236,6 +236,9 @@ For flashing the native module (AEH-W4G1)
 
 [AEH-W4G2 flashing](https://github.com/pio2398/W4G2/blob/main/docs/install_on_w4g2/instalation.md)
 
+<img width="960" height="1280" alt="photo_2026-10-30_19-50-04" src="https://github.com/user-attachments/assets/5fc01a11-bf6a-4312-8350-3a5f02ff8b01" />
+
+
 ## Entities provided
 <img width="412" height="411" alt="22" src="https://github.com/user-attachments/assets/8fad5a88-fb8d-411f-b24c-99a231ceedea" />
 <img width="277" height="952" alt="2" src="https://github.com/user-attachments/assets/966420c5-864d-4781-aad5-31595a1a0833" />
