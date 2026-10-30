@@ -424,6 +424,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void queue_retry_fields_from_state_();
   void publish_gated_state_();
   void update_led_switch_state_();
+  void enforce_led_sound_dependency_();
   void update_sound_switch_state_();
   void update_memory_switch_state_();
   void update_sleep_program_select_state_();
@@ -559,7 +560,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // even when audible confirmation is disabled.
   bool user_command_next_write_{false};
 
-  // User-configurable local mute for command confirmation beeps.
+  // Local command-beep preference; cannot be OFF while desired AC LED is OFF.
   bool command_sound_enabled_{true};
 
   // When enabled, a generic climate.turn_on restores the last active HVAC mode

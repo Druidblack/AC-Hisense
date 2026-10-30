@@ -1,4 +1,6 @@
 #include "ac_hi.h"
+#include "wind_codec.h"
+#include "led_sound_policy.h"
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -672,14 +674,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
         }
       }
 
-      // Do not carry an implicit QUIET fan value from DRY/FAN_ONLY status into
-      // a user mode change. On this indoor unit raw wind code 10 may be reported
-      // by the unit while Quiet Mode Code is still 0; that is not an explicit
-      // Quiet request from HA and should fall back to AUTO when the mode changes.
-      if (!call.get_fan_mode().has_value() && d_fan_ == climate::CLIMATE_FAN_QUIET &&
-          !d_quiet_ && !d_eco_ && !d_turbo_ && !d_heat_8c_ && d_sleep_stage_ == 0) {
-        d_fan_ = climate::CLIMATE_FAN_AUTO;
-      }
+      // Retain a real manual QUIET fan speed (Wind Mode Code = 10) when
+      // switching between supported HVAC modes. It is independent of the
+      // separate Quiet preset flag (Quiet Mode Code = 1).
     }
     changed = true;
   }
@@ -719,7 +716,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     heat_8c_restore_valid_ = false;
     d_fan_ = *call.get_fan_mode();
     d_fan_turbo_ = false;
-    d_quiet_ = (d_fan_ == climate::CLIMATE_FAN_QUIET);
+    // Every manual fan speed, including QUIET (raw wind 10 / TX 0x0B), is
+    // independent of the Quiet preset (raw wind 2 + Quiet Mode Code 1).
+    // Clear a previously selected preset, but NEVER enable it from a fan call.
+    d_quiet_ = false;
     changed = true;
     }
   }
@@ -858,11 +858,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
                  LOG_STR_ARG(climate::climate_fan_mode_to_string(d_fan_)));
       }
 
+      // Clearing the Quiet preset must not silently turn an independently
+      // selected QUIET fan speed back into AUTO.
       d_quiet_ = false;
       // A Sleep OFF action must remain byte-17-only. Let the indoor unit
       // report the fan it restores after leaving Sleep, then synchronize to it.
-      if (d_fan_ == climate::CLIMATE_FAN_QUIET && !was_eco && !was_sleep)
-        d_fan_ = climate::CLIMATE_FAN_AUTO;
     }
 
     changed = true;
@@ -922,7 +922,10 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
       d_eco_ = false;
       d_sleep_stage_ = 0;
       d_fan_turbo_ = false;
-      d_fan_ = climate::CLIMATE_FAN_QUIET;
+      // Custom preset Quiet is the dedicated Quiet Mode flag. It is NOT the
+      // manual QUIET fan speed (Wind Mode Code 10). This model reports the
+      // preset with raw Wind Mode Code 2 / Quiet Mode Code 1.
+      d_fan_ = climate::CLIMATE_FAN_AUTO;
       changed = true;
       }  // Quiet supported
     }
@@ -2208,15 +2211,19 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_wri
   last_raw_wind_ = raw_wind;
   fan_turbo_ = false;
   if (power_on_) {
-    if (raw_wind == 0 || raw_wind == 1 || raw_wind == 2) fan_ = climate::CLIMATE_FAN_AUTO;
-    else if (raw_wind == 10) fan_ = climate::CLIMATE_FAN_QUIET;
-    else if (raw_wind == 12) fan_ = climate::CLIMATE_FAN_LOW;
-    else if (raw_wind == 14) fan_ = climate::CLIMATE_FAN_MEDIUM;
-    else if (raw_wind == 16) fan_ = climate::CLIMATE_FAN_HIGH;
-    else if (raw_wind == 18) {
-      fan_ = climate::CLIMATE_FAN_HIGH;
-      fan_turbo_ = true;
-    } else fan_ = climate::CLIMATE_FAN_AUTO;
+    // Decode only the wind field here. The independent Quiet preset flag is
+    // read below and must never rewrite the manual fan speed.
+    switch (decode_wind_code(raw_wind)) {
+      case WindSpeed::QUIET:  fan_ = climate::CLIMATE_FAN_QUIET;  break;
+      case WindSpeed::LOW:    fan_ = climate::CLIMATE_FAN_LOW;    break;
+      case WindSpeed::MEDIUM: fan_ = climate::CLIMATE_FAN_MEDIUM; break;
+      case WindSpeed::HIGH:   fan_ = climate::CLIMATE_FAN_HIGH;   break;
+      case WindSpeed::TURBO:
+        fan_ = climate::CLIMATE_FAN_HIGH;
+        fan_turbo_ = true;
+        break;
+      default: fan_ = climate::CLIMATE_FAN_AUTO; break;
+    }
   } else {
     fan_ = climate::CLIMATE_FAN_AUTO;   // when off, fan mode is irrelevant
     fan_turbo_ = false;
@@ -2337,18 +2344,12 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_wri
     }
   }
 
-  // On this model Quiet is signaled by the quiet flag, while raw_wind may remain 2.
-  if (quiet_) {
-    fan_ = climate::CLIMATE_FAN_QUIET;
-    fan_turbo_ = false;
-  } else if ((mode_ == climate::CLIMATE_MODE_DRY || mode_ == climate::CLIMATE_MODE_FAN_ONLY) && raw_wind == 10) {
-    // In DRY/FAN_ONLY the unit can report raw wind code 10 with Quiet Mode Code = 0.
-    // Treat that as the unit's internal/automatic airflow, not as an explicit
-    // HA Quiet fan request. This prevents QUIET from being learned and carried
-    // into the next mode change.
-    fan_ = climate::CLIMATE_FAN_AUTO;
-    fan_turbo_ = false;
-  } else if (turbo_ && raw_wind == 18) {
+  // The Quiet preset and manual QUIET fan speed are *independent*:
+  //   Wind Mode Code 10, Quiet Mode Code 0 -> Fan QUIET, Preset NONE.
+  //   Wind Mode Code  2, Quiet Mode Code 1 -> Fan AUTO, Preset Quiet.
+  // Do not override a Wind=10 reading in FAN_ONLY/DRY (or any other mode)
+  // and do not derive the Quiet preset from the current fan speed.
+  if (turbo_ && raw_wind == 18) {
     // BOOST preset also uses raw Wind Mode Code 18, but it should stay a preset
     // in HA rather than being shown as custom fan mode Turbo.
     fan_turbo_ = false;
@@ -2680,13 +2681,14 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_wri
 #endif
 
   ESP_LOGD(TAG,
-           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s, swing=%s, target=%u°C, unit=%c, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u%c target_marker=%s), current=%.1f°C, outdoor=%d°C, "
+           "Parsed: power=%s, mode=%s (raw_mode=%u), action=%s, fan=%s (wind=%u quiet_preset=%u), swing=%s, target=%u°C, unit=%c, heat8=%s (status77=0x%02X status66=0x%02X raw_target=%u%c target_marker=%s), current=%.1f°C, outdoor=%d°C, "
            "compressor_actual=%uHz, compressor_set=%uHz, compressor_command=%uHz, discharge=%d°C, condenser=%d°C",
            power_on_ ? "ON" : "OFF",
            LOG_STR_ARG(climate::climate_mode_to_string(mode_)),
            (unsigned) raw_mode_code_,
            LOG_STR_ARG(climate::climate_action_to_string(this->action)),
            LOG_STR_ARG(climate::climate_fan_mode_to_string(fan_)),
+           (unsigned) raw_wind, quiet_ ? 1u : 0u,
            LOG_STR_ARG(climate::climate_swing_mode_to_string(swing_)),
            (unsigned) (heat_8c_ ? 8 : target_c_), temp_unit_f_ ? 'F' : 'C', heat_8c_ ? "ON" : "OFF",
            b.size() > IDX_RX_HEAT_8C ? b[IDX_RX_HEAT_8C] : 0,
@@ -2787,13 +2789,13 @@ void ACHIClimate::publish_gated_state_() {
         out_fan = d_fan_;
         out_fan_turbo = false;
 
-      } else if (d_quiet_ && (quiet_ || fan_ == climate::CLIMATE_FAN_QUIET)) {
+      } else if (d_quiet_ && quiet_) {
         out_turbo = false;
         out_eco = false;
         out_quiet = true;
         out_sleep_stage = 0;
-        out_fan = climate::CLIMATE_FAN_QUIET;
-        out_fan_turbo = false;
+        out_fan = fan_;
+        out_fan_turbo = fan_turbo_;
       } else if (d_fan_turbo_ && last_raw_wind_ == 18) {
         out_turbo = false;
         out_eco = false;
@@ -2884,10 +2886,21 @@ void ACHIClimate::publish_gated_state_() {
 }
 
 void ACHIClimate::update_led_switch_state_() {
-  // Keep the user-selected sound setting independent from the display.
-  // Sending LED_OFF to keep the panel dark can itself produce a beep.
+  // The indoor unit does not reliably support both display and command sound
+  // disabled at the same time. This also covers LED state learned from the
+  // remote or restored after Sleep, not just direct HA switch commands.
+  enforce_led_sound_dependency_();
   if (led_switch_ == nullptr) return;
   led_switch_->publish_state(d_led_);
+}
+
+void ACHIClimate::enforce_led_sound_dependency_() {
+  if (led_sound_safe_command_sound(d_led_, command_sound_enabled_) == command_sound_enabled_)
+    return;
+
+  command_sound_enabled_ = true;
+  ESP_LOGD(TAG, "Command sound forced ON because AC LED is OFF");
+  update_sound_switch_state_();
 }
 
 void ACHIClimate::update_sound_switch_state_() {
@@ -3069,7 +3082,7 @@ void ACHIClimate::recalc_actual_sig_() {
       effective_fan_turbo = false;
       effective_fan = d_fan_;
 
-    } else if (d_quiet_ && fan_ == climate::CLIMATE_FAN_QUIET) {
+    } else if (d_quiet_ && quiet_) {
       effective_quiet = true;
       effective_eco = false;
       effective_turbo = false;
@@ -3088,6 +3101,8 @@ void ACHIClimate::recalc_actual_sig_() {
 // ---- External LED control ----
 void ACHIClimate::set_desired_led(bool on) {
   d_led_ = on;
+  // LED OFF always enables command sound before the LED action is queued.
+  enforce_led_sound_dependency_();
 
   // If the user explicitly changes the display while Sleep is active, this is
   // the preference that must remain after Sleep ends.
@@ -3097,7 +3112,7 @@ void ACHIClimate::set_desired_led(bool on) {
   }
   sleep_led_restore_pending_ = false;
 
-  // Display and sound switches remain independently controllable.
+  // The display may be changed independently, but LED OFF requires sound ON.
   led_command_pending_ = true;
   pending_command_fields_ |= CMD_FIELD_LED;
   accept_remote_changes_ = false;
@@ -3136,9 +3151,15 @@ void ACHIClimate::set_memory_mode_enabled(bool on) {
 }
 
 void ACHIClimate::set_command_sound_enabled(bool on) {
-  command_sound_enabled_ = on;
+  const bool effective_sound = led_sound_safe_command_sound(d_led_, on);
+  if (!on && effective_sound) {
+    // Reject an unsupported OFF/OFF combination rather than unexpectedly
+    // turning the physical display on just to accommodate a sound switch.
+    ESP_LOGW(TAG, "Cannot turn command sound OFF while AC LED is OFF; keeping sound ON");
+  }
+  command_sound_enabled_ = effective_sound;
   update_sound_switch_state_();
-  ESP_LOGD(TAG, "Command sound: %s", on ? "ON" : "OFF");
+  ESP_LOGD(TAG, "Command sound: %s", command_sound_enabled_ ? "ON" : "OFF");
 }
 
 // ---- Field encoders ----
@@ -3151,15 +3172,14 @@ uint8_t ACHIClimate::encode_fan_byte_(climate::ClimateFanMode f, bool turbo_fan)
   // AUTO is the special case: its action value is 0x01, not the
   // status-derived value 0x02 that was accepted in the old full-state frame.
   if (turbo_fan)
-    return 0x13;
+    return encode_wind_action(WindSpeed::TURBO);
 
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO:   return 0x01;
-    case climate::CLIMATE_FAN_LOW:    return 0x0D;
-    case climate::CLIMATE_FAN_MEDIUM: return 0x0F;
-    case climate::CLIMATE_FAN_HIGH:   return 0x11;
-    case climate::CLIMATE_FAN_QUIET:  return 0x0B;
-    default:                          return 0x01;
+    case climate::CLIMATE_FAN_LOW:    return encode_wind_action(WindSpeed::LOW);
+    case climate::CLIMATE_FAN_MEDIUM: return encode_wind_action(WindSpeed::MEDIUM);
+    case climate::CLIMATE_FAN_HIGH:   return encode_wind_action(WindSpeed::HIGH);
+    case climate::CLIMATE_FAN_QUIET:  return encode_wind_action(WindSpeed::QUIET);
+    default:                          return encode_wind_action(WindSpeed::AUTO);
   }
 }
 
