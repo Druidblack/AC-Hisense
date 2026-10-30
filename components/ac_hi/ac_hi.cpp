@@ -2,8 +2,17 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
-#include <Arduino.h>
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"
+
+// Native ESP-IDF memory metrics for ESP32 (including ESP32-C3).
+#if defined(USE_ESP32)
+#include <esp_heap_caps.h>
+#elif defined(USE_ESP8266)
+// ESP8266 uses the Arduino platform internally; include only its narrow heap API
+// instead of the full Arduino.h header. ESP32/ESP-IDF does not use this branch.
+#include <Esp.h>
+#endif
 #ifdef USE_API
 #include "esphome/components/api/api_server.h"
 #endif
@@ -2614,17 +2623,8 @@ void ACHIClimate::publish_gated_state_() {
 }
 
 void ACHIClimate::update_led_switch_state_() {
-  // Dependency: when the display switch is OFF, command sound must stay ON.
-  // With this indoor unit, keeping the display off during user climate commands
-  // requires sending LED_OFF, and that action can itself make the unit beep.
-
-  // I don't need it. Want quit and dark!
-  // if (!d_led_ && !command_sound_enabled_) {
-  //   command_sound_enabled_ = true;
-  //   ESP_LOGD(TAG, "Command sound forced ON because display switch is OFF");
-  //   update_sound_switch_state_();
-  // }
-
+  // Keep the user-selected sound setting independent from the display.
+  // Sending LED_OFF to keep the panel dark can itself produce a beep.
   if (led_switch_ == nullptr) return;
   led_switch_->publish_state(d_led_);
 }
@@ -2824,10 +2824,6 @@ void ACHIClimate::recalc_actual_sig_() {
                                            effective_heat_8c, led_, effective_sleep_stage, target_c_);
 }
 
-void ACHIClimate::log_sig_diff_() const {
-  // Optional verbose diff – can be enabled for debugging
-}
-
 // ---- External LED control ----
 void ACHIClimate::set_desired_led(bool on) {
   d_led_ = on;
@@ -2840,15 +2836,7 @@ void ACHIClimate::set_desired_led(bool on) {
   }
   sleep_led_restore_pending_ = false;
 
-  // Dependency: turning the display OFF also turns command sound ON.
-  // This keeps HA from showing an unsupported combination for this protocol.
-  // I don't need it. Want quit and dark!
-  // if (!on && !command_sound_enabled_) {
-  //   command_sound_enabled_ = true;
-  //   ESP_LOGD(TAG, "Command sound forced ON because display switch was turned OFF");
-  //   update_sound_switch_state_();
-  // }
-
+  // Display and sound switches remain independently controllable.
   led_command_pending_ = true;
   pending_command_fields_ |= CMD_FIELD_LED;
   accept_remote_changes_ = false;
@@ -2862,7 +2850,6 @@ void ACHIClimate::set_desired_led(bool on) {
 
   ESP_LOGD(TAG, "LED switch: desired_led=%s, command_sound=%s, pending write",
            on ? "ON" : "OFF", command_sound_enabled_ ? "ON" : "OFF");
-  // update_led_switch_state_() will be called from loop after publish
 }
 
 // ---- External command sound control ----
@@ -2888,17 +2875,6 @@ void ACHIClimate::set_memory_mode_enabled(bool on) {
 }
 
 void ACHIClimate::set_command_sound_enabled(bool on) {
-  // I don't need it. Want quit and dark!
-  // if (!on && !d_led_) {
-  //   // The display is currently desired OFF. In this state user commands need
-  //   // LED_OFF to keep the panel dark, and LED_OFF is audible on this unit.
-  //   // Keep the sound switch ON so the UI reflects the real supported state.
-  //   command_sound_enabled_ = true;
-  //   update_sound_switch_state_();
-  //   ESP_LOGD(TAG, "Command sound stays ON while display switch is OFF");
-  //   return;
-  // }
-
   command_sound_enabled_ = on;
   update_sound_switch_state_();
   ESP_LOGD(TAG, "Command sound: %s", on ? "ON" : "OFF");
@@ -2959,38 +2935,58 @@ void ACHIClimate::publish_memory_diagnostics_() {
   if (now - last_ms < MEM_PUBLISH_INTERVAL_MS) return;
   last_ms = now;
 
-  // Gather metrics (simplified, no heavy allocation)
-  size_t heap_free = ESP.getFreeHeap();
+  // Measure a consistent memory pool. MALLOC_CAP_8BIT by itself can include
+  // external PSRAM on devices that have it, so explicitly select internal RAM.
+  size_t heap_free = 0;
   size_t heap_total = 0, heap_used = 0, heap_min_free = 0, heap_max_alloc = 0;
   int heap_frag_pct = -1;
   size_t psram_total = 0, psram_free = 0;
 
-#if defined(ARDUINO_ARCH_ESP32)
-  heap_total     = ESP.getHeapSize();
-  heap_min_free  = ESP.getMinFreeHeap();
-  heap_max_alloc = ESP.getMaxAllocHeap();
-  psram_total    = ESP.getPsramSize();
-  psram_free     = ESP.getFreePsram();
-  if (heap_total > heap_free) heap_used = heap_total - heap_free;
-  if (heap_free > 0 && heap_max_alloc > 0) {
+#if defined(USE_ESP32)
+  constexpr uint32_t INTERNAL_HEAP_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  constexpr uint32_t PSRAM_HEAP_CAPS = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+
+  heap_total     = heap_caps_get_total_size(INTERNAL_HEAP_CAPS);
+  heap_free      = heap_caps_get_free_size(INTERNAL_HEAP_CAPS);
+  heap_min_free  = heap_caps_get_minimum_free_size(INTERNAL_HEAP_CAPS);
+  heap_max_alloc = heap_caps_get_largest_free_block(INTERNAL_HEAP_CAPS);
+  psram_total    = heap_caps_get_total_size(PSRAM_HEAP_CAPS);
+  psram_free     = heap_caps_get_free_size(PSRAM_HEAP_CAPS);
+#elif defined(USE_ESP8266)
+  // Keep the existing ESP8266 behavior: this platform still uses Arduino.
+  heap_free = ESP.getFreeHeap();
+  heap_max_alloc = ESP.getMaxFreeBlockSize();
+  heap_frag_pct = ESP.getHeapFragmentation();
+#endif
+
+  if (heap_total >= heap_free)
+    heap_used = heap_total - heap_free;
+
+#if defined(USE_ESP32)
+  // Fragmentation estimate: 0% means all free memory is in one block.
+  // It is not an exact allocator fragmentation statistic.
+  if (heap_free > 0) {
     double ratio = 1.0 - static_cast<double>(heap_max_alloc) / static_cast<double>(heap_free);
     if (ratio < 0.0) ratio = 0.0;
     if (ratio > 1.0) ratio = 1.0;
     heap_frag_pct = static_cast<int>(std::lround(ratio * 100.0));
   }
-#elif defined(ARDUINO_ARCH_ESP8266)
-  heap_max_alloc = ESP.getMaxFreeBlockSize();
-  heap_frag_pct  = ESP.getHeapFragmentation();
 #endif
 
+#if defined(USE_ESP32) || defined(USE_ESP8266)
   publish_sensor_if_changed_(heap_free_sensor_, static_cast<float>(heap_free));
+#endif
   if (heap_total > 0) publish_sensor_if_changed_(heap_total_sensor_, static_cast<float>(heap_total));
   if (heap_total > 0) publish_sensor_if_changed_(heap_used_sensor_, static_cast<float>(heap_used));
-  if (heap_min_free > 0) publish_sensor_if_changed_(heap_min_free_sensor_, static_cast<float>(heap_min_free));
-  if (heap_max_alloc > 0) publish_sensor_if_changed_(heap_max_alloc_sensor_, static_cast<float>(heap_max_alloc));
+  if (heap_total > 0) publish_sensor_if_changed_(heap_min_free_sensor_, static_cast<float>(heap_min_free));
+  if (heap_total > 0 || heap_free > 0) publish_sensor_if_changed_(heap_max_alloc_sensor_, static_cast<float>(heap_max_alloc));
   if (heap_frag_pct >= 0) publish_sensor_if_changed_(heap_fragmentation_sensor_, static_cast<float>(heap_frag_pct));
-  if (psram_total > 0) publish_sensor_if_changed_(psram_total_sensor_, static_cast<float>(psram_total));
-  if (psram_free > 0) publish_sensor_if_changed_(psram_free_sensor_, static_cast<float>(psram_free));
+  // A board with PSRAM must publish 0 if all external RAM is exhausted.
+  // Boards without PSRAM leave these optional sensors unavailable.
+  if (psram_total > 0) {
+    publish_sensor_if_changed_(psram_total_sensor_, static_cast<float>(psram_total));
+    publish_sensor_if_changed_(psram_free_sensor_, static_cast<float>(psram_free));
+  }
 #endif
 }
 
