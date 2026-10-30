@@ -60,7 +60,7 @@ A configuration with all optional sensors and switches:
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
 
 logger:
   level: DEBUG
