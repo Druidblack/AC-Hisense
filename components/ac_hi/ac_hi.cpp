@@ -1119,10 +1119,23 @@ void ACHIClimate::queue_retry_fields_from_state_() {
   }
 }
 
+// The first DevType request uses 00/00, but subsequent module-to-AC frames
+// address the type/subtype pair returned in DevType bytes 16 and 17. Until
+// discovery succeeds use the previously working 01/01 address. The checksum
+// must be refreshed by the caller after updating these two header bytes.
+void ACHIClimate::apply_device_address_(std::vector<uint8_t> &frame) const {
+  if (frame.size() > IDX_CMD && frame[IDX_CMD] != 0x0A) {
+    frame[7] = device_type_;
+    frame[8] = device_subtype_;
+  }
+}
+
 // ---- Send status query ----
 void ACHIClimate::send_query_status_() {
   post_write_status_pending_ = false; // Any actual status poll satisfies verification.
   ESP_LOGD(TAG, "Sending status query (0x66/subtype 0x00)");
+  apply_device_address_(query_);
+  calc_and_patch_crc_(query_);
   send_logical_frame_(query_, "TX status query 0x66/0x00");
   status_query_in_flight_ = true;
   status_query_time_ = millis();
@@ -1138,6 +1151,7 @@ void ACHIClimate::send_query_capabilities_() {
       0xFE, 0x01, 0x00, 0x00, 0x66, 0x40, 0x00,
       0x00, 0x00, 0xF4, 0xFB  // CRC high/low patched below
   };
+  apply_device_address_(query);
   calc_and_patch_crc_(query);
 
   capabilities_attempts_++;
@@ -1151,6 +1165,15 @@ void ACHIClimate::send_query_capabilities_() {
   publish_text_sensor_if_changed_(device_capabilities_text_, "Querying 0x66/0x40");
 #endif
 }
+
+// Readable label for a confirmed device-type class; retain raw hex identifiers
+// for unrecognized devices rather than guessing their exact appliance model.
+#ifdef USE_TEXT_SENSOR
+static const char *device_class_name_(uint8_t device_type) {
+  if (device_type == 0x01) return "Air Conditioner";
+  return "Device";
+}
+#endif
 
 // ---- Best-effort device identification (factory W4G2 DevTypeCMD) ----
 void ACHIClimate::send_query_devtype_() {
@@ -1184,6 +1207,7 @@ void ACHIClimate::send_query_version_() {
       0xFE, 0x01, 0x00, 0x00, 0x07, 0x01, 0x00,
       0x00, 0x00, 0xF4, 0xFB  // CRC high/low patched below
   };
+  apply_device_address_(query);
   calc_and_patch_crc_(query);
 
   ++version_attempts_;
@@ -1215,6 +1239,7 @@ void ACHIClimate::send_write_changes_() {
   if (sleep_confirmation_pending_)
     sleep_confirmation_target_stage_ = d_sleep_stage_;
   tx_bytes_[IDX_TX_BEEP] = beep_on_next_write_ ? TxValues::BEEP_ON : TxValues::BEEP_OFF;
+  apply_device_address_(tx_bytes_);
   calc_and_patch_crc_(tx_bytes_);
   ESP_LOGD(TAG,
            "Sending neutral one-shot write (0x65): fields=0x%03X wind[16]=0x%02X sleep[17]=0x%02X power_mode[18]=0x%02X temp[19]=0x%02X swing[32]=0x%02X features[33]=0x%02X quiet[35]=0x%02X led[36]=0x%02X heat8[37]=0x%02X beep[23]=0x%02X",
@@ -1748,29 +1773,33 @@ void ACHIClimate::handle_frame_(const std::vector<uint8_t> &b) {
 }
 
 void ACHIClimate::parse_devtype_10_04_(const std::vector<uint8_t> &b) {
-  // Captured factory reply: F4 F5 01 40 0D 01 00 FE 01 00 00 01 00
-  //                         0A 04 01 01 01 01 60 F4 FB
-  // Byte 15 is the response/ACK flag. Bytes 17-18 are the two device-type
-  // values logged by the factory W4G2 as "dev type 1 1"; byte 16 is retained
-  // in the raw debug log until its precise meaning is confirmed.
+  // Factory response (22 logical bytes):
+  // F4 F5 01 40 0D 01 00 FE 01 00 00 01 00 0A 04 01 01 01 01 60 F4 FB
+  // byte 15 = successful response, byte 16 = device type, byte 17 = subtype,
+  // bytes 18-19 = checksum (0x0160 for this reference capture).
   if (query_kind_ != QUERY_DEVTYPE) {
     ESP_LOGD(TAG, "Unsolicited DevType reply ignored");
     return;
   }
-  if (b.size() < 22 || b[2] != 0x01 || b[15] != 0x01) {
+  if (b.size() != 22 || b[2] != 0x01 || b[4] != 0x0D || b[15] != 0x01) {
     ESP_LOGW(TAG, "DevType reply invalid/negative (size=%u, result=%02X)",
              (unsigned) b.size(), (unsigned) (b.size() > 15 ? b[15] : 0));
-    // Let the usual timeout perform bounded retry or fallback.
+    // Leave discovery active for the existing bounded timeout/fallback.
     return;
   }
+  device_type_ = b[16];
+  device_subtype_ = b[17];
   devtype_done_ = true;
   status_query_in_flight_ = false;
   query_kind_ = QUERY_NONE;
-  ESP_LOGI(TAG, "DevType detected: type=%u, subtype=%u (raw flags=%02X %02X)",
-           (unsigned) b[17], (unsigned) b[18], (unsigned) b[15], (unsigned) b[16]);
+  ESP_LOGI(TAG, "DevType detected: type=0x%02X (%u), subtype=0x%02X (%u)",
+           (unsigned) device_type_, (unsigned) device_type_,
+           (unsigned) device_subtype_, (unsigned) device_subtype_);
 #ifdef USE_TEXT_SENSOR
-  char value[32];
-  snprintf(value, sizeof(value), "%u / %u", (unsigned) b[17], (unsigned) b[18]);
+  char value[64];
+  snprintf(value, sizeof(value), "%s (0x%02X / 0x%02X)",
+           device_class_name_(device_type_),
+           (unsigned) device_type_, (unsigned) device_subtype_);
   publish_text_sensor_if_changed_(device_type_text_, value);
 #endif
 }

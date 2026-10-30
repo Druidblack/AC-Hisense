@@ -381,6 +381,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Protocol I/O
   void send_query_status_();
   void send_query_capabilities_();
+  void apply_device_address_(std::vector<uint8_t> &frame) const;
   void send_query_devtype_();
   void send_query_version_();
   void send_write_changes_();
@@ -492,6 +493,10 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   // Device identification is diagnostic only. Failed discovery must not
   // suppress the already-working status/capabilities/control traffic.
   bool devtype_done_{false};
+  // Default 01/01 preserves the original working addressing before DevType.
+  // Updated only from a complete, checksum-valid 0x0A/0x04 reply.
+  uint8_t device_type_{0x01};
+  uint8_t device_subtype_{0x01};
   uint8_t devtype_attempts_{0};
   uint32_t devtype_next_attempt_ms_{0};
   bool version_done_{false};
@@ -618,7 +623,7 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   };
 
   // Short status query (cmd 0x66) – CRC is correct for this template
-  const std::vector<uint8_t> query_ = {
+  std::vector<uint8_t> query_ = {
       0xF4, 0xF5, 0x00, 0x40, 0x0C, 0x00, 0x00, 0x01, 0x01,
       0xFE, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x00, 0x01,
       0xB3, 0xF4, 0xFB
