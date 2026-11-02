@@ -482,8 +482,15 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.set_supported_fan_modes({climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW,
                              climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH,
                              climate::CLIMATE_FAN_QUIET});
-  t.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_VERTICAL,
-                               climate::CLIMATE_SWING_HORIZONTAL, climate::CLIMATE_SWING_BOTH});
+  // Swing capabilities are configured for the physical indoor unit; a unit
+  // with one motorized axis must never offer BOTH or the missing axis in HA.
+  t.add_supported_swing_mode(climate::CLIMATE_SWING_OFF);
+  if (supports_vertical_swing_)
+    t.add_supported_swing_mode(climate::CLIMATE_SWING_VERTICAL);
+  if (supports_horizontal_swing_)
+    t.add_supported_swing_mode(climate::CLIMATE_SWING_HORIZONTAL);
+  if (supports_vertical_swing_ && supports_horizontal_swing_)
+    t.add_supported_swing_mode(climate::CLIMATE_SWING_BOTH);
   if (enable_presets_) {
     climate::ClimatePresetMask presets;
     presets.insert(climate::CLIMATE_PRESET_NONE);
@@ -501,6 +508,19 @@ climate::ClimateTraits ACHIClimate::traits() {
   t.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
   t.add_feature_flags(climate::CLIMATE_SUPPORTS_ACTION);
   return t;
+}
+
+// Keep only the installed louver axes. A BOTH status received from an AC
+// configured with one available axis becomes that one axis in Home Assistant.
+climate::ClimateSwingMode ACHIClimate::normalize_swing_(climate::ClimateSwingMode swing) const {
+  const bool vertical = supports_vertical_swing_ &&
+      (swing == climate::CLIMATE_SWING_VERTICAL || swing == climate::CLIMATE_SWING_BOTH);
+  const bool horizontal = supports_horizontal_swing_ &&
+      (swing == climate::CLIMATE_SWING_HORIZONTAL || swing == climate::CLIMATE_SWING_BOTH);
+  if (vertical && horizontal) return climate::CLIMATE_SWING_BOTH;
+  if (vertical) return climate::CLIMATE_SWING_VERTICAL;
+  if (horizontal) return climate::CLIMATE_SWING_HORIZONTAL;
+  return climate::CLIMATE_SWING_OFF;
 }
 
 // ---- Per-mode target temperature memory ----
@@ -560,6 +580,7 @@ void ACHIClimate::set_sleep_program(const std::string &value) {
 // ---- Control from HA ----
 void ACHIClimate::control(const climate::ClimateCall &call) {
   bool changed = false;
+  bool rejected_dry_fan = false;
   bool was_power_on = d_power_on_;
 
   // Snapshot the desired state. After applying the ClimateCall we compare the
@@ -646,6 +667,14 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
 
       d_mode_ = requested_mode;
 
+      if (d_mode_ == climate::CLIMATE_MODE_DRY) {
+        // DRY owns fan speed, just like SMART. Previous manual wind/Turbo must
+        // not remain selected when the user enters dehumidification.
+        d_fan_ = climate::CLIMATE_FAN_AUTO;
+        d_fan_turbo_ = false;
+        sleep_fan_override_pending_ = false;
+      }
+
       if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
         // SMART owns its target temperature and indoor fan. Enter it with a
         // mode-only command and clear mutually exclusive manual features from
@@ -704,6 +733,11 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (call.get_fan_mode().has_value()) {
     if (d_mode_ == climate::CLIMATE_MODE_AUTO) {
       ESP_LOGD(TAG, "Ignoring fan-mode command while SMART/AUTO is active");
+    } else if (d_mode_ == climate::CLIMATE_MODE_DRY) {
+      // The indoor unit ignores manual speeds in DRY. Reject the request and
+      // re-publish AUTO; do not transmit a wind command or cancel Sleep.
+      rejected_dry_fan = true;
+      ESP_LOGD(TAG, "Ignoring fan-mode command in DRY; fan is always AUTO");
     } else {
     // While Sleep is active, QUIET is controlled by the indoor unit itself.
     // Remember that this fan change is explicit so the next status parser does
@@ -725,8 +759,18 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   }
 
   if (call.get_swing_mode().has_value()) {
-    d_swing_ = *call.get_swing_mode();
-    changed = true;
+    const auto requested_swing = *call.get_swing_mode();
+    const auto allowed_swing = normalize_swing_(requested_swing);
+    if (allowed_swing != requested_swing &&
+        requested_swing != climate::CLIMATE_SWING_BOTH) {
+      // An unsupported single-axis request must not accidentally turn OFF
+      // an already active, supported axis. BOTH may degrade to the one
+      // available axis, while OFF always remains a valid choice.
+      ESP_LOGD(TAG, "Ignoring unsupported swing axis in Home Assistant command");
+    } else if (d_swing_ != allowed_swing) {
+      d_swing_ = allowed_swing;
+      changed = true;
+    }
   }
 
   if (call.get_preset().has_value()) {
@@ -935,6 +979,9 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (!custom_fan.empty()) {
     if (custom_fan == CUSTOM_FAN_TURBO && d_mode_ == climate::CLIMATE_MODE_AUTO) {
       ESP_LOGD(TAG, "Ignoring custom Turbo fan while SMART/AUTO is active");
+    } else if (custom_fan == CUSTOM_FAN_TURBO && d_mode_ == climate::CLIMATE_MODE_DRY) {
+      rejected_dry_fan = true;
+      ESP_LOGD(TAG, "Ignoring custom Turbo fan in DRY; fan is always AUTO");
     } else if (custom_fan == CUSTOM_FAN_TURBO) {
       sleep_fan_override_pending_ = (sleep_stage_ > 0 || d_sleep_stage_ > 0);
       sleep_restore_fan_valid_ = false;
@@ -952,7 +999,23 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
     }
   }
 
-  if (!changed) return;
+  // A preset may also have selected a manual fan speed. Keep DRY under the
+  // unit's automatic airflow control regardless of the command combination.
+  if (d_mode_ == climate::CLIMATE_MODE_DRY &&
+      (d_fan_ != climate::CLIMATE_FAN_AUTO || d_fan_turbo_)) {
+    d_fan_ = climate::CLIMATE_FAN_AUTO;
+    d_fan_turbo_ = false;
+    changed = true;
+  }
+
+  if (!changed) {
+    if (rejected_dry_fan) {
+      // Reaffirm the authoritative state without scheduling a UART write.
+      publish_fan_state_(false, climate::CLIMATE_FAN_AUTO);
+      publish_state();
+    }
+    return;
+  }
 
   uint16_t changed_fields = CMD_FIELD_NONE;
   if (d_power_on_ != before_power_on || d_mode_ != before_mode)
@@ -960,7 +1023,8 @@ void ACHIClimate::control(const climate::ClimateCall &call) {
   if (d_target_c_ != before_target)
     changed_fields |= CMD_FIELD_TEMP;
   if ((d_fan_ != before_fan || d_fan_turbo_ != before_fan_turbo) &&
-      d_mode_ != climate::CLIMATE_MODE_AUTO)
+      d_mode_ != climate::CLIMATE_MODE_AUTO &&
+      d_mode_ != climate::CLIMATE_MODE_DRY)
     changed_fields |= CMD_FIELD_WIND;
   if (d_swing_ != before_swing)
     changed_fields |= CMD_FIELD_SWING;
@@ -1037,7 +1101,7 @@ void ACHIClimate::build_tx_from_pending_fields_(uint16_t fields) {
   if (fields & CMD_FIELD_TEMP)
     tx_bytes_[IDX_SET_TEMP] = encode_temp_(d_target_c_);
 
-  if (fields & CMD_FIELD_WIND)
+  if ((fields & CMD_FIELD_WIND) && d_mode_ != climate::CLIMATE_MODE_DRY)
     tx_bytes_[IDX_WIND] = encode_fan_byte_(d_fan_, d_fan_turbo_);
 
   if (fields & CMD_FIELD_SLEEP)
@@ -1105,8 +1169,8 @@ void ACHIClimate::queue_retry_fields_from_state_() {
     // fight that automatic fan value unless the user explicitly selected a fan
     // mode in Home Assistant while Sleep was active.
     const bool sleep_owns_fan = sleep_stage_ > 0 && !sleep_fan_override_pending_;
-    if (d_mode_ != climate::CLIMATE_MODE_AUTO && !sleep_owns_fan &&
-        (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
+    if (d_mode_ != climate::CLIMATE_MODE_AUTO && d_mode_ != climate::CLIMATE_MODE_DRY &&
+        !sleep_owns_fan && (d_fan_ != fan_ || d_fan_turbo_ != fan_turbo_))
       pending_command_fields_ |= CMD_FIELD_WIND;
     if (d_swing_ != swing_)
       pending_command_fields_ |= CMD_FIELD_SWING;
@@ -2389,6 +2453,14 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_wri
     fan_ = climate::CLIMATE_FAN_HIGH;
   }
 
+  // A DRY status may carry a physical wind code other than AUTO, even though
+  // DRY does not permit manually selecting that speed. Retain last_raw_wind_
+  // for diagnostics but show AUTO and never chase the reported wind value.
+  if (power_on_ && mode_ == climate::CLIMATE_MODE_DRY) {
+    fan_ = climate::CLIMATE_FAN_AUTO;
+    fan_turbo_ = false;
+  }
+
   // During a confirmed Sleep program the indoor unit controls the fan and
   // normally reports QUIET. Keep the desired/UI fan synchronized with that
   // real value so unrelated HA commands (temperature, swing, display, etc.) do
@@ -2433,6 +2505,7 @@ void ACHIClimate::parse_status_102_(const std::vector<uint8_t> &b, bool from_wri
   else if (updown) swing_ = climate::CLIMATE_SWING_VERTICAL;
   else if (leftright) swing_ = climate::CLIMATE_SWING_HORIZONTAL;
   else swing_ = climate::CLIMATE_SWING_OFF;
+  swing_ = normalize_swing_(swing_);
 
   // The first status after a byte-17 Sleep action is authoritative. A command
   // is successful only when the reported program exactly matches the requested
@@ -2778,6 +2851,13 @@ void ACHIClimate::handle_ack_101_(const std::vector<uint8_t> &b) {
 
 // ---- Gating and convergence ----
 void ACHIClimate::publish_fan_state_(bool turbo_fan, climate::ClimateFanMode fan) {
+  // The climate fan selector is global in HA; DRY has no separate fan traits.
+  // Display AUTO even when the protocol reports an internal speed or a
+  // caller tries to select Turbo while dehumidifying.
+  if (this->mode == climate::CLIMATE_MODE_DRY) {
+    turbo_fan = false;
+    fan = climate::CLIMATE_FAN_AUTO;
+  }
   if (turbo_fan) {
     this->set_custom_fan_mode_(CUSTOM_FAN_TURBO);
   } else {
@@ -2875,8 +2955,8 @@ void ACHIClimate::publish_gated_state_() {
     // +8 °C is an action-style frost mode, not a normal setpoint. Preserve the
     // last normal HEAT target so Preset=None can return to it.
     if (!out_heat_8c) d_target_c_ = published_target;
-    d_fan_         = out_fan;
-    d_fan_turbo_   = out_fan_turbo;
+    d_fan_         = (mode_ == climate::CLIMATE_MODE_DRY) ? climate::CLIMATE_FAN_AUTO : out_fan;
+    d_fan_turbo_   = (mode_ != climate::CLIMATE_MODE_DRY) && out_fan_turbo;
     d_swing_       = swing_;
     d_eco_         = out_eco;
     d_turbo_       = out_turbo;
@@ -3012,6 +3092,14 @@ uint32_t ACHIClimate::compute_control_signature_(bool power, climate::ClimateMod
     fan_turbo = false;
     target_c = 24;
   }
+
+  // DRY controls its own airflow. A raw wind reading of QUIET/LOW/HIGH or
+  // TURBO cannot represent a selectable speed in this HVAC mode.
+  if (power && mode == climate::CLIMATE_MODE_DRY) {
+    fan = climate::CLIMATE_FAN_AUTO;
+    fan_turbo = false;
+  }
+  swing = normalize_swing_(swing);
 
   // +8 °C is an action-style HEAT sub-mode. Its reported internal setpoint and
   // fan may differ by model, so normalize them while retaining the dedicated

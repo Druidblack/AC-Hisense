@@ -29,6 +29,8 @@ else:
     }
 
 CONF_ENABLE_PRESETS = "enable_presets"
+CONF_SUPPORTS_VERTICAL_SWING = "supports_vertical_swing"
+CONF_SUPPORTS_HORIZONTAL_SWING = "supports_horizontal_swing"
 CONF_ADAPTIVE_STARTUP = "adaptive_startup"
 CONF_ACK_STATE_SYNC = "ack_state_sync"
 CONF_ENABLE_HUMIDITY = "enable_humidity"
@@ -116,6 +118,9 @@ def _ensure_discharge_sensor(config):
 CONFIG_SCHEMA = cv.All(BASE_CLIMATE_SCHEMA.extend({
     **BASE_CLIMATE_EXTRA,
     cv.Optional(CONF_ENABLE_PRESETS, default=True): cv.boolean,
+    # Available motorized louvers. Defaults preserve the legacy four options.
+    cv.Optional(CONF_SUPPORTS_VERTICAL_SWING, default=True): cv.boolean,
+    cv.Optional(CONF_SUPPORTS_HORIZONTAL_SWING, default=True): cv.boolean,
     cv.Optional(CONF_ADAPTIVE_STARTUP, default=True): cv.boolean,
     cv.Optional(CONF_ACK_STATE_SYNC, default=True): cv.boolean,
     cv.Optional(CONF_ENABLE_HUMIDITY, default=True): cv.boolean,
@@ -336,6 +341,8 @@ async def to_code(config):
     cg.add(var.set_uart_parent(uart_comp))
 
     cg.add(var.set_enable_presets(config[CONF_ENABLE_PRESETS]))
+    cg.add(var.set_supports_vertical_swing(config[CONF_SUPPORTS_VERTICAL_SWING]))
+    cg.add(var.set_supports_horizontal_swing(config[CONF_SUPPORTS_HORIZONTAL_SWING]))
     cg.add(var.set_adaptive_startup(config[CONF_ADAPTIVE_STARTUP]))
     cg.add(var.set_ack_state_sync(config[CONF_ACK_STATE_SYNC]))
 

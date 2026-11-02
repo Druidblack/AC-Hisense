@@ -276,6 +276,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
 
   // Configuration
   void set_enable_presets(bool v) { enable_presets_ = v; }
+  void set_supports_vertical_swing(bool v) { supports_vertical_swing_ = v; }
+  void set_supports_horizontal_swing(bool v) { supports_horizontal_swing_ = v; }
   // Set false to restore the exact pre-stage-4 fixed 10-second startup guard.
   void set_adaptive_startup(bool v) { adaptive_startup_ = v; }
   // Stage 5: parse full write-response snapshots, then verify with a 0x66 poll.
@@ -378,6 +380,9 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   void set_memory_mode_enabled(bool on);
 
  protected:
+  // Hide unsupported louver axes from HA and disregard them in status frames.
+  climate::ClimateSwingMode normalize_swing_(climate::ClimateSwingMode swing) const;
+
   // Protocol I/O
   void send_query_status_();
   void send_query_capabilities_();
@@ -745,6 +750,8 @@ class ACHIClimate : public climate::Climate, public PollingComponent, public uar
   ACHISleepProgramSelect *sleep_program_select_{nullptr};
 
   bool enable_presets_{true};
+  bool supports_vertical_swing_{true};
+  bool supports_horizontal_swing_{true};
 
   // For debugging (optional)
   std::vector<uint8_t> last_status_frame_;
