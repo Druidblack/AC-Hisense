@@ -85,6 +85,9 @@ climate:
     update_interval: 2s
     enable_presets: true
     # enable_humidity: false  # uncomment to hide humidity sensors on units without humidity hardware
+    # by default, both values are true
+    # supports_vertical_swing: false
+    # supports_horizontal_swing: true
 
 ```
 
