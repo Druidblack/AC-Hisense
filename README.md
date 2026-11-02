@@ -238,6 +238,65 @@ For flashing the native module (AEH-W4G1)
 
 <img width="960" height="1280" alt="photo_2026-10-30_19-50-04" src="https://github.com/user-attachments/assets/5fc01a11-bf6a-4312-8350-3a5f02ff8b01" />
 
+For flashing the native module (AEH-W4G2)
+
+```yaml
+# Board: Generic - RTL8710BN (2M/468k)
+# Definition: definitions/boards/generic-rtl8710bn-2mb-468k/manifest.yaml
+
+esphome:
+  name: ac-bedroom
+  friendly_name: AC Bedroom
+  platformio_options:
+    platform_packages:
+      - framework-arduino-api @ https://github.com/hn/ArduinoCore-API#RingBufferFix
+
+rtl87xx:
+  board: generic-rtl8710bn-2mb-468k
+  framework:
+    version: 0.0.0
+    source: https://github.com/libretiny-eu/libretiny.git#v1.11.0
+
+logger:
+  # level: DEBUG
+  baud_rate: 0
+
+api:
+  encryption:
+    key: ""
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: AC Bedroom Fallback Hotspot
+    password: ""
+
+external_components:
+  - source: github://Druidblack/AC-Hisense@main
+    components: [ac_hi]
+    refresh: 30s
+
+uart:
+  id: ac_uart
+  tx_pin: GPIO23
+  rx_pin: GPIO18
+  baud_rate: 9600
+
+climate:
+  - platform: ac_hi
+    id: hisense_ac
+    name: "Hisense AC"
+    uart_id: ac_uart
+    flow_control_pin: GPIO14
+    update_interval: 2s
+    enable_presets: true
+    enable_humidity: false
+```
+
 
 ## Entities provided
 <img width="412" height="411" alt="22" src="https://github.com/user-attachments/assets/8fad5a88-fb8d-411f-b24c-99a231ceedea" />
