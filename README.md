@@ -19,6 +19,8 @@ This custom component provides full climate control for air conditioners manufac
 
 ❄️  **Hisense Free Match Multi Split 4AMW81U4RJC**
 
+❄️  **Olmo OSH-12FWH**
+
 and should work with many other models.
 
 The component exposes a standard Home Assistant Climate entity, along with a set of optional sensors and switches to access all advanced features of the AC (turbo, eco, quiet, sleep, swing, LED, iFeel (temperature from any sensor from the home assistant) etc.).
