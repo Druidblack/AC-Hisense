@@ -19,7 +19,7 @@ This custom component provides full climate control for air conditioners manufac
 
 ❄️  **Hisense Free Match Multi Split 4AMW81U4RJC**
 
-❄️  **Olmo OSH-12FWH**
+❄️  **Olmo Premion OSH-12FWH**
 
 and should work with many other models.
 
